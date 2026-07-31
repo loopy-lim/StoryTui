@@ -14,4 +14,5 @@ pub mod migrate;
 pub mod validate;
 
 pub use loader::{PackLoader, REQUIRED_FILES};
+pub use migrate::{check_schema_compat, migrate_in_memory};
 pub use validate::validate_all;

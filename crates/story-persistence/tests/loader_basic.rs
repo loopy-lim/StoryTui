@@ -211,3 +211,27 @@ fn load_does_not_mutate_pack_files() {
     let after_count = fs::read_dir(dir.path()).unwrap().count();
     assert_eq!(before_count, after_count);
 }
+
+#[test]
+fn unsupported_schema_major_is_rejected() {
+    let dir = build_valid_pack();
+    let future = STORY_TOML.replace("\"1.0.0\"", "\"2.0.0\"");
+    write(dir.path(), "story.toml", &future);
+    let err = PackLoader::load(dir.path()).expect_err("future major rejected");
+    let s = format!("{err}");
+    assert!(
+        s.contains("지원하지 않는 Pack 스키마"),
+        "expected unsupported, got: {s}"
+    );
+    assert!(s.contains("2.0.0"));
+}
+
+#[test]
+fn forward_minor_within_same_major_loads() {
+    let dir = build_valid_pack();
+    let future = STORY_TOML.replace("\"1.0.0\"", "\"1.7.3\"");
+    write(dir.path(), "story.toml", &future);
+    let pack = PackLoader::load(dir.path()).expect("forward minor loads");
+    assert_eq!(pack.metadata.schema_version.minor, 7);
+    assert_eq!(pack.metadata.schema_version.patch, 3);
+}

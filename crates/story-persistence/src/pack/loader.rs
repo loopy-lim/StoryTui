@@ -146,10 +146,16 @@ impl<'a> LoadCtx<'a> {
         let writer_str = read.remove(0);
 
         // Phase 4: schema-major compat (migrate.rs).
-        // W4.4 fills in actual logic; for W4.3 we treat schema_version as
-        // implicitly compatible (the canonical metadata converter still
-        // parses it).
+        // Cross-major is rejected via UnsupportedSchemaVersion; same-major
+        // continues with in-memory default-fill.
         crate::pack::migrate::check_schema_compat(&story_dto, &mut self.errors);
+        let story_dto = match crate::pack::migrate::migrate_in_memory(&story_dto) {
+            Ok(d) => d,
+            Err(e) => {
+                self.errors.push(e);
+                return Ok(());
+            }
+        };
 
         // Phase 5: parse TOML DTOs.
         let characters_dto = self.parse_toml::<CharactersToml>("characters.toml", characters_str);
