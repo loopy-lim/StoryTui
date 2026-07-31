@@ -24,7 +24,7 @@ pub struct ParsedAction {
 }
 
 /// Structured summary of a turn, persisted for later recall.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TurnSummary {
     // --- MVP wire fields (always populated) ---
     /// Salient facts established this turn.
@@ -56,7 +56,7 @@ pub struct GenerationWarning {
 }
 
 /// Token accounting for a single generation call.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TokenUsage {
     /// Tokens consumed by the prompt.
     pub prompt_tokens: u32,

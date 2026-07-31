@@ -8,7 +8,7 @@ use crate::{CharacterId, ConditionExpr, RiskLevel};
 ///
 /// `hidden_requirements` is a conjunction: the choice is visible/available only
 /// when every condition holds. Evaluation lives in W3.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Choice {
     /// Pack-stable id of this choice within its turn.
     pub id: String,

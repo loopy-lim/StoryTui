@@ -36,6 +36,7 @@ pub mod id;
 pub mod memory;
 pub mod pack;
 pub mod patch;
+pub mod provider_dto;
 pub mod rules;
 pub mod state;
 pub mod turn;
@@ -62,6 +63,10 @@ pub use pack::{
     PackRating, PromptFragments, StoryPack,
 };
 pub use patch::StatePatch;
+pub use provider_dto::{
+    ChatMessage, GeneratedTurnDraft, ProviderCapabilities, ProviderError, ProviderHealth,
+    TurnRequest,
+};
 pub use rules::{
     DEFAULT_DELTA_MAX, DEFAULT_DELTA_MIN, DEFAULT_STAT_MAX, DEFAULT_STAT_MIN, DeltaLimits,
     EndingDef, EventDef, EventEffects, Int16Range, LocationDef, NumberVarDef, RouteDef, StoryRules,
