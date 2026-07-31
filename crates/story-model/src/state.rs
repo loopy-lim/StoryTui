@@ -2,14 +2,15 @@
 //!
 //! [`CharacterState`] is the per-character relationship/emotion snapshot.
 //! [`ChoiceRef`] is a compact pointer to the last choice the player made.
-//! The full [`GameState`] keystone is added once its memory/history dependencies
-//! exist (see W2.4).
+//! [`GameState`] is the top-level save-state keystone.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{CharacterId, Emotion, RelationshipStage};
+use crate::{
+    CharacterId, Emotion, HistoryEntry, LocationId, MemoryEntry, RelationshipStage, TimeSlot,
+};
 
 /// Per-character mutable state tracked by the engine.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -39,4 +40,61 @@ pub struct ChoiceRef {
     pub label: String,
     /// Turn number at which the choice was made.
     pub turn: u32,
+}
+
+/// The full, serializable game state — the save-file root.
+///
+/// This struct is intentionally forward-tolerant: it does **not** carry
+/// `#[serde(deny_unknown_fields)]`, so future optional fields do not break
+/// loading of older saves. The `save_schema_version` field records which schema
+/// revision a given save was written with; loaders compare it against
+/// [`crate::SAVE_SCHEMA_VERSION`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GameState {
+    /// Schema revision this save was written with.
+    pub save_schema_version: u32,
+    /// Pack id this save belongs to.
+    pub story_id: String,
+    /// Semantic version of the story pack this save was created with.
+    pub story_version: semver::Version,
+    /// Schema version of the story pack format (independent of save schema).
+    pub pack_schema_version: semver::Version,
+    /// Unique id of this play session.
+    pub session_id: uuid::Uuid,
+    /// Current chapter id within the pack.
+    pub current_chapter: String,
+    /// Current scene id within the chapter.
+    pub current_scene_id: String,
+    /// Monotonic turn counter.
+    pub turn: u32,
+    /// Current location.
+    pub location: LocationId,
+    /// Current time-of-day bucket.
+    pub time_slot: TimeSlot,
+    /// Active route name, if any.
+    pub active_route: Option<String>,
+    /// Per-character state.
+    pub characters: BTreeMap<CharacterId, CharacterState>,
+    /// Boolean flag store.
+    pub flags: BTreeMap<String, bool>,
+    /// Numeric counter store.
+    pub numbers: BTreeMap<String, i64>,
+    /// String store.
+    pub strings: BTreeMap<String, String>,
+    /// Inventory item quantities.
+    pub inventory: BTreeMap<String, u32>,
+    /// Events that have occurred at least once.
+    pub occurred_events: BTreeSet<String>,
+    /// Sliding window of recent turn summaries (oldest first).
+    pub recent_summaries: VecDeque<String>,
+    /// Long-term memories built up over the session.
+    pub memories: Vec<MemoryEntry>,
+    /// Full per-turn history.
+    pub history: Vec<HistoryEntry>,
+    /// The most recent choice the player made, if any.
+    pub last_choice: Option<ChoiceRef>,
+    /// Monotonic revision counter, bumped on every applied mutation.
+    pub revision: u64,
+    /// Generation id of the last stable/accepted generation, if any.
+    pub stable_generation_id: Option<uuid::Uuid>,
 }

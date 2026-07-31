@@ -22,9 +22,13 @@
 pub mod choice;
 pub mod condition;
 pub mod enums;
+pub mod error;
+pub mod history;
 pub mod id;
+pub mod memory;
 pub mod patch;
 pub mod state;
+pub mod turn;
 
 /// Schema version this build of `story-model` writes and understands.
 ///
@@ -38,6 +42,10 @@ pub use condition::ConditionExpr;
 pub use enums::{
     ActionType, CompareOp, Emotion, MemoryKind, RelationshipStage, RiskLevel, TimeSlot,
 };
+pub use error::CoreError;
+pub use history::HistoryEntry;
 pub use id::{CharacterId, EventId, FlagId, ItemId, LocationId};
+pub use memory::{MemoryEntry, MemoryFact};
 pub use patch::StatePatch;
-pub use state::{CharacterState, ChoiceRef};
+pub use state::{CharacterState, ChoiceRef, GameState};
+pub use turn::{GeneratedTurn, GenerationWarning, ParsedAction, TokenUsage, TurnSummary};
