@@ -34,6 +34,7 @@ pub mod error;
 pub mod history;
 pub mod id;
 pub mod memory;
+pub mod pack;
 pub mod patch;
 pub mod rules;
 pub mod state;
@@ -56,6 +57,10 @@ pub use error::CoreError;
 pub use history::HistoryEntry;
 pub use id::{CharacterId, EventId, FlagId, ItemId, LocationId};
 pub use memory::{MemoryEntry, MemoryFact};
+pub use pack::{
+    CharacterDef, PACK_SCHEMA_VERSION, PackContentPolicy, PackInitialState, PackMetadata,
+    PackRating, PromptFragments, StoryPack,
+};
 pub use patch::StatePatch;
 pub use rules::{
     DEFAULT_DELTA_MAX, DEFAULT_DELTA_MIN, DEFAULT_STAT_MAX, DEFAULT_STAT_MIN, DeltaLimits,
