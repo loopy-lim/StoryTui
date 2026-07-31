@@ -8,3 +8,8 @@ license.workspace = true
 [dependencies]
 story-model.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+uuid.workspace = true
+semver.workspace = true
