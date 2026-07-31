@@ -9,13 +9,17 @@
 //! - recovery parser (W5.3): strict `GeneratedTurn` JSON parse + limited repair.
 //! - [`envelope`] is a stub — the real OpenAI HTTP client lands in W6.
 
+pub mod config;
 pub mod envelope;
 pub mod error;
 pub mod mock;
+pub mod openai_compatible;
 pub mod provider;
 pub mod recovery;
 
+pub use config::{ProviderConfig, StructuredOutputMode};
 pub use mock::{MockProvider, MockResponse};
+pub use openai_compatible::OpenAiCompatibleProvider;
 pub use provider::LlmProvider;
 pub use recovery::{ParseOutcome, parse_generated_turn};
 

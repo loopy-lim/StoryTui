@@ -38,6 +38,11 @@ unicode-width = "0.2.2"
 unicode-segmentation = "1.13.3"
 jsonschema = "0.49.2"
 insta = "1.48.0"
+# HTTP mock for story-provider contract tests. Justification: async-native
+# (built on hyper + tokio), matches the existing reqwest + tokio stack, and its
+# `expect(N)` / `received_requests()` API gives the exact request-count
+# assertions the 4xx-no-retry / 5xx-retry contract tests need.
+wiremock = "0.6"
 story-model = { path = "crates/story-model" }
 story-core = { path = "crates/story-core" }
 story-provider = { path = "crates/story-provider" }
