@@ -23,6 +23,7 @@ pub mod choice;
 pub mod condition;
 pub mod enums;
 pub mod id;
+pub mod patch;
 pub mod state;
 
 /// Schema version this build of `story-model` writes and understands.
@@ -38,4 +39,5 @@ pub use enums::{
     ActionType, CompareOp, Emotion, MemoryKind, RelationshipStage, RiskLevel, TimeSlot,
 };
 pub use id::{CharacterId, EventId, FlagId, ItemId, LocationId};
+pub use patch::StatePatch;
 pub use state::{CharacterState, ChoiceRef};
