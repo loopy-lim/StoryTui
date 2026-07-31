@@ -9,9 +9,7 @@
 use story_core::summary::validate_summary;
 use story_model::chrono::Utc;
 use story_model::uuid::Uuid;
-use story_model::{
-    Choice, HistoryEntry, ParsedAction, StatePatch, TurnSummary, ActionType,
-};
+use story_model::{ActionType, Choice, HistoryEntry, ParsedAction, StatePatch, TurnSummary};
 
 fn entry(id: Uuid, turn: u32) -> HistoryEntry {
     HistoryEntry {
@@ -84,7 +82,10 @@ fn summary_with_no_sources_but_asserting_facts_is_rejected() {
     // no source history ids at all -> missing required anchor.
     let s = summary_with(vec![]);
     let err = validate_summary(&s, &[]).expect_err("empty source_history_ids must be rejected");
-    assert_eq!(err.reason_code(), Some("summary_missing_source_history_ids"));
+    assert_eq!(
+        err.reason_code(),
+        Some("summary_missing_source_history_ids")
+    );
 }
 
 #[test]

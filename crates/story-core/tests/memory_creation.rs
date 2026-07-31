@@ -68,7 +68,8 @@ fn base_state() -> GameState {
 fn rules_with_events() -> StoryRules {
     let mut r = StoryRules::minimal();
     // A flag the patches can set so reference-check passes.
-    r.allowed_flags.extend(["f-meet", "f-resolve"].map(String::from));
+    r.allowed_flags
+        .extend(["f-meet", "f-resolve"].map(String::from));
 
     let yuna = yuna_id();
     let mk = |id: &str, effects: EventEffects| EventDef {
@@ -156,7 +157,11 @@ fn rules_with_events() -> StoryRules {
     r
 }
 
-fn fire(state: &GameState, rules: &StoryRules, event_ids: &[&str]) -> story_core::reducer::ApplyResult {
+fn fire(
+    state: &GameState,
+    rules: &StoryRules,
+    event_ids: &[&str],
+) -> story_core::reducer::ApplyResult {
     let mut patch = StatePatch::default();
     for id in event_ids {
         patch.add_events.insert(id.to_string());
@@ -180,11 +185,18 @@ fn promise_event_produces_unresolved_promise_memory() {
     assert_eq!(m.importance, 9);
     assert_eq!(m.created_turn, 3);
     assert_eq!(m.source_history_ids, vec![hid]);
-    assert_eq!(m.location.as_ref(), Some(&LocationId("cafe-namu".to_string())));
+    assert_eq!(
+        m.location.as_ref(),
+        Some(&LocationId("cafe-namu".to_string()))
+    );
     // participants include yuna (from the affection delta).
     assert!(m.participants.contains(&yuna_id()));
     // known_by: player + participants, no invented owners.
-    assert!(m.facts[0].known_by.contains(&CharacterId(PLAYER.to_string())));
+    assert!(
+        m.facts[0]
+            .known_by
+            .contains(&CharacterId(PLAYER.to_string()))
+    );
     assert!(m.facts[0].known_by.contains(&yuna_id()));
     assert_eq!(m.facts[0].predicate, "약속");
 }
@@ -254,7 +266,10 @@ fn non_memory_event_produces_nothing() {
     );
     let result = fire(&state, &rules, &["ambient.rain_starts"]);
     let mems = memories_from_turn(&result, &dummy_pack(&rules), 1, Uuid::new_v4());
-    assert!(mems.is_empty(), "events without a memory-kind hint yield no memory");
+    assert!(
+        mems.is_empty(),
+        "events without a memory-kind hint yield no memory"
+    );
 }
 
 #[test]
@@ -262,7 +277,11 @@ fn creation_is_deterministic_same_inputs_same_output() {
     let state = base_state();
     let rules = rules_with_events();
     let pack = dummy_pack(&rules);
-    let result = fire(&state, &rules, &["promise.share_umbrella", "secret.past_letter"]);
+    let result = fire(
+        &state,
+        &rules,
+        &["promise.share_umbrella", "secret.past_letter"],
+    );
     let hid = Uuid::new_v4();
     let a = memories_from_turn(&result, &pack, 5, hid);
     let b = memories_from_turn(&result, &pack, 5, hid);

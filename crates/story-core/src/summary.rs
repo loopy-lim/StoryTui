@@ -30,16 +30,13 @@
 
 use story_model::{HistoryEntry, TurnSummary};
 
-use crate::error::{SUMMARY_MISSING_SOURCE_HISTORY_IDS, SUMMARY_UNSOURCED_FACT, CoreError};
+use crate::error::{CoreError, SUMMARY_MISSING_SOURCE_HISTORY_IDS, SUMMARY_UNSOURCED_FACT};
 
 /// Validate `summary` against the `sources` it claims to summarize.
 ///
 /// Returns `Ok(())` when the summary is faithful, or [`CoreError::RuleViolation`]
 /// with a stable reason code when it invents facts or omits a required field.
-pub fn validate_summary(
-    summary: &TurnSummary,
-    sources: &[&HistoryEntry],
-) -> Result<(), CoreError> {
+pub fn validate_summary(summary: &TurnSummary, sources: &[&HistoryEntry]) -> Result<(), CoreError> {
     let asserts_content = !summary.facts.is_empty()
         || !summary.relationship_changes.is_empty()
         || !summary.knowledge_changes.is_empty()
@@ -80,7 +77,7 @@ mod tests {
 
     use super::*;
     use story_model::uuid::Uuid;
-    use story_model::{Choice, ParsedAction, StatePatch, ActionType};
+    use story_model::{ActionType, Choice, ParsedAction, StatePatch};
 
     fn bare_summary() -> TurnSummary {
         TurnSummary {
