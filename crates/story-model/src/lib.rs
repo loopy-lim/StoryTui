@@ -19,8 +19,11 @@
 
 #![warn(clippy::all)]
 
+pub mod choice;
+pub mod condition;
 pub mod enums;
 pub mod id;
+pub mod state;
 
 /// Schema version this build of `story-model` writes and understands.
 ///
@@ -29,7 +32,10 @@ pub mod id;
 /// signals a migration is required.
 pub const SAVE_SCHEMA_VERSION: u32 = 1;
 
+pub use choice::Choice;
+pub use condition::ConditionExpr;
 pub use enums::{
     ActionType, CompareOp, Emotion, MemoryKind, RelationshipStage, RiskLevel, TimeSlot,
 };
 pub use id::{CharacterId, EventId, FlagId, ItemId, LocationId};
+pub use state::{CharacterState, ChoiceRef};
