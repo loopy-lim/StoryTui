@@ -3,6 +3,7 @@
 //! memory selector, and prompt context. Depends only on [`story-model`] and must
 //! never depend on terminal, HTTP, or filesystem crates (ADR-003).
 
+pub mod action_parse;
 pub mod engine;
 pub mod engine_cmd;
 pub mod error;
