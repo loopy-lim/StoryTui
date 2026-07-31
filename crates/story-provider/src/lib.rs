@@ -19,7 +19,7 @@ pub mod recovery;
 
 pub use config::{ProviderConfig, StructuredOutputMode};
 pub use mock::{MockProvider, MockResponse};
-pub use openai_compatible::OpenAiCompatibleProvider;
+pub use openai_compatible::{OpenAiCompatibleProvider, is_loopback_base_url};
 pub use provider::LlmProvider;
 pub use recovery::{ParseOutcome, parse_generated_turn};
 
