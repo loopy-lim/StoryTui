@@ -66,12 +66,12 @@ fn migrate_one(payload: SavePayload, from: u32) -> Result<SavePayload, SaveError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
+    use story_model::{GameState, LocationId, TimeSlot};
 
-    fn empty_payload() -> SavePayload {
-        use std::collections::{BTreeMap, BTreeSet, VecDeque};
-        use story_model::{CharacterState, GameState, LocationId, TimeSlot};
+    fn empty_payload(version: u32) -> SavePayload {
         let state = GameState {
-            save_schema_version: 0,
+            save_schema_version: version,
             story_id: "rainy-reunion".to_string(),
             story_version: semver::Version::new(0, 1, 0),
             pack_schema_version: semver::Version::new(1, 0, 0),
@@ -95,15 +95,6 @@ mod tests {
             revision: 0,
             stable_generation_id: None,
         };
-        let _ = CharacterState {
-            affection: 0,
-            trust: 0,
-            tension: 0,
-            relationship_stage: story_model::RelationshipStage::Acquaintance,
-            current_emotion: story_model::Emotion::Neutral,
-            known_facts: BTreeSet::new(),
-            address_form_overrides: BTreeMap::new(),
-        };
         SavePayload {
             stable_state: state,
             memories: Vec::new(),
@@ -114,14 +105,14 @@ mod tests {
 
     #[test]
     fn migrate_v0_to_v1_bumps_version() {
-        let p = empty_payload();
+        let p = empty_payload(0);
         let migrated = migrate_payload(p, 0, 1).unwrap();
         assert_eq!(migrated.stable_state.save_schema_version, 1);
     }
 
     #[test]
     fn migrate_same_version_is_noop() {
-        let p = empty_payload();
+        let p = empty_payload(1);
         let migrated = migrate_payload(p.clone(), 1, 1).unwrap();
         assert_eq!(
             migrated.stable_state.save_schema_version,
@@ -131,7 +122,7 @@ mod tests {
 
     #[test]
     fn migrate_rejects_future_major() {
-        let p = empty_payload();
+        let p = empty_payload(2);
         match migrate_payload(p, 2, 1) {
             Err(SaveError::UnsupportedVersion { found, supported }) => {
                 assert_eq!(found, 2);
