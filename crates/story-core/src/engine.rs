@@ -524,11 +524,20 @@ fn reduce_dismiss_error(state: &EngineState, pack: &StoryPack) -> Transition {
 ///   the checkpoint ring for later [`EngineCommand::RestoreCheckpoint`].
 fn assemble_accepted_turn(
     state: &EngineState,
-    _pack: &StoryPack,
+    pack: &StoryPack,
     pending: &PendingGeneration,
     draft: story_model::GeneratedTurnDraft,
     result: ApplyResult,
 ) -> (EngineState, Vec<StateChangeLog>) {
+    // Derive long-term memories from this turn's fired events BEFORE we move
+    // `result.state` (ST-029). The history-entry id is generated once and used
+    // both as the memory's `source_history_id` and the actual `HistoryEntry`
+    // id, so every memory traces to a real, present source entry.
+    let history_id = Uuid::new_v4();
+    let fired_events = result.fired_events.clone();
+    let new_memories =
+        crate::memory::memories_from_turn(&result, pack, pending.requested_at_turn + 1, history_id);
+
     let mut game = result.state;
     game.turn = pending.requested_at_turn + 1;
 
@@ -551,8 +560,14 @@ fn assemble_accepted_turn(
         });
     }
 
+    // Resolve prior memories against this turn's fired events, then append the
+    // new ones. Resolution is deterministic and never deletes a memory — it
+    // only clears the `unresolved` flag of matching priors.
+    crate::memory::resolve_memories(&mut game.memories, &fired_events);
+    game.memories.extend(new_memories);
+
     let entry = HistoryEntry {
-        id: Uuid::new_v4(),
+        id: history_id,
         turn: game.turn,
         scene_id: game.current_scene_id.clone(),
         created_at: Utc::now(),
