@@ -3,4 +3,7 @@
 //! memory selector, and prompt context. Depends only on [`story-model`] and must
 //! never depend on terminal, HTTP, or filesystem crates (ADR-003).
 
+pub mod error;
 pub mod eval;
+pub mod state_machine;
+pub mod validator;

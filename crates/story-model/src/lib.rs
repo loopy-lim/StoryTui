@@ -19,6 +19,13 @@
 
 #![warn(clippy::all)]
 
+// Re-export `serde_json`, `uuid`, and `semver` so downstream crates (notably
+// `story-core`) can use them without adding a direct runtime dependency,
+// keeping their dependency tree minimal per ADR-003.
+pub use semver;
+pub use serde_json;
+pub use uuid;
+
 pub mod change_log;
 pub mod choice;
 pub mod condition;
