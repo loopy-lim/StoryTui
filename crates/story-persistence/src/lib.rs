@@ -3,3 +3,8 @@
 //! caching (`sha2`), atomic save-file writes, and schema migrations keyed by
 //! `semver`. All filesystem interaction is isolated here so the deterministic
 //! core never touches disk.
+
+pub mod error;
+pub mod pack;
+
+pub use error::PackError;

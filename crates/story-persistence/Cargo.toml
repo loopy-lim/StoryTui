@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 story-model.workspace = true
 story-core.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
