@@ -1,0 +1,58 @@
+---
+source: crates/story-core/tests/prompt_context.rs
+expression: combined
+---
+=== SYSTEM ===
+당신은 StoryTUI의 한국어 장면 생성 모델이다.
+
+# Allowed IDs
+## Characters
+- ami
+- yuna
+- zoe
+## Locations
+- cafe-namu
+- loc-hall
+- loc-roof
+## Flags
+- apologized
+- met_namu
+- shared_umbrella
+
+# Delta limits (per turn, inclusive)
+affection: -3..=3
+trust: -3..=3
+tension: -3..=3
+# Choices
+offer exactly 3 choices
+
+# Player sovereignty
+Do not fix emotions, dialogue, physical contact, forgiveness, confessions, or decisions the player did not specify. Do not invert or shrink the core intent of the player's free-text input.
+
+
+=== USER ===
+# World
+# 세계관
+카페 나무, 비 오는 저녁.
+
+# Style
+# 문체
+짧고 정확한 문장.
+
+# Opening
+# 오프닝
+유나가 앉아 있다.
+
+# Current state
+{"characters":{"ami":{"affection":10,"emotion":"neutral","stage":"acquaintance","tension":0,"trust":5},"yuna":{"affection":11,"emotion":"neutral","stage":"acquaintance","tension":1,"trust":6},"zoe":{"affection":12,"emotion":"neutral","stage":"acquaintance","tension":2,"trust":7}},"flags":{"apologized":false,"met_namu":true,"shared_umbrella":false},"inventory":{"i-letter":2},"location":"cafe-namu","numbers":{"score":1,"yuna.affection":9,"yuna.trust":4},"time_slot":"evening","turn":3}
+
+# Recent turns
+## turn 1 (cafe-reunion)
+narration: 유나가 커피를 내렸다.
+action: 오래간만이야. ("dialogue")
+## turn 2 (cafe-reunion)
+narration: 비가 창을 때렸다.
+
+
+=== HASH ===
+9190e4bce5e211ff633eb718743dcce009761b0cb28fbd5054c93a2471825390
