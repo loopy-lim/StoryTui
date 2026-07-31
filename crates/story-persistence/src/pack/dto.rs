@@ -27,6 +27,31 @@ pub struct ContentToml {
     pub violence: Option<String>,
 }
 
+/// Raw `[files]` section of `story.toml`. Every entry is optional; the
+/// loader fills in canonical defaults. Strings are validated for path
+/// safety (no `..`, no absolute paths) before use.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct FilesToml {
+    #[serde(default)]
+    pub characters: Option<String>,
+    #[serde(default)]
+    pub rules: Option<String>,
+    #[serde(default)]
+    pub events: Option<String>,
+    #[serde(default)]
+    pub world: Option<String>,
+    #[serde(default)]
+    pub style: Option<String>,
+    #[serde(default)]
+    pub opening: Option<String>,
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    #[serde(default)]
+    pub director_prompt: Option<String>,
+    #[serde(default)]
+    pub writer_prompt: Option<String>,
+}
+
 /// Raw `[initial_state]` section of `story.toml`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InitialStateToml {
@@ -59,6 +84,8 @@ pub struct StoryToml {
     pub initial_state: InitialStateToml,
     #[serde(default)]
     pub content: ContentToml,
+    #[serde(default)]
+    pub files: FilesToml,
 }
 
 fn default_choice_count() -> u8 {

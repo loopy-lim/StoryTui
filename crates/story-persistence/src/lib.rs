@@ -8,3 +8,4 @@ pub mod error;
 pub mod pack;
 
 pub use error::PackError;
+pub use pack::PackLoader;
