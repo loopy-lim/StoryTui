@@ -2378,11 +2378,13 @@ dependencies = [
 name = "story-tui"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "crossterm",
  "insta",
  "ratatui",
  "story-core",
  "story-model",
+ "story-persistence",
  "tokio",
  "unicode-segmentation",
  "unicode-width",

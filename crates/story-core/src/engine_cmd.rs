@@ -90,4 +90,15 @@ pub enum EngineEffect {
     /// Surface a recoverable error. Always co-emitted with a [`PublishView`]
     /// showing the error overlay so the view stays self-contained.
     ShowRecoverableError(DomainErrorView),
+    /// Persist the engine's stable state to `slot_id`. Emitted after each
+    /// accepted turn when `EngineState::autosave_on_accept` is enabled
+    /// (default). The host executes this by calling
+    /// `SaveStore::save(state.snapshot_payload().into_envelope(...))`. The
+    /// engine NEVER touches the filesystem itself (ADR-003).
+    PersistStableState {
+        /// Slot id to write (default `"autosave"`).
+        slot_id: String,
+        /// Player-facing description (e.g. `"턴 3 — 카페 나무"`).
+        description: Option<String>,
+    },
 }

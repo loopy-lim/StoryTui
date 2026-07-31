@@ -24,8 +24,8 @@ use story_model::chrono::Utc;
 use story_model::uuid::Uuid;
 use story_model::{
     AppViewModel, CharacterId, CharacterState, ChoiceRef, DomainErrorView, Emotion, GameState,
-    HistoryEntry, LoadingState, PackMetadata, ParsedAction, Screen, StateChangeLog, StatePatch,
-    StoryPack, StoryRules, TurnRequest,
+    HistoryEntry, LoadingState, PackMetadata, ParsedAction, SavePayload, Screen, StateChangeLog,
+    StatePatch, StoryPack, StoryRules, TurnRequest,
 };
 
 use crate::engine_cmd::{EngineCommand, EngineEffect};
@@ -42,6 +42,12 @@ const FREE_ACTION_CHOICE_ID: &str = "__free_action__";
 /// Maximum number of committed-state checkpoints retained for
 /// [`EngineCommand::RestoreCheckpoint`].
 const CHECKPOINT_RING: usize = 8;
+/// Slot id the engine writes to on autosave (after each accepted turn).
+pub const AUTOSAVE_SLOT: &str = "autosave";
+/// Cap on the in-memory audit tail kept on [`EngineState`] for the save
+/// payload. Larger histories are truncated to the most recent entries so
+/// saves stay compact.
+const AUDIT_TAIL_CAP: usize = 1024;
 
 /// Validate + atomically apply a generated patch for one turn (W3 primitive).
 ///
@@ -84,6 +90,14 @@ pub struct EngineState {
     /// entry is pushed each time a turn is accepted; the ring keeps the most
     /// recent [`CHECKPOINT_RING`] entries.
     pub checkpoints: Vec<Checkpoint>,
+    /// Tail of the field-level audit log accumulated across accepted turns.
+    /// Bounded to the most recent [`AUDIT_TAIL_CAP`] entries so saves stay
+    /// compact; included in [`EngineState::snapshot_payload`].
+    pub audit_tail: Vec<StateChangeLog>,
+    /// When `true` (default), the engine emits a [`EngineEffect::PersistStableState`]
+    /// effect after each accepted turn, writing to the [`AUTOSAVE_SLOT`].
+    /// Disable for headless benchmarks / tests that don't persist.
+    pub autosave_on_accept: bool,
 }
 
 /// A committed-state snapshot the player can rewind to via
@@ -152,6 +166,23 @@ impl EngineState {
             pending: None,
             lineage: Vec::new(),
             checkpoints: Vec::new(),
+            audit_tail: Vec::new(),
+            autosave_on_accept: true,
+        }
+    }
+
+    /// Assemble the pure-data [`SavePayload`] snapshot of this engine state.
+    ///
+    /// Mirrors `game.memories` / `game.history` into the payload's top-level
+    /// mirrors (forward-compat with the W9 memory selector) and includes the
+    /// bounded `audit_tail`. **Pure**: no FS, no UI, no HTTP — the host wraps
+    /// this in a `SaveEnvelope` and hands it to `SaveStore::save`.
+    pub fn snapshot_payload(&self) -> SavePayload {
+        SavePayload {
+            memories: self.game.memories.clone(),
+            history: self.game.history.clone(),
+            audit_tail: self.audit_tail.clone(),
+            stable_state: self.game.clone(),
         }
     }
 }
@@ -412,9 +443,18 @@ fn reduce_accept(
         Ok(result) => {
             let (next, audit) = assemble_accepted_turn(state, pack, pending, draft.clone(), result);
             let view = build_view(&next, pack, None, None);
+            let mut effects = vec![EngineEffect::PublishView(Box::new(view))];
+            // Autosave-on-accept (configurable; default on for MVP). The host
+            // executes the effect by calling SaveStore::save.
+            if next.autosave_on_accept {
+                effects.push(EngineEffect::PersistStableState {
+                    slot_id: AUTOSAVE_SLOT.to_string(),
+                    description: Some(format!("턴 {}", next.game.turn)),
+                });
+            }
             Ok(Transition {
                 state: next,
-                effects: vec![EngineEffect::PublishView(Box::new(view))],
+                effects,
                 audit,
             })
         }
@@ -543,8 +583,26 @@ fn assemble_accepted_turn(
         pending: None,
         lineage: Vec::new(),
         checkpoints,
+        audit_tail: extend_audit_tail(&state.audit_tail, &result.change_log),
+        autosave_on_accept: state.autosave_on_accept,
     };
     (next, result.change_log)
+}
+
+/// Append `new_entries` to the audit tail, trimming to the most recent
+/// [`AUDIT_TAIL_CAP`] entries so the save payload stays compact.
+fn extend_audit_tail(
+    existing: &[StateChangeLog],
+    new_entries: &[StateChangeLog],
+) -> Vec<StateChangeLog> {
+    let mut out = Vec::with_capacity(existing.len() + new_entries.len());
+    out.extend_from_slice(existing);
+    out.extend_from_slice(new_entries);
+    if out.len() > AUDIT_TAIL_CAP {
+        let drop_n = out.len() - AUDIT_TAIL_CAP;
+        out.drain(0..drop_n);
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -729,5 +787,7 @@ fn clone_state(state: &EngineState) -> EngineState {
         pending: state.pending.clone(),
         lineage: state.lineage.clone(),
         checkpoints: state.checkpoints.clone(),
+        audit_tail: state.audit_tail.clone(),
+        autosave_on_accept: state.autosave_on_accept,
     }
 }
