@@ -113,3 +113,10 @@ pub const ENGINE_GENERATION_IN_FLIGHT: &str = "engine_generation_in_flight";
 pub const ENGINE_UNKNOWN_CHOICE: &str = "engine_unknown_choice";
 /// `SubmitChoice` arrived when no choices are available yet.
 pub const ENGINE_NO_CHOICES: &str = "engine_no_choices";
+
+/// A `TurnSummary` asserted facts/changes without any `source_history_ids`
+/// anchor (ST-030 source-coverage).
+pub const SUMMARY_MISSING_SOURCE_HISTORY_IDS: &str = "summary_missing_source_history_ids";
+/// A `TurnSummary` listed a `source_history_id` that is not present in the
+/// supplied source history entries (an invented/unsourced fact, ST-030).
+pub const SUMMARY_UNSOURCED_FACT: &str = "summary_unsourced_fact";

@@ -12,5 +12,6 @@ pub mod memory;
 pub mod prompt_context;
 pub mod reducer;
 pub mod state_machine;
+pub mod summary;
 pub mod tests_support;
 pub mod validator;
