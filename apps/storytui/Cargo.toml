@@ -1,0 +1,16 @@
+[package]
+name = "storytui"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+story-core.workspace = true
+story-model.workspace = true
+story-provider.workspace = true
+story-persistence.workspace = true
+story-tui.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

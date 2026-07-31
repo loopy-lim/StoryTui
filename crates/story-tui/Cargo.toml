@@ -1,0 +1,13 @@
+[package]
+name = "story-tui"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ratatui.workspace = true
+crossterm.workspace = true
+tokio.workspace = true
+story-model.workspace = true
+story-core.workspace = true
