@@ -1,0 +1,45 @@
+schema_version = "1.0.0"
+
+[[events]]
+id = "event.first_honest_exchange"
+priority = 10
+allow_relationship_skip = false
+trigger = { kind = "all", children = [
+  { kind = "flag_equals", id = "apologized", value = true },
+  { kind = "trust_at_least", character = "yuna", value = 2 },
+]}
+
+[events.effects]
+number_delta = { "yuna.trust" = 1 }
+
+[[events]]
+id = "event.truth_revealed"
+priority = 20
+allow_relationship_skip = false
+trigger = { kind = "all", children = [
+  { kind = "flag_equals", id = "mentioned_returned_letters", value = true },
+  { kind = "flag_equals", id = "asked_about_departure", value = true },
+]}
+
+[[events]]
+id = "event.reconciled"
+priority = 30
+allow_relationship_skip = true
+trigger = { kind = "all", children = [
+  { kind = "event_occurred", id = "event.truth_revealed" },
+  { kind = "flag_equals", id = "gave_space", value = true },
+  { kind = "trust_at_least", character = "yuna", value = 8 },
+]}
+
+[events.effects]
+set_flags = { "shared_umbrella" = false }
+
+[[events]]
+id = "event.shared_vulnerability"
+priority = 40
+allow_relationship_skip = false
+trigger = { kind = "all", children = [
+  { kind = "event_occurred", id = "event.reconciled" },
+  { kind = "affection_at_least", character = "yuna", value = 10 },
+  { kind = "trust_at_least", character = "yuna", value = 10 },
+]}

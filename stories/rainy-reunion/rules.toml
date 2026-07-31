@@ -1,0 +1,89 @@
+schema_version = "1.0.0"
+
+[limits]
+affection_min = -30
+affection_max = 30
+trust_min = -30
+trust_max = 30
+tension_min = 0
+tension_max = 30
+normal_delta_min = -3
+normal_delta_max = 3
+
+[[locations]]
+id = "cafe-namu"
+name = "카페 나무"
+connects_to = ["riverside-walk", "subway-entrance"]
+
+[[locations]]
+id = "riverside-walk"
+name = "강변 산책로"
+connects_to = ["cafe-namu", "subway-entrance"]
+
+[[locations]]
+id = "subway-entrance"
+name = "지하철역 입구"
+connects_to = ["cafe-namu", "riverside-walk"]
+
+[[flags]]
+id = "apologized"
+default = false
+description = "플레이어가 과거의 침묵에 대해 명시적으로 사과했다."
+
+[[flags]]
+id = "asked_about_departure"
+default = false
+description = "유나가 떠난 이유를 직접 물었다."
+
+[[flags]]
+id = "mentioned_returned_letters"
+default = false
+description = "반송된 편지의 존재를 밝혔다."
+
+[[flags]]
+id = "shared_umbrella"
+default = false
+description = "비 속에서 우산을 함께 썼다."
+
+[[flags]]
+id = "gave_space"
+default = false
+description = "대답을 강요하지 않고 기다리겠다고 말했다."
+
+[[numbers]]
+id = "yuna.affection"
+default = 0
+min = -30
+max = 30
+
+[[numbers]]
+id = "yuna.trust"
+default = 0
+min = -30
+max = 30
+
+[[numbers]]
+id = "yuna.tension"
+default = 8
+min = 0
+max = 30
+
+[[routes]]
+id = "reconciliation"
+premise = "두 사람은 과거의 오해를 인정하고 다시 연락하기로 합의한다."
+enter_condition = { kind = "all", children = [
+  { kind = "flag_equals", id = "apologized", value = true },
+  { kind = "flag_equals", id = "gave_space", value = true },
+  { kind = "trust_at_least", character = "yuna", value = 8 },
+]}
+
+[[endings]]
+id = "ending-new-beginning"
+label = "새로운 시작"
+condition = { kind = "all", children = [
+  { kind = "event_occurred", id = "event.reconciled" },
+  { kind = "event_occurred", id = "event.shared_vulnerability" },
+  { kind = "affection_at_least", character = "yuna", value = 12 },
+  { kind = "trust_at_least", character = "yuna", value = 12 },
+  { kind = "turn_at_least", value = 12 },
+]}
