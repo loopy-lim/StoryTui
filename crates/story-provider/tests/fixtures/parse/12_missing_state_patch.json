@@ -1,0 +1,25 @@
+{
+  "narration": "비가 그쳤다.",
+  "choices": [
+    {
+      "id": "c1",
+      "label": "기다린다",
+      "intent": "wait",
+      "tone": null,
+      "target": null,
+      "risk": "safe",
+      "hidden_requirements": [],
+      "preview": null
+    }
+  ],
+  "summary": {
+    "facts": [],
+    "unresolved": [],
+    "relationship_changes": [],
+    "knowledge_changes": [],
+    "interpretation": null,
+    "address_form_changes": [],
+    "important_player_actions": [],
+    "source_history_ids": []
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "narration": "비가 그쳤다.",
+  "choices": [],
+  "state_patch": {
+    "affection_delta": {},
+    "trust_delta": {},
+    "tension_delta": {},
+    "relationship_transitions": {},
+    "set_flags": {},
+    "number_delta": {},
+    "set_strings": {},
+    "inventory_delta": {},
+    "add_events": [],
+    "next_location": null,
+    "next_time_slot": null,
+    "proposed_route": null
+  },
+  "summary": {
+    "facts": [],
+    "unresolved": [],
+    "relationship_changes": [],
+    "knowledge_changes": [],
+    "interpretation": null,
+    "address_form_changes": [],
+    "important_player_actions": [],
+    "source_history_ids": []
+  }
+}

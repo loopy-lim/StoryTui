@@ -13,9 +13,11 @@ pub mod envelope;
 pub mod error;
 pub mod mock;
 pub mod provider;
+pub mod recovery;
 
 pub use mock::{MockProvider, MockResponse};
 pub use provider::LlmProvider;
+pub use recovery::{ParseOutcome, parse_generated_turn};
 
 // Convenient re-export of the boundary DTOs / error for downstream crates.
 pub use story_model::{

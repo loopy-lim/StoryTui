@@ -1,0 +1,36 @@
+{
+  "narration": "비가 그쳤다.",
+  "choices": [
+    { "id": "c1", "label": "a", "intent": "i", "tone": null, "target": null, "risk": "safe", "hidden_requirements": [], "preview": null },
+    { "id": "c2", "label": "b", "intent": "i", "tone": null, "target": null, "risk": "safe", "hidden_requirements": [], "preview": null },
+    { "id": "c3", "label": "c", "intent": "i", "tone": null, "target": null, "risk": "safe", "hidden_requirements": [], "preview": null },
+    { "id": "c4", "label": "d", "intent": "i", "tone": null, "target": null, "risk": "low", "hidden_requirements": [], "preview": null },
+    { "id": "c5", "label": "e", "intent": "i", "tone": null, "target": null, "risk": "low", "hidden_requirements": [], "preview": null },
+    { "id": "c6", "label": "f", "intent": "i", "tone": null, "target": null, "risk": "medium", "hidden_requirements": [], "preview": null },
+    { "id": "c7", "label": "g", "intent": "i", "tone": null, "target": null, "risk": "high", "hidden_requirements": [], "preview": null }
+  ],
+  "state_patch": {
+    "affection_delta": {},
+    "trust_delta": {},
+    "tension_delta": {},
+    "relationship_transitions": {},
+    "set_flags": {},
+    "number_delta": {},
+    "set_strings": {},
+    "inventory_delta": {},
+    "add_events": [],
+    "next_location": null,
+    "next_time_slot": null,
+    "proposed_route": null
+  },
+  "summary": {
+    "facts": [],
+    "unresolved": [],
+    "relationship_changes": [],
+    "knowledge_changes": [],
+    "interpretation": null,
+    "address_form_changes": [],
+    "important_player_actions": [],
+    "source_history_ids": []
+  }
+}
