@@ -19,6 +19,7 @@
 
 #![warn(clippy::all)]
 
+pub mod change_log;
 pub mod choice;
 pub mod condition;
 pub mod enums;
@@ -27,6 +28,7 @@ pub mod history;
 pub mod id;
 pub mod memory;
 pub mod patch;
+pub mod rules;
 pub mod state;
 pub mod turn;
 
@@ -37,6 +39,7 @@ pub mod turn;
 /// signals a migration is required.
 pub const SAVE_SCHEMA_VERSION: u32 = 1;
 
+pub use change_log::{ChangeDecision, ChangeSource, StateChangeLog};
 pub use choice::Choice;
 pub use condition::ConditionExpr;
 pub use enums::{
@@ -47,5 +50,10 @@ pub use history::HistoryEntry;
 pub use id::{CharacterId, EventId, FlagId, ItemId, LocationId};
 pub use memory::{MemoryEntry, MemoryFact};
 pub use patch::StatePatch;
+pub use rules::{
+    DEFAULT_DELTA_MAX, DEFAULT_DELTA_MIN, DEFAULT_STAT_MAX, DEFAULT_STAT_MIN, DeltaLimits,
+    EndingDef, EventDef, EventEffects, Int16Range, LocationDef, NumberVarDef, RouteDef, StoryRules,
+    StringVarDef,
+};
 pub use state::{CharacterState, ChoiceRef, GameState};
 pub use turn::{GeneratedTurn, GenerationWarning, ParsedAction, TokenUsage, TurnSummary};

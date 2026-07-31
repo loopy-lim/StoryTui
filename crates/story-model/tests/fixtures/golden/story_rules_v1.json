@@ -1,0 +1,102 @@
+{
+  "locations": {
+    "loc-classroom": {
+      "id": "loc-classroom",
+      "display_name": "Classroom 2-B",
+      "adjacent": [
+        "loc-hall"
+      ]
+    }
+  },
+  "allowed_flags": [
+    "f-brave",
+    "met_namu"
+  ],
+  "numbers": {
+    "score": {
+      "id": "score",
+      "min": 0,
+      "max": 100,
+      "default": 50
+    }
+  },
+  "strings": {
+    "address_form": {
+      "id": "address_form",
+      "max_len": 32,
+      "allowed": [
+        "casual",
+        "formal"
+      ]
+    }
+  },
+  "allowed_items": [
+    "i-letter"
+  ],
+  "events": {
+    "e-rooftop": {
+      "id": "e-rooftop",
+      "trigger": {
+        "kind": "at_location",
+        "location": "loc-roof"
+      },
+      "priority": 5,
+      "effects": {
+        "affection_delta": {
+          "c-namu": 2
+        },
+        "set_flags": {
+          "f-brave": true
+        },
+        "number_delta": {},
+        "add_events": [],
+        "force_location": "loc-roof",
+        "force_relationship": {},
+        "ending": null
+      },
+      "allow_relationship_skip": false,
+      "route_lock": "route-roof"
+    }
+  },
+  "routes": {
+    "route-roof": {
+      "id": "route-roof",
+      "enter_condition": {
+        "kind": "affection_at_least",
+        "character": "c-namu",
+        "value": 20
+      },
+      "premise": "The rooftop calls."
+    }
+  },
+  "endings": {
+    "end-good": {
+      "id": "end-good",
+      "condition": {
+        "kind": "affection_at_least",
+        "character": "c-namu",
+        "value": 100
+      },
+      "label": "Good ending"
+    }
+  },
+  "delta_limits": {
+    "affection": {
+      "min": -3,
+      "max": 3
+    },
+    "trust": {
+      "min": -3,
+      "max": 3
+    },
+    "tension": {
+      "min": -3,
+      "max": 3
+    }
+  },
+  "stat_limits": {
+    "min": -100,
+    "max": 100
+  },
+  "default_choice_count": 3
+}
