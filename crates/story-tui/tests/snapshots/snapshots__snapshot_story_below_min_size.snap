@@ -1,0 +1,5 @@
+---
+source: crates/story-tui/tests/snapshots.rs
+expression: "render_to_string(base_view(), 30, 8)"
+---
+터미널이 너무 작습니다 (최소 6

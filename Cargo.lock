@@ -2266,10 +2266,13 @@ name = "story-tui"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "insta",
  "ratatui",
  "story-core",
  "story-model",
  "tokio",
+ "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]

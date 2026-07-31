@@ -9,5 +9,10 @@ license.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 tokio.workspace = true
+unicode-width.workspace = true
+unicode-segmentation.workspace = true
 story-model.workspace = true
 story-core.workspace = true
+
+[dev-dependencies]
+insta.workspace = true

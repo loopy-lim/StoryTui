@@ -14,7 +14,7 @@ use story_model::{AppViewModel, DomainErrorView, GeneratedTurnDraft, TurnRequest
 
 /// A user / host intent handed to the engine. The engine validates each
 /// command against its current state and returns a [`crate::engine::Transition`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum EngineCommand {
     /// Initialize a fresh game from the pack and request the opening turn's
     /// choices. Idempotent over the pack: rebuilds `game` from
@@ -50,7 +50,7 @@ pub enum EngineCommand {
 /// A side-effect the engine *describes* but does not execute. The host app
 /// interprets this list (e.g. calls the provider for [`RequestGeneration`],
 /// hands [`PublishView`] to the TUI renderer).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum EngineEffect {
     /// Call the provider with `request`. The host feeds the result back as
     /// [`EngineCommand::AcceptGeneration`].
