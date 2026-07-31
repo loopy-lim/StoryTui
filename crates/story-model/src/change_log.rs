@@ -14,7 +14,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Originator of a proposed state change.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChangeSource {
     /// A patch emitted by the generation LLM.
@@ -30,7 +30,7 @@ pub enum ChangeSource {
 }
 
 /// Outcome of evaluating a single proposed change.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChangeDecision {
     /// The proposed value was applied verbatim.

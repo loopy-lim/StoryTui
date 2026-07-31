@@ -5,5 +5,6 @@
 
 pub mod error;
 pub mod eval;
+pub mod reducer;
 pub mod state_machine;
 pub mod validator;
