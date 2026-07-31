@@ -23,6 +23,12 @@ pub enum CoreError {
     #[error("forbidden transition: {0}")]
     ForbiddenTransition(String),
 
+    /// An [`crate::engine_cmd::EngineCommand`] was rejected before it could
+    /// produce effects (e.g. unknown choice id, generation already in flight).
+    /// `code` is one of the `ENGINE_*` consts.
+    #[error("invalid command ({code}): {detail}")]
+    InvalidCommand { code: &'static str, detail: String },
+
     /// A serde_json (de)serialization failure.
     #[error(transparent)]
     Json(#[from] story_model::serde_json::Error),
@@ -45,10 +51,20 @@ impl CoreError {
         }
     }
 
+    /// Construct an `InvalidCommand` with a reason code and detail.
+    pub fn invalid_command(code: &'static str, detail: impl Into<String>) -> Self {
+        Self::InvalidCommand {
+            code,
+            detail: detail.into(),
+        }
+    }
+
     /// Stable reason code carried by this error, if any.
     pub fn reason_code(&self) -> Option<&'static str> {
         match self {
-            Self::InvalidPatch { code, .. } | Self::RuleViolation { code, .. } => Some(code),
+            Self::InvalidPatch { code, .. }
+            | Self::RuleViolation { code, .. }
+            | Self::InvalidCommand { code, .. } => Some(code),
             Self::ForbiddenTransition(_) => Some(FORBIDDEN_TRANSITION),
             Self::Json(_) => None,
         }
@@ -90,3 +106,10 @@ pub const PATCH_STRING_VIOLATION: &str = "patch_string_violation";
 pub const PATCH_NUMBER_OUT_OF_RANGE: &str = "patch_number_out_of_range";
 /// Generic forbidden-transition code (used when none of the above apply).
 pub const FORBIDDEN_TRANSITION: &str = "forbidden_transition";
+
+/// `SubmitChoice` arrived while a generation is already pending.
+pub const ENGINE_GENERATION_IN_FLIGHT: &str = "engine_generation_in_flight";
+/// `SubmitChoice` referenced a choice id not in the current view.
+pub const ENGINE_UNKNOWN_CHOICE: &str = "engine_unknown_choice";
+/// `SubmitChoice` arrived when no choices are available yet.
+pub const ENGINE_NO_CHOICES: &str = "engine_no_choices";

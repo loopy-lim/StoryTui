@@ -4,6 +4,7 @@
 //! never depend on terminal, HTTP, or filesystem crates (ADR-003).
 
 pub mod engine;
+pub mod engine_cmd;
 pub mod error;
 pub mod eval;
 pub mod prompt_context;

@@ -19,9 +19,10 @@
 
 #![warn(clippy::all)]
 
-// Re-export `serde_json`, `uuid`, and `semver` so downstream crates (notably
-// `story-core`) can use them without adding a direct runtime dependency,
-// keeping their dependency tree minimal per ADR-003.
+// Re-export `serde_json`, `uuid`, `semver`, and `chrono` so downstream crates
+// (notably `story-core`) can use them without adding a direct runtime
+// dependency, keeping their dependency tree minimal per ADR-003.
+pub use chrono;
 pub use semver;
 pub use serde_json;
 pub use uuid;
@@ -40,6 +41,7 @@ pub mod provider_dto;
 pub mod rules;
 pub mod state;
 pub mod turn;
+pub mod view;
 
 /// Schema version this build of `story-model` writes and understands.
 ///
@@ -74,3 +76,4 @@ pub use rules::{
 };
 pub use state::{CharacterState, ChoiceRef, GameState};
 pub use turn::{GeneratedTurn, GenerationWarning, ParsedAction, TokenUsage, TurnSummary};
+pub use view::{AppViewModel, ChoiceView, DomainErrorView, LoadingState, Screen, StatusLine};
