@@ -1,0 +1,70 @@
+{
+  "save_schema_version": 1,
+  "story_id": "demo-story",
+  "story_version": "0.1.0",
+  "pack_schema_version": "1.0.0",
+  "session_id": "00000000-0000-0000-0000-000000000000",
+  "current_chapter": "ch-1",
+  "current_scene_id": "sc-roof",
+  "turn": 6,
+  "location": "loc-roof",
+  "time_slot": "evening",
+  "active_route": "route-main",
+  "characters": {
+    "c-namu": {
+      "affection": 25,
+      "trust": 10,
+      "tension": 3,
+      "relationship_stage": "friend",
+      "current_emotion": "surprised",
+      "known_facts": [
+        "player_is_transfer"
+      ],
+      "address_form_overrides": {}
+    }
+  },
+  "flags": {
+    "met_namu": true
+  },
+  "numbers": {
+    "score": 7
+  },
+  "strings": {
+    "address_form": "transfer-student"
+  },
+  "inventory": {
+    "i-letter": 1
+  },
+  "occurred_events": [
+    "e-first-meeting"
+  ],
+  "recent_summaries": [
+    "Met Namu in the hallway.",
+    "Walked to the rooftop."
+  ],
+  "memories": [
+    {
+      "id": "00000000-0000-0000-0000-000000000000",
+      "kind": "first_meeting",
+      "facts": [],
+      "interpretation": "First meeting with Namu.",
+      "participants": [
+        "c-namu"
+      ],
+      "location": "loc-hallway",
+      "importance": 8,
+      "unresolved": false,
+      "source_history_ids": [],
+      "created_turn": 1,
+      "last_recalled_turn": 6
+    }
+  ],
+  "history": [],
+  "last_choice": {
+    "choice_id": "ch-stay",
+    "label": "Stay with Namu",
+    "turn": 5
+  },
+  "revision": 7,
+  "stable_generation_id": "00000000-0000-0000-0000-000000000000"
+}

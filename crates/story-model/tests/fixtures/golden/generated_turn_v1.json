@@ -1,0 +1,125 @@
+{
+  "generation_id": "00000000-0000-0000-0000-000000000000",
+  "narration": "Wind tugs at your uniform on the rooftop.",
+  "choices": [
+    {
+      "id": "ch-stay",
+      "label": "Label for ch-stay",
+      "intent": "comfort",
+      "tone": "gentle",
+      "target": "c-namu",
+      "risk": "medium",
+      "hidden_requirements": [
+        {
+          "kind": "affection_at_least",
+          "character": "c-namu",
+          "value": 20
+        },
+        {
+          "kind": "flag_equals",
+          "id": "met_namu",
+          "value": true
+        }
+      ],
+      "preview": "She might smile."
+    },
+    {
+      "id": "ch-leave",
+      "label": "Label for ch-leave",
+      "intent": "comfort",
+      "tone": "gentle",
+      "target": "c-namu",
+      "risk": "medium",
+      "hidden_requirements": [
+        {
+          "kind": "affection_at_least",
+          "character": "c-namu",
+          "value": 20
+        },
+        {
+          "kind": "flag_equals",
+          "id": "met_namu",
+          "value": true
+        }
+      ],
+      "preview": "She might smile."
+    }
+  ],
+  "proposed_patch": {
+    "affection_delta": {
+      "c-namu": 6
+    },
+    "trust_delta": {
+      "c-namu": 3
+    },
+    "tension_delta": {},
+    "relationship_transitions": {},
+    "set_flags": {
+      "f-brave": true
+    },
+    "number_delta": {},
+    "set_strings": {},
+    "inventory_delta": {},
+    "add_events": [
+      "e-rooftop"
+    ],
+    "next_location": "loc-roof",
+    "next_time_slot": "evening",
+    "proposed_route": "route-roof"
+  },
+  "accepted_patch": {
+    "affection_delta": {
+      "c-namu": 6
+    },
+    "trust_delta": {
+      "c-namu": 3
+    },
+    "tension_delta": {},
+    "relationship_transitions": {},
+    "set_flags": {
+      "f-brave": true
+    },
+    "number_delta": {},
+    "set_strings": {},
+    "inventory_delta": {},
+    "add_events": [
+      "e-rooftop"
+    ],
+    "next_location": "loc-roof",
+    "next_time_slot": "evening",
+    "proposed_route": "route-roof"
+  },
+  "summary": {
+    "facts": [
+      "reached the rooftop"
+    ],
+    "unresolved": [
+      "Nam-u hasn't answered"
+    ],
+    "relationship_changes": [
+      "+6 affection Namu"
+    ],
+    "knowledge_changes": [
+      "rooftop exists"
+    ],
+    "interpretation": "The player chose to stay.",
+    "address_form_changes": [],
+    "important_player_actions": [
+      "stay_with_namu"
+    ],
+    "source_history_ids": [
+      "00000000-0000-0000-0000-000000000000"
+    ]
+  },
+  "warnings": [
+    {
+      "code": "fallback_parser",
+      "detail": "Used rule-based parser; confidence below threshold."
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 800,
+    "completion_tokens": 200,
+    "total_tokens": 1000
+  }
+}
