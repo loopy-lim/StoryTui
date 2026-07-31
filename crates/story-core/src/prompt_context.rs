@@ -24,7 +24,7 @@
 
 use sha2::{Digest, Sha256};
 use story_model::serde_json;
-use story_model::{GameState, HistoryEntry, StoryPack};
+use story_model::{GameState, HistoryEntry, ParsedAction, StoryPack};
 
 /// The assembled prompt: system + user strings plus the canonical hash.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,11 +39,19 @@ pub struct PromptBundle {
 
 /// Assemble a deterministic [`PromptBundle`] for one generation call.
 ///
-/// Pure function of (`pack`, `state`, `recent`). See the module docs for the
-/// ordering rules that make it deterministic and construction-order-independent.
-pub fn build_prompt(pack: &StoryPack, state: &GameState, recent: &[HistoryEntry]) -> PromptBundle {
-    let system = build_system(pack);
-    let user = build_user(pack, state, recent);
+/// Pure function of (`pack`, `state`, `recent`, `player_action`). When
+/// `player_action` is `Some`, the system prompt gets an extra player-
+/// sovereignty reinforcement and the user prompt carries the parsed action
+/// (with `original_text` verbatim). See the module docs for the ordering rules
+/// that make it deterministic and construction-order-independent.
+pub fn build_prompt(
+    pack: &StoryPack,
+    state: &GameState,
+    recent: &[HistoryEntry],
+    player_action: Option<&ParsedAction>,
+) -> PromptBundle {
+    let system = build_system(pack, player_action);
+    let user = build_user(pack, state, recent, player_action);
 
     let mut hasher = Sha256::new();
     hasher.update(system.as_bytes());
@@ -58,7 +66,7 @@ pub fn build_prompt(pack: &StoryPack, state: &GameState, recent: &[HistoryEntry]
 // system prompt
 // ---------------------------------------------------------------------------
 
-fn build_system(pack: &StoryPack) -> String {
+fn build_system(pack: &StoryPack, player_action: Option<&ParsedAction>) -> String {
     let mut s = String::new();
 
     // Role / safety / output contract from the Pack.
@@ -115,6 +123,16 @@ fn build_system(pack: &StoryPack) -> String {
          the player's free-text input.\n",
     );
 
+    // When this turn originates from a free-text action, reinforce the
+    // sovereignty clause in Korean right where the model reads its role.
+    if player_action.is_some() {
+        s.push_str(
+            "\n# Free-text action sovereignty\n\
+             이 입력은 플레이어의 의도다. 감정이나 행동을 임의로 확정/왜곡하지 말 것. \
+             플레이어가 명시하지 않은 사랑·용서·접촉·고백을 첨가하지 말 것.\n",
+        );
+    }
+
     s
 }
 
@@ -122,7 +140,12 @@ fn build_system(pack: &StoryPack) -> String {
 // user prompt
 // ---------------------------------------------------------------------------
 
-fn build_user(pack: &StoryPack, state: &GameState, recent: &[HistoryEntry]) -> String {
+fn build_user(
+    pack: &StoryPack,
+    state: &GameState,
+    recent: &[HistoryEntry],
+    player_action: Option<&ParsedAction>,
+) -> String {
     let mut s = String::new();
 
     s.push_str("# World\n");
@@ -151,6 +174,26 @@ fn build_user(pack: &StoryPack, state: &GameState, recent: &[HistoryEntry]) -> S
                 serde_json::to_string(&act.action_type).unwrap_or_else(|_| "\"?\"".to_string())
             ));
         }
+    }
+
+    // When this turn originates from a free-text action, surface the parsed
+    // intent (verbatim `original_text` + classification) to the model. The
+    // sovereignty rule lives in the system prompt; this block only conveys the
+    // player's input without interpreting it.
+    if let Some(pa) = player_action {
+        s.push_str("\n# Player free action\n");
+        s.push_str(&format!(
+            "action_type: {}\n",
+            serde_json::to_string(&pa.action_type).unwrap_or_else(|_| "\"?\"".to_string())
+        ));
+        if let Some(t) = &pa.target {
+            s.push_str(&format!("target: {}\n", t.0));
+        }
+        if let Some(c) = pa.confidence {
+            s.push_str(&format!("confidence: {c:.2}\n"));
+        }
+        s.push_str(&format!("content: {}\n", pa.content));
+        s.push_str(&format!("original_text: {}\n", pa.original_text));
     }
 
     s
@@ -294,7 +337,7 @@ mod tests {
     #[test]
     fn hash_matches_manual_sha256_of_concatenation() {
         let (pack, state) = minimal_fixture();
-        let bundle = build_prompt(&pack, &state, &[]);
+        let bundle = build_prompt(&pack, &state, &[], None);
         // Recompute the expected hash independently.
         let expected_input = format!("{}\n\n---\n\n{}", bundle.system, bundle.user);
         let mut h = Sha256::new();
@@ -311,7 +354,7 @@ mod tests {
     #[test]
     fn build_prompt_unit_runs_minimally() {
         let (pack, state) = minimal_fixture();
-        let b = build_prompt(&pack, &state, &[]);
+        let b = build_prompt(&pack, &state, &[], None);
         assert!(!b.system.is_empty());
         assert!(!b.user.is_empty());
         assert_eq!(b.hash.len(), 64);

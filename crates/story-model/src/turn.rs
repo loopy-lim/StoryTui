@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{ActionType, CharacterId, Choice, StatePatch};
 
 /// The player's action for a turn, parsed from free-text input.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ParsedAction {
     /// Coarse classification of the action.
     pub action_type: ActionType,

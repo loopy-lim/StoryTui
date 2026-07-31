@@ -248,7 +248,7 @@ fn fixture(reversed: bool) -> (StoryPack, GameState, Vec<HistoryEntry>) {
 #[test]
 fn golden_prompt_snapshot_is_stable() {
     let (pack, state, recent) = fixture(false);
-    let bundle = build_prompt(&pack, &state, &recent);
+    let bundle = build_prompt(&pack, &state, &recent, None);
     let combined = format!(
         "=== SYSTEM ===\n{}\n\n=== USER ===\n{}\n\n=== HASH ===\n{}",
         bundle.system, bundle.user, bundle.hash
@@ -259,7 +259,7 @@ fn golden_prompt_snapshot_is_stable() {
 #[test]
 fn hash_is_64_lowercase_hex_chars() {
     let (pack, state, recent) = fixture(false);
-    let bundle = build_prompt(&pack, &state, &recent);
+    let bundle = build_prompt(&pack, &state, &recent, None);
     assert_eq!(bundle.hash.len(), 64);
     assert!(
         bundle
@@ -275,8 +275,8 @@ fn hash_is_64_lowercase_hex_chars() {
 fn same_inputs_produce_identical_bundle() {
     // Determinism: pure function of inputs.
     let (pack, state, recent) = fixture(false);
-    let b1 = build_prompt(&pack, &state, &recent);
-    let b2 = build_prompt(&pack, &state, &recent);
+    let b1 = build_prompt(&pack, &state, &recent, None);
+    let b2 = build_prompt(&pack, &state, &recent, None);
     assert_eq!(b1, b2);
 }
 
@@ -289,8 +289,8 @@ fn ordering_independent_of_btreemap_construction_order() {
     let (pack_f, state_f, recent_f) = fixture(false);
     let (pack_r, state_r, recent_r) = fixture(true);
 
-    let bf: PromptBundle = build_prompt(&pack_f, &state_f, &recent_f);
-    let br: PromptBundle = build_prompt(&pack_r, &state_r, &recent_r);
+    let bf: PromptBundle = build_prompt(&pack_f, &state_f, &recent_f, None);
+    let br: PromptBundle = build_prompt(&pack_r, &state_r, &recent_r, None);
 
     assert_eq!(bf.system, br.system, "system differs under reordering");
     assert_eq!(bf.user, br.user, "user differs under reordering");
@@ -301,7 +301,7 @@ fn ordering_independent_of_btreemap_construction_order() {
 fn different_recent_history_changes_hash() {
     // Sanity: the hash is sensitive to inputs (not a constant).
     let (pack, state, recent) = fixture(false);
-    let b1 = build_prompt(&pack, &state, &recent);
-    let b2 = build_prompt(&pack, &state, &recent[..recent.len() - 1]);
+    let b1 = build_prompt(&pack, &state, &recent, None);
+    let b2 = build_prompt(&pack, &state, &recent[..recent.len() - 1], None);
     assert_ne!(b1.hash, b2.hash, "hash must react to history changes");
 }

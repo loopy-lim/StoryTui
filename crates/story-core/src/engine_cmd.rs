@@ -10,7 +10,7 @@
 //! and the [`crate::engine::reduce`] function.
 
 use story_model::uuid::Uuid;
-use story_model::{AppViewModel, DomainErrorView, GeneratedTurnDraft, TurnRequest};
+use story_model::{AppViewModel, DomainErrorView, GeneratedTurnDraft, ParsedAction, TurnRequest};
 
 /// A user / host intent handed to the engine. The engine validates each
 /// command against its current state and returns a [`crate::engine::Transition`].
@@ -25,6 +25,29 @@ pub enum EngineCommand {
     SubmitChoice {
         /// Id of the chosen [`story_model::Choice`].
         choice_id: String,
+    },
+    /// The player typed free text (parsed into a [`ParsedAction`] by the
+    /// rule-based parser). Behaves like [`SubmitChoice`]: requires no pending
+    /// generation, snapshots a checkpoint, and requests a generation whose
+    /// prompt carries the parsed action + the player-sovereignty clause.
+    /// `action` is boxed to keep this variant cheap relative to
+    /// [`EngineCommand::AcceptGeneration`].
+    SubmitFreeAction {
+        /// The parsed free-text action. `original_text` is forwarded verbatim
+        /// into the prompt; the engine never paraphrases it.
+        action: Box<ParsedAction>,
+    },
+    /// Re-roll the in-flight generation for the current turn: cancels the
+    /// pending generation and re-requests from the SAME checkpoint with a fresh
+    /// `generation_id` (recorded in the turn's lineage). The previously
+    /// committed turn is NOT touched. No-op when no generation is pending.
+    RegenerateCurrentTurn,
+    /// Restore a prior committed-state checkpoint (kept in the engine's
+    /// in-memory checkpoint ring). Clears any pending generation. No-op when
+    /// `checkpoint_id` does not match a stored checkpoint.
+    RestoreCheckpoint {
+        /// Id of the checkpoint to restore (one of `EngineState::checkpoints`).
+        checkpoint_id: Uuid,
     },
     /// A generation completed. The draft's `generation_id` must match the
     /// pending one; a mismatch (or no pending generation) is a late/stale
