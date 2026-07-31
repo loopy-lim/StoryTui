@@ -1,0 +1,18 @@
+# Rust build artifacts
+/target
+
+# Save files (game state)
+/saves
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Claude Code session/runtime artifacts
+.claude/*.lock
+
+# Keep Cargo.lock (binary app present, do NOT ignore)
