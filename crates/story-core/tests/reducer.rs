@@ -478,6 +478,10 @@ use story_core::eval::{EvalContext, evaluate};
 fn rules_with_event(axis: &'static str, delta: i16) -> StoryRules {
     let mut r = hand_built_rules();
     let effects = match axis {
+        "affection" => EventEffects {
+            affection_delta: BTreeMap::from([(CharacterId("c-namu".to_string()), delta)]),
+            ..EventEffects::default()
+        },
         "trust" => EventEffects {
             trust_delta: BTreeMap::from([(CharacterId("c-namu".to_string()), delta)]),
             ..EventEffects::default()
@@ -592,6 +596,24 @@ fn event_tension_delta_advances_character_tension_stat() {
             && e.source == story_model::ChangeSource::EventRule
     }));
     let _ = ctx; // silence unused warning if ConditionExpr grows no tension variant
+}
+
+#[test]
+fn event_affection_delta_out_of_range_is_rejected_atomically() {
+    let state = hand_built_state(); // c-namu.affection = 25
+    let rules = rules_with_event("affection", 5); // default delta_limits.affection = -3..=3
+    let err = apply_patch(&state, &rules, &patch_firing_axis_event(), GEN_ID).unwrap_err();
+    assert_eq!(err.reason_code(), Some(PATCH_DELTA_OUT_OF_RANGE));
+    // Atomicity: caller's state untouched.
+    assert_eq!(state.revision, 5);
+    assert_eq!(
+        state
+            .characters
+            .get(&CharacterId("c-namu".to_string()))
+            .unwrap()
+            .affection,
+        25
+    );
 }
 
 #[test]

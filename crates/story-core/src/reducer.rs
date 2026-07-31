@@ -388,26 +388,22 @@ fn apply_event_effects(
     let source = ChangeSource::EventRule;
     let rule_id = ev_id.0.clone();
 
-    for (ch, delta) in &effects.affection_delta {
-        if let Some(c) = next.characters.get_mut(ch) {
-            let was = c.affection;
-            c.affection = was.saturating_add(*delta);
-            let entry = ChangeEntry::applied(
-                source,
-                format!("characters.{ch}.affection"),
-                serde_json::json!(was),
-                serde_json::json!(delta),
-                serde_json::json!(c.affection),
-            )
-            .with_rule(rule_id.clone());
-            log.record(entry);
-        }
-    }
-    // Trust/tension: same apply mechanics as affection (saturating_add, skip
-    // unknown characters defensively) plus the delta-magnitude and projected-
-    // stat range guards the patch-path validator enforces. Out-of-range deltas
-    // reject the whole turn with an error (no silent clamp); atomicity holds
-    // because the reducer only ever mutates a clone of the caller's state.
+    // Affection/trust/tension share the same apply mechanics —
+    // [`i16::saturating_add`] under a `characters.{c}.<axis>` change-log entry
+    // attributed to [`ChangeSource::EventRule`] — plus the delta-magnitude and
+    // projected-stat range guards the patch-path validator enforces. Out-of-
+    // range deltas reject the whole turn with an error (no silent clamp);
+    // atomicity holds because the reducer only ever mutates a clone of the
+    // caller's state.
+    apply_event_affection_delta(
+        next,
+        rules,
+        &effects.affection_delta,
+        ev_id,
+        source,
+        &rule_id,
+        log,
+    )?;
     apply_event_trust_delta(
         next,
         rules,
@@ -503,14 +499,65 @@ fn apply_event_effects(
 }
 
 // ---------------------------------------------------------------------------
-// Per-axis event-effect application (trust/tension)
+// Per-axis event-effect application (affection/trust/tension)
 // ---------------------------------------------------------------------------
+
+/// Apply `effects.affection_delta` to `state.characters[c].affection`.
+///
+/// Structurally identical to [`apply_event_trust_delta`]; see its docs.
+fn apply_event_affection_delta(
+    next: &mut GameState,
+    rules: &StoryRules,
+    deltas: &BTreeMap<CharacterId, i16>,
+    ev_id: &EventId,
+    source: ChangeSource,
+    rule_id: &str,
+    log: &mut ChangeLog,
+) -> Result<(), CoreError> {
+    let range = &rules.delta_limits.affection;
+    for (ch, delta) in deltas {
+        let Some(c) = next.characters.get_mut(ch) else {
+            continue;
+        };
+        if !range.contains(*delta) {
+            return Err(CoreError::invalid_patch(
+                PATCH_DELTA_OUT_OF_RANGE,
+                format!(
+                    "event {ev_id} affection_delta for {ch} is {delta}, outside [{}, {}]",
+                    range.min, range.max
+                ),
+            ));
+        }
+        let was = c.affection;
+        let projected = was.saturating_add(*delta);
+        if !rules.stat_limits.contains(projected) {
+            return Err(CoreError::invalid_patch(
+                PATCH_STAT_OUT_OF_RANGE,
+                format!(
+                    "event {ev_id} affection for {ch} projected to {projected}, outside [{}, {}]",
+                    rules.stat_limits.min, rules.stat_limits.max
+                ),
+            ));
+        }
+        c.affection = projected;
+        let entry = ChangeEntry::applied(
+            source,
+            format!("characters.{ch}.affection"),
+            serde_json::json!(was),
+            serde_json::json!(delta),
+            serde_json::json!(projected),
+        )
+        .with_rule(rule_id.to_string());
+        log.record(entry);
+    }
+    Ok(())
+}
 
 /// Apply `effects.trust_delta` to `state.characters[c].trust`.
 ///
-/// Mirrors the affection apply mechanics — [`i16::saturating_add`] under a
+/// Uses the same apply mechanics — [`i16::saturating_add`] under a
 /// `characters.{c}.trust` change-log entry attributed to
-/// [`ChangeSource::EventRule`] — and adds the same delta-magnitude +
+/// [`ChangeSource::EventRule`] — plus the same delta-magnitude +
 /// projected-stat range guards the patch-path validator applies via
 /// `check_axis_delta`. Unknown character ids are skipped defensively (the
 /// Pack-load-time referential-integrity check is expected to catch them
