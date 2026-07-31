@@ -8,6 +8,7 @@ pub mod engine;
 pub mod engine_cmd;
 pub mod error;
 pub mod eval;
+pub mod memory;
 pub mod prompt_context;
 pub mod reducer;
 pub mod state_machine;
