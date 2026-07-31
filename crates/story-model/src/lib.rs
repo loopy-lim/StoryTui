@@ -30,6 +30,7 @@ pub use uuid;
 pub mod change_log;
 pub mod choice;
 pub mod condition;
+pub mod director;
 pub mod enums;
 pub mod error;
 pub mod history;
@@ -54,6 +55,10 @@ pub const SAVE_SCHEMA_VERSION: u32 = 1;
 pub use change_log::{ChangeDecision, ChangeSource, StateChangeLog};
 pub use choice::Choice;
 pub use condition::ConditionExpr;
+pub use director::{
+    ConflictCheck, DirectorPlan, DirectorRequest, EmotionArc, WriterEvent, WriterFinish,
+    WriterLintIssue, WriterRequest,
+};
 pub use enums::{
     ActionType, CompareOp, Emotion, MemoryKind, RelationshipStage, RiskLevel, TimeSlot,
 };
