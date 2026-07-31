@@ -126,8 +126,10 @@ fn missing_required_file_aggregates_with_other_missing() {
     fs::remove_file(dir.path().join("events.toml")).unwrap();
     let err = PackLoader::load(dir.path()).expect_err("multiple missing");
     let s = format!("{err}");
-    // both should appear in the aggregated Multiple bundle
-    assert!(s.contains("팩 오류 2건"), "expected aggregation: {s}");
+    // Both missing-file errors must appear in the aggregated bundle; later
+    // validators may add more (e.g. unknown initial_state.location) so we
+    // assert each missing-file entry is present, not the exact count.
+    assert!(s.contains("팩 오류"), "expected aggregation: {s}");
     assert!(s.contains("rules.toml"));
     assert!(s.contains("events.toml"));
 }
