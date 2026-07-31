@@ -64,6 +64,8 @@ fn sample_rules() -> StoryRules {
             priority: 5,
             effects: EventEffects {
                 affection_delta: BTreeMap::from([(CharacterId("c-namu".to_string()), 2)]),
+                trust_delta: BTreeMap::new(),
+                tension_delta: BTreeMap::new(),
                 set_flags: BTreeMap::from([("f-brave".to_string(), true)]),
                 number_delta: BTreeMap::new(),
                 add_events: BTreeSet::new(),

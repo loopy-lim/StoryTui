@@ -181,6 +181,58 @@ set_flags = { "ghost_flag" = true }
 }
 
 #[test]
+fn unknown_event_effect_trust_delta_character_is_caught() {
+    let dir = base_teen_pack();
+    // trust_delta on a character id that is not in characters.toml must be
+    // flagged by the Pack referential-integrity pass on the new typed field
+    // (previously the loader routed trust/tension into number_delta, masking
+    // a bad character id behind a "{cid}.trust" number-variable lookup).
+    write(
+        dir.path(),
+        "events.toml",
+        r#"
+schema_version = "1.0.0"
+[[events]]
+id = "event.x"
+priority = 1
+trigger = { kind = "flag_equals", id = "apologized", value = true }
+[events.effects]
+trust_delta = { "ghost_char" = 1 }
+"#,
+    );
+    let err = PackLoader::load(dir.path()).expect_err("unknown trust_delta character");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("참조 오류") && msg.contains("ghost_char"),
+        "expected reference error mentioning ghost_char: {msg}"
+    );
+}
+
+#[test]
+fn unknown_event_effect_tension_delta_character_is_caught() {
+    let dir = base_teen_pack();
+    write(
+        dir.path(),
+        "events.toml",
+        r#"
+schema_version = "1.0.0"
+[[events]]
+id = "event.x"
+priority = 1
+trigger = { kind = "flag_equals", id = "apologized", value = true }
+[events.effects]
+tension_delta = { "ghost_char" = 1 }
+"#,
+    );
+    let err = PackLoader::load(dir.path()).expect_err("unknown tension_delta character");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("참조 오류") && msg.contains("ghost_char"),
+        "expected reference error mentioning ghost_char: {msg}"
+    );
+}
+
+#[test]
 fn duplicate_character_id_is_caught() {
     let dir = base_teen_pack();
     let chars_path = dir.path().join("characters.toml");

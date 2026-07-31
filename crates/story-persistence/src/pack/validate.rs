@@ -109,6 +109,20 @@ pub fn check_references(pack: &StoryPack) -> Vec<PackError> {
                 )));
             }
         }
+        for cid in ev.effects.trust_delta.keys() {
+            if !idx.characters.contains(cid) {
+                errs.push(PackError::reference(format!(
+                    "이벤트 {eid} 의 trust_delta 가 알 수 없는 캐릭터를 참조합니다: {cid}"
+                )));
+            }
+        }
+        for cid in ev.effects.tension_delta.keys() {
+            if !idx.characters.contains(cid) {
+                errs.push(PackError::reference(format!(
+                    "이벤트 {eid} 의 tension_delta 가 알 수 없는 캐릭터를 참조합니다: {cid}"
+                )));
+            }
+        }
         for nid in ev.effects.number_delta.keys() {
             if !idx.numbers.contains(nid) {
                 errs.push(PackError::reference(format!(

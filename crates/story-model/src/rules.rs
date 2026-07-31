@@ -174,6 +174,10 @@ pub struct EventDef {
 pub struct EventEffects {
     /// Additive affection change per character.
     pub affection_delta: BTreeMap<CharacterId, i16>,
+    /// Additive trust change per character.
+    pub trust_delta: BTreeMap<CharacterId, i16>,
+    /// Additive tension change per character.
+    pub tension_delta: BTreeMap<CharacterId, i16>,
     /// Flag assignments.
     pub set_flags: BTreeMap<String, bool>,
     /// Additive number changes.
@@ -237,5 +241,33 @@ mod tests {
         assert_eq!(r.stat_limits.min, DEFAULT_STAT_MIN);
         assert_eq!(r.stat_limits.max, DEFAULT_STAT_MAX);
         assert_eq!(r.default_choice_count, 3);
+    }
+
+    #[test]
+    fn event_effects_default_has_empty_typed_deltas() {
+        let e = EventEffects::default();
+        assert!(e.affection_delta.is_empty());
+        assert!(e.trust_delta.is_empty());
+        assert!(e.tension_delta.is_empty());
+    }
+
+    #[test]
+    fn event_effects_round_trips_typed_deltas() {
+        let mut e = EventEffects::default();
+        e.affection_delta.insert(CharacterId("c-namu".into()), 2);
+        e.trust_delta.insert(CharacterId("c-namu".into()), 3);
+        e.tension_delta.insert(CharacterId("c-namu".into()), -1);
+        let json = serde_json::to_string(&e).expect("serialize");
+        let back: EventEffects = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(e, back);
+        // Trust/tension serialize as their own typed keys — NOT under number_delta.
+        assert!(
+            json.contains("\"trust_delta\""),
+            "trust_delta key missing from JSON: {json}"
+        );
+        assert!(
+            json.contains("\"tension_delta\""),
+            "tension_delta key missing from JSON: {json}"
+        );
     }
 }

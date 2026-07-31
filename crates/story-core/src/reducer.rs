@@ -24,7 +24,7 @@
 //! Atomicity: on any error after cloning, return `Err`. The original state is
 //! never mutated because we only ever mutate the clone.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use story_model::serde_json;
 use story_model::uuid::Uuid;
@@ -33,7 +33,7 @@ use story_model::{
     StateChangeLog, StatePatch, StoryRules,
 };
 
-use crate::error::CoreError;
+use crate::error::{CoreError, PATCH_DELTA_OUT_OF_RANGE, PATCH_STAT_OUT_OF_RANGE};
 use crate::eval::{EvalContext, evaluate};
 use crate::state_machine::{confirm_route, resolve_ending, resolve_relationship_transition};
 use crate::validator::{ValidationOutcome, validate};
@@ -105,7 +105,7 @@ pub fn apply_patch(
             .events
             .get(ev_id)
             .expect("fired events come from add_events validated against rules");
-        apply_event_effects(state, &mut next, rules, &def.effects, ev_id, &mut log);
+        apply_event_effects(state, &mut next, rules, &def.effects, ev_id, &mut log)?;
     }
 
     // --- Stage 7e: resolve route + ending ------------------------------
@@ -384,7 +384,7 @@ fn apply_event_effects(
     effects: &EventEffects,
     ev_id: &EventId,
     log: &mut ChangeLog,
-) {
+) -> Result<(), CoreError> {
     let source = ChangeSource::EventRule;
     let rule_id = ev_id.0.clone();
 
@@ -403,6 +403,29 @@ fn apply_event_effects(
             log.record(entry);
         }
     }
+    // Trust/tension: same apply mechanics as affection (saturating_add, skip
+    // unknown characters defensively) plus the delta-magnitude and projected-
+    // stat range guards the patch-path validator enforces. Out-of-range deltas
+    // reject the whole turn with an error (no silent clamp); atomicity holds
+    // because the reducer only ever mutates a clone of the caller's state.
+    apply_event_trust_delta(
+        next,
+        rules,
+        &effects.trust_delta,
+        ev_id,
+        source,
+        &rule_id,
+        log,
+    )?;
+    apply_event_tension_delta(
+        next,
+        rules,
+        &effects.tension_delta,
+        ev_id,
+        source,
+        &rule_id,
+        log,
+    )?;
     for (id, value) in &effects.set_flags {
         let was = before.flags.get(id).copied();
         next.flags.insert(id.clone(), *value);
@@ -476,6 +499,121 @@ fn apply_event_effects(
     // solely by resolve_ending() from EndingDef conditions, never from events
     // or the patch. (Documented for future maintainers.)
     let _ = effects.ending;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Per-axis event-effect application (trust/tension)
+// ---------------------------------------------------------------------------
+
+/// Apply `effects.trust_delta` to `state.characters[c].trust`.
+///
+/// Mirrors the affection apply mechanics — [`i16::saturating_add`] under a
+/// `characters.{c}.trust` change-log entry attributed to
+/// [`ChangeSource::EventRule`] — and adds the same delta-magnitude +
+/// projected-stat range guards the patch-path validator applies via
+/// `check_axis_delta`. Unknown character ids are skipped defensively (the
+/// Pack-load-time referential-integrity check is expected to catch them
+/// earlier); an out-of-range delta for a *known* character rejects the turn
+/// with [`CoreError::invalid_patch`] so the reducer's atomic clone is
+/// discarded and the caller's state is left byte-identical.
+fn apply_event_trust_delta(
+    next: &mut GameState,
+    rules: &StoryRules,
+    deltas: &BTreeMap<CharacterId, i16>,
+    ev_id: &EventId,
+    source: ChangeSource,
+    rule_id: &str,
+    log: &mut ChangeLog,
+) -> Result<(), CoreError> {
+    let range = &rules.delta_limits.trust;
+    for (ch, delta) in deltas {
+        let Some(c) = next.characters.get_mut(ch) else {
+            continue;
+        };
+        if !range.contains(*delta) {
+            return Err(CoreError::invalid_patch(
+                PATCH_DELTA_OUT_OF_RANGE,
+                format!(
+                    "event {ev_id} trust_delta for {ch} is {delta}, outside [{}, {}]",
+                    range.min, range.max
+                ),
+            ));
+        }
+        let was = c.trust;
+        let projected = was.saturating_add(*delta);
+        if !rules.stat_limits.contains(projected) {
+            return Err(CoreError::invalid_patch(
+                PATCH_STAT_OUT_OF_RANGE,
+                format!(
+                    "event {ev_id} trust for {ch} projected to {projected}, outside [{}, {}]",
+                    rules.stat_limits.min, rules.stat_limits.max
+                ),
+            ));
+        }
+        c.trust = projected;
+        let entry = ChangeEntry::applied(
+            source,
+            format!("characters.{ch}.trust"),
+            serde_json::json!(was),
+            serde_json::json!(delta),
+            serde_json::json!(projected),
+        )
+        .with_rule(rule_id.to_string());
+        log.record(entry);
+    }
+    Ok(())
+}
+
+/// Apply `effects.tension_delta` to `state.characters[c].tension`.
+///
+/// Structurally identical to [`apply_event_trust_delta`]; see its docs.
+fn apply_event_tension_delta(
+    next: &mut GameState,
+    rules: &StoryRules,
+    deltas: &BTreeMap<CharacterId, i16>,
+    ev_id: &EventId,
+    source: ChangeSource,
+    rule_id: &str,
+    log: &mut ChangeLog,
+) -> Result<(), CoreError> {
+    let range = &rules.delta_limits.tension;
+    for (ch, delta) in deltas {
+        let Some(c) = next.characters.get_mut(ch) else {
+            continue;
+        };
+        if !range.contains(*delta) {
+            return Err(CoreError::invalid_patch(
+                PATCH_DELTA_OUT_OF_RANGE,
+                format!(
+                    "event {ev_id} tension_delta for {ch} is {delta}, outside [{}, {}]",
+                    range.min, range.max
+                ),
+            ));
+        }
+        let was = c.tension;
+        let projected = was.saturating_add(*delta);
+        if !rules.stat_limits.contains(projected) {
+            return Err(CoreError::invalid_patch(
+                PATCH_STAT_OUT_OF_RANGE,
+                format!(
+                    "event {ev_id} tension for {ch} projected to {projected}, outside [{}, {}]",
+                    rules.stat_limits.min, rules.stat_limits.max
+                ),
+            ));
+        }
+        c.tension = projected;
+        let entry = ChangeEntry::applied(
+            source,
+            format!("characters.{ch}.tension"),
+            serde_json::json!(was),
+            serde_json::json!(delta),
+            serde_json::json!(projected),
+        )
+        .with_rule(rule_id.to_string());
+        log.record(entry);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

@@ -45,6 +45,8 @@
         "affection_delta": {
           "c-namu": 2
         },
+        "trust_delta": {},
+        "tension_delta": {},
         "set_flags": {
           "f-brave": true
         },

@@ -10,7 +10,7 @@ trigger = { kind = "all", children = [
 ]}
 
 [events.effects]
-number_delta = { "yuna.trust" = 1 }
+trust_delta = { "yuna" = 1 }
 
 [[events]]
 id = "event.truth_revealed"

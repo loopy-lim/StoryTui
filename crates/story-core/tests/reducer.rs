@@ -462,3 +462,180 @@ fn no_narration_text_appears_in_change_log() {
         );
     }
 }
+
+// ===========================================================================
+// Event trust_delta / tension_delta reach the character stat (W5 fix)
+//
+// Regression: previously the Pack loader rewrote event trust/tension deltas
+// into effects.number_delta under keys like "c-namu.trust", so at runtime they
+// landed in state.numbers — never in state.characters[c].trust/.tension where
+// TrustAtLeast/AffectionAtLeast actually read. These tests pin the typed path.
+// ===========================================================================
+
+use story_core::error::PATCH_STAT_OUT_OF_RANGE;
+use story_core::eval::{EvalContext, evaluate};
+
+fn rules_with_event(axis: &'static str, delta: i16) -> StoryRules {
+    let mut r = hand_built_rules();
+    let effects = match axis {
+        "trust" => EventEffects {
+            trust_delta: BTreeMap::from([(CharacterId("c-namu".to_string()), delta)]),
+            ..EventEffects::default()
+        },
+        "tension" => EventEffects {
+            tension_delta: BTreeMap::from([(CharacterId("c-namu".to_string()), delta)]),
+            ..EventEffects::default()
+        },
+        _ => unreachable!("unknown axis {axis}"),
+    };
+    r.events.insert(
+        EventId("e-axis".to_string()),
+        EventDef {
+            id: EventId("e-axis".to_string()),
+            // met_namu is already true in hand_built_state → trigger fires.
+            trigger: ConditionExpr::FlagEquals {
+                id: "met_namu".to_string(),
+                value: true,
+            },
+            priority: 1,
+            effects,
+            allow_relationship_skip: false,
+            route_lock: None,
+        },
+    );
+    r
+}
+
+fn patch_firing_axis_event() -> StatePatch {
+    StatePatch {
+        add_events: BTreeSet::from(["e-axis".to_string()]),
+        ..StatePatch::default()
+    }
+}
+
+#[test]
+fn event_trust_delta_advances_character_trust_stat() {
+    let state = hand_built_state(); // c-namu.trust = 10
+    let rules = rules_with_event("trust", 2);
+    let result = apply_patch(&state, &rules, &patch_firing_axis_event(), GEN_ID).expect("applies");
+
+    assert!(result.fired_events.contains(&EventId("e-axis".to_string())));
+    // Event trust_delta reached the character stat: 10 + 2 = 12.
+    let after = result
+        .state
+        .characters
+        .get(&CharacterId("c-namu".to_string()))
+        .unwrap();
+    assert_eq!(
+        after.trust, 12,
+        "event trust_delta must land in characters[c].trust"
+    );
+
+    // A subsequent TrustAtLeast reads the advanced stat (the bug being fixed).
+    let ctx = EvalContext {
+        state: &result.state,
+        rules: &rules,
+    };
+    assert!(
+        evaluate(
+            &ConditionExpr::TrustAtLeast {
+                character: CharacterId("c-namu".to_string()),
+                value: 12,
+            },
+            &ctx,
+        ),
+        "TrustAtLeast {{ c-namu, 12 }} must be true after the event fired"
+    );
+    assert!(
+        !evaluate(
+            &ConditionExpr::TrustAtLeast {
+                character: CharacterId("c-namu".to_string()),
+                value: 13,
+            },
+            &ctx,
+        ),
+        "TrustAtLeast {{ c-namu, 13 }} must be false — proves the gate reads the real stat"
+    );
+
+    // The change log carries an EventRule entry on the trust field path.
+    assert!(result.change_log.iter().any(|e| {
+        e.field_path == "characters.c-namu.trust"
+            && e.source == story_model::ChangeSource::EventRule
+            && e.rule_id.as_deref() == Some("e-axis")
+    }));
+}
+
+#[test]
+fn event_tension_delta_advances_character_tension_stat() {
+    let state = hand_built_state(); // c-namu.tension = 3
+    let rules = rules_with_event("tension", 2);
+    let result = apply_patch(&state, &rules, &patch_firing_axis_event(), GEN_ID).expect("applies");
+
+    let after = result
+        .state
+        .characters
+        .get(&CharacterId("c-namu".to_string()))
+        .unwrap();
+    assert_eq!(
+        after.tension, 5,
+        "event tension_delta must land in characters[c].tension"
+    );
+
+    let ctx = EvalContext {
+        state: &result.state,
+        rules: &rules,
+    };
+    // Tension has no dedicated ConditionExpr variant, but the stat change is
+    // observable directly and the change-log entry proves the typed path.
+    assert!(result.change_log.iter().any(|e| {
+        e.field_path == "characters.c-namu.tension"
+            && e.source == story_model::ChangeSource::EventRule
+    }));
+    let _ = ctx; // silence unused warning if ConditionExpr grows no tension variant
+}
+
+#[test]
+fn event_trust_delta_out_of_range_is_rejected_atomically() {
+    let state = hand_built_state(); // c-namu.trust = 10
+    let rules = rules_with_event("trust", 5); // default delta_limits.trust = -3..=3
+    let err = apply_patch(&state, &rules, &patch_firing_axis_event(), GEN_ID).unwrap_err();
+    assert_eq!(err.reason_code(), Some(PATCH_DELTA_OUT_OF_RANGE));
+    // Atomicity: caller's state untouched.
+    assert_eq!(state.revision, 5);
+    assert_eq!(
+        state
+            .characters
+            .get(&CharacterId("c-namu".to_string()))
+            .unwrap()
+            .trust,
+        10
+    );
+}
+
+#[test]
+fn event_trust_delta_projected_stat_out_of_range_is_rejected() {
+    let state = hand_built_state();
+    let mut rules = hand_built_rules();
+    // Permit the delta magnitude but shrink the stat ceiling so 10 + 3 = 13
+    // exceeds stat_limits.max (= 12).
+    rules.stat_limits = story_model::Int16Range { min: -100, max: 12 };
+    rules.events.insert(
+        EventId("e-axis".to_string()),
+        EventDef {
+            id: EventId("e-axis".to_string()),
+            trigger: ConditionExpr::FlagEquals {
+                id: "met_namu".to_string(),
+                value: true,
+            },
+            priority: 1,
+            effects: EventEffects {
+                trust_delta: BTreeMap::from([(CharacterId("c-namu".to_string()), 3)]),
+                ..EventEffects::default()
+            },
+            allow_relationship_skip: false,
+            route_lock: None,
+        },
+    );
+    let err = apply_patch(&state, &rules, &patch_firing_axis_event(), GEN_ID).unwrap_err();
+    assert_eq!(err.reason_code(), Some(PATCH_STAT_OUT_OF_RANGE));
+}

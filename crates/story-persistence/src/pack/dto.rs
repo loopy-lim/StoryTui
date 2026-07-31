@@ -572,18 +572,11 @@ pub fn merge_events_into_rules(
         for (cid, v) in &ev.effects.affection_delta {
             effects.affection_delta.insert(CharacterId(cid.clone()), *v);
         }
-        // trust/tension are not on canonical EventEffects; record them as
-        // number deltas under their canonical variable id when present so
-        // they do not get silently dropped at the validation layer.
         for (cid, v) in &ev.effects.trust_delta {
-            effects
-                .number_delta
-                .insert(format!("{cid}.trust"), *v as i64);
+            effects.trust_delta.insert(CharacterId(cid.clone()), *v);
         }
         for (cid, v) in &ev.effects.tension_delta {
-            effects
-                .number_delta
-                .insert(format!("{cid}.tension"), *v as i64);
+            effects.tension_delta.insert(CharacterId(cid.clone()), *v);
         }
         for (fid, v) in &ev.effects.set_flags {
             effects.set_flags.insert(fid.clone(), *v);
