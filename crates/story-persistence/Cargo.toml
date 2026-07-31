@@ -19,3 +19,7 @@ thiserror.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 story-model.workspace = true
+chrono.workspace = true
+semver.workspace = true
+uuid.workspace = true
+serde_json.workspace = true

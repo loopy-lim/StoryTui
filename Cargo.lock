@@ -2342,6 +2342,7 @@ dependencies = [
 name = "story-persistence"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "semver",
  "serde",
  "serde_json",
@@ -2351,6 +2352,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "toml",
+ "uuid",
 ]
 
 [[package]]

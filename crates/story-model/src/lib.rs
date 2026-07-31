@@ -39,6 +39,7 @@ pub mod pack;
 pub mod patch;
 pub mod provider_dto;
 pub mod rules;
+pub mod save;
 pub mod state;
 pub mod turn;
 pub mod view;
@@ -74,6 +75,7 @@ pub use rules::{
     EndingDef, EventDef, EventEffects, Int16Range, LocationDef, NumberVarDef, RouteDef, StoryRules,
     StringVarDef,
 };
+pub use save::{SaveEnvelope, SavePayload};
 pub use state::{CharacterState, ChoiceRef, GameState};
 pub use turn::{GeneratedTurn, GenerationWarning, ParsedAction, TokenUsage, TurnSummary};
 pub use view::{AppViewModel, ChoiceView, DomainErrorView, LoadingState, Screen, StatusLine};
