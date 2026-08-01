@@ -237,7 +237,7 @@ async fn dispatch(
 
 fn provider_error_view(error: ProviderError) -> DomainErrorView {
     let player_message = if matches!(&error, ProviderError::InvalidGeneration(_)) {
-        "모델 응답을 이해하지 못했습니다. 다시 시도해 주세요".to_string()
+        "모델 응답 형식을 이해하지 못했습니다.".to_string()
     } else {
         error.to_string()
     };
@@ -253,10 +253,7 @@ fn provider_error_view(error: ProviderError) -> DomainErrorView {
         // Serde/parser details are useful for diagnostics but are not stable
         // or actionable for players (for example: "key must be a string").
         // Keep the detail out of the TUI and offer a retry-oriented message.
-        ProviderError::InvalidGeneration(_) => (
-            "invalid_generation",
-            "모델 응답을 이해하지 못했습니다. 다시 시도해 주세요",
-        ),
+        ProviderError::InvalidGeneration(_) => ("invalid_generation", "응답 형식 오류"),
     };
     DomainErrorView {
         code: code.to_string(),
@@ -278,9 +275,7 @@ mod tests {
         ));
         assert_eq!(view.code, "invalid_generation");
         assert!(!view.message_ko.contains("key must be a string"));
-        assert_eq!(
-            view.message_ko,
-            "모델 응답을 이해하지 못했습니다. 다시 시도해 주세요"
-        );
+        assert_eq!(view.title_ko, "응답 형식 오류");
+        assert_eq!(view.message_ko, "모델 응답 형식을 이해하지 못했습니다.");
     }
 }
