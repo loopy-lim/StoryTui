@@ -62,8 +62,9 @@ impl App {
         pending_generation_id: Option<Uuid>,
     ) -> Option<EngineCommand> {
         let loading = self.view.loading.is_some();
+        let has_error = self.view.error.is_some();
         let choice_count = self.view.choices.len();
-        match map_key(key, choice_count, loading) {
+        match map_key(key, choice_count, loading, has_error) {
             KeyAction::None => None,
             KeyAction::Quit => {
                 self.should_quit = true;

@@ -85,6 +85,9 @@ pub struct EngineState {
     pub pack_metadata: PackMetadata,
     /// The in-flight generation, if any. At most one is ever pending.
     pub pending: Option<PendingGeneration>,
+    /// A failed generation that can be retried from its original checkpoint.
+    /// Failed requests are no longer loading, but the player can retry them.
+    pub retry_pending: Option<PendingGeneration>,
     /// Attempted `generation_id`s for the current pending turn (diagnostics /
     /// regenerate). Length 1 on a fresh request; grows by one per
     /// [`EngineCommand::RegenerateCurrentTurn`]. Cleared when the turn is
@@ -185,6 +188,7 @@ impl EngineState {
             game: build_initial_game_state(pack),
             pack_metadata: pack.metadata.clone(),
             pending: None,
+            retry_pending: None,
             lineage: Vec::new(),
             checkpoints: Vec::new(),
             audit_tail: Vec::new(),
@@ -240,6 +244,10 @@ pub fn reduce(
             }
         }
         EngineCommand::AcceptGeneration { draft } => reduce_accept(state, pack, *draft),
+        EngineCommand::ProviderFailed {
+            generation_id,
+            error,
+        } => Ok(reduce_provider_failed(state, pack, generation_id, error)),
         EngineCommand::AcceptDirectorPlan {
             generation_id,
             plan,
@@ -276,6 +284,7 @@ fn reduce_start_new_game(state: &EngineState, pack: &StoryPack) -> Result<Transi
     next.game = game;
     next.pack_metadata = pack.metadata.clone();
     next.pending = Some(pending.clone());
+    next.retry_pending = None;
     next.lineage = vec![generation_id];
 
     let loading_view = build_view(&next, pack, Some(&pending), None);
@@ -329,6 +338,7 @@ fn reduce_submit_choice(
 
     let mut next = clone_state(state);
     next.pending = Some(pending.clone());
+    next.retry_pending = None;
     next.lineage = vec![generation_id];
 
     let loading_view = build_view(&next, pack, Some(&pending), None);
@@ -374,6 +384,7 @@ fn reduce_submit_free_action(
 
     let mut next = clone_state(state);
     next.pending = Some(pending.clone());
+    next.retry_pending = None;
     next.lineage = vec![generation_id];
 
     let loading_view = build_view(&next, pack, Some(&pending), None);
@@ -396,7 +407,7 @@ fn reduce_submit_free_action(
 /// `generation_id`; the new id is appended to `lineage`. The committed stable
 /// state and history are NOT touched. No-op when nothing is pending.
 fn reduce_regenerate(state: &EngineState, pack: &StoryPack) -> Transition {
-    let Some(pending) = state.pending.as_ref() else {
+    let Some(pending) = state.pending.as_ref().or(state.retry_pending.as_ref()) else {
         return Transition::identity(clone_state(state));
     };
     let generation_id = Uuid::new_v4();
@@ -420,6 +431,7 @@ fn reduce_regenerate(state: &EngineState, pack: &StoryPack) -> Transition {
 
     let mut next = clone_state(state);
     next.pending = Some(new_pending.clone());
+    next.retry_pending = None;
     next.lineage.push(generation_id);
 
     let loading_view = build_view(&next, pack, Some(&new_pending), None);
@@ -525,6 +537,35 @@ fn reduce_accept(
     }
 }
 
+fn reduce_provider_failed(
+    state: &EngineState,
+    pack: &StoryPack,
+    generation_id: Uuid,
+    error: DomainErrorView,
+) -> Transition {
+    let Some(pending) = state.pending.as_ref() else {
+        return Transition::identity(clone_state(state));
+    };
+    if pending.generation_id != generation_id {
+        return Transition::identity(clone_state(state));
+    }
+
+    let mut restored = clone_state(state);
+    restored.game = pending.checkpoint.clone();
+    restored.pending = None;
+    restored.retry_pending = Some(pending.clone());
+    restored.lineage.clear();
+    let view = build_view(&restored, pack, None, Some(error.clone()));
+    Transition {
+        state: restored,
+        effects: vec![
+            EngineEffect::ShowRecoverableError(error),
+            EngineEffect::PublishView(Box::new(view)),
+        ],
+        audit: Vec::new(),
+    }
+}
+
 fn reduce_cancel(state: &EngineState, pack: &StoryPack, generation_id: Uuid) -> Transition {
     let Some(pending) = state.pending.as_ref() else {
         return Transition::identity(clone_state(state));
@@ -535,6 +576,7 @@ fn reduce_cancel(state: &EngineState, pack: &StoryPack, generation_id: Uuid) -> 
     let mut restored = clone_state(state);
     restored.game = pending.checkpoint.clone();
     restored.pending = None;
+    restored.retry_pending = None;
     restored.lineage = Vec::new();
     let view = build_view(&restored, pack, None, None);
     Transition {
@@ -545,7 +587,8 @@ fn reduce_cancel(state: &EngineState, pack: &StoryPack, generation_id: Uuid) -> 
 }
 
 fn reduce_dismiss_error(state: &EngineState, pack: &StoryPack) -> Transition {
-    let next = clone_state(state);
+    let mut next = clone_state(state);
+    next.retry_pending = None;
     let view = build_view(&next, pack, None, None);
     Transition {
         state: next,
@@ -596,6 +639,7 @@ fn reduce_submit_choice_director(
 
     let mut next = clone_state(state);
     next.pending = Some(pending.clone());
+    next.retry_pending = None;
     next.lineage = vec![generation_id];
 
     let loading_view = build_view(&next, pack, Some(&pending), None);
@@ -834,6 +878,7 @@ fn assemble_accepted_2stage_turn(
         game,
         pack_metadata: state.pack_metadata.clone(),
         pending: None,
+        retry_pending: None,
         lineage: Vec::new(),
         checkpoints,
         audit_tail: extend_audit_tail(&state.audit_tail, &audit),
@@ -935,6 +980,7 @@ fn assemble_accepted_turn(
         game,
         pack_metadata: state.pack_metadata.clone(),
         pending: None,
+        retry_pending: None,
         lineage: Vec::new(),
         checkpoints,
         audit_tail: extend_audit_tail(&state.audit_tail, &result.change_log),
@@ -1224,6 +1270,7 @@ fn clone_state(state: &EngineState) -> EngineState {
         game: state.game.clone(),
         pack_metadata: state.pack_metadata.clone(),
         pending: state.pending.clone(),
+        retry_pending: state.retry_pending.clone(),
         lineage: state.lineage.clone(),
         checkpoints: state.checkpoints.clone(),
         audit_tail: state.audit_tail.clone(),

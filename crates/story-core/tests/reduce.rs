@@ -17,10 +17,10 @@ use story_core::engine::{EngineState, Transition, commit_turn, reduce};
 use story_core::engine_cmd::{EngineCommand, EngineEffect};
 use story_core::reducer::ApplyResult;
 use story_model::{
-    AppViewModel, CharacterDef, CharacterId, Choice, ChoiceView, ConditionExpr, Emotion,
-    GeneratedTurnDraft, LocationDef, LocationId, PackContentPolicy, PackInitialState, PackMetadata,
-    PackRating, PromptFragments, RelationshipStage, RiskLevel, SAVE_SCHEMA_VERSION, Screen,
-    StatePatch, StoryPack, StoryRules, TimeSlot, TurnSummary,
+    AppViewModel, CharacterDef, CharacterId, Choice, ChoiceView, ConditionExpr, DomainErrorView,
+    Emotion, GeneratedTurnDraft, LocationDef, LocationId, PackContentPolicy, PackInitialState,
+    PackMetadata, PackRating, PromptFragments, RelationshipStage, RiskLevel, SAVE_SCHEMA_VERSION,
+    Screen, StatePatch, StoryPack, StoryRules, TimeSlot, TurnSummary,
 };
 
 // ---------------------------------------------------------------------------
@@ -431,6 +431,68 @@ fn failed_apply_restores_checkpoint_byte_identically() {
     // and revision match the checkpoint.
     assert_eq!(t.state.game.history.len(), checkpoint.history.len());
     assert_eq!(t.state.game.revision, checkpoint.revision);
+}
+
+#[test]
+fn provider_failure_exposes_retry_from_same_checkpoint() {
+    let pack = sample_pack();
+    let (state, opening_gid) = start_and_pending_id(&pack);
+    let state = reduce(
+        &state,
+        EngineCommand::AcceptGeneration {
+            draft: Box::new(valid_draft(opening_gid, 1)),
+        },
+        &pack,
+    )
+    .expect("accept opening")
+    .state;
+    let submitted = reduce(
+        &state,
+        EngineCommand::SubmitChoice {
+            choice_id: "choice-0".to_string(),
+        },
+        &pack,
+    )
+    .expect("submit choice");
+    let failed_gid = submitted.state.pending.as_ref().unwrap().generation_id;
+    let checkpoint = submitted.state.pending.as_ref().unwrap().checkpoint.clone();
+
+    let failed = reduce(
+        &submitted.state,
+        EngineCommand::ProviderFailed {
+            generation_id: failed_gid,
+            error: DomainErrorView {
+                code: "invalid_generation".to_string(),
+                title_ko: "생성 실패".to_string(),
+                message_ko: "다시 시도할 수 있습니다".to_string(),
+                recoverable: true,
+            },
+        },
+        &pack,
+    )
+    .expect("provider failure")
+    .state;
+    assert!(failed.pending.is_none());
+    assert_eq!(
+        serde_json::to_vec(&failed.retry_pending.as_ref().unwrap().checkpoint).unwrap(),
+        serde_json::to_vec(&checkpoint).unwrap()
+    );
+
+    let retried = reduce(&failed, EngineCommand::RegenerateCurrentTurn, &pack)
+        .expect("retry from failed generation");
+    let retry_gid = retried.state.pending.as_ref().unwrap().generation_id;
+    assert_ne!(retry_gid, failed_gid);
+    assert!(retried.state.retry_pending.is_none());
+    assert_eq!(
+        serde_json::to_vec(&retried.state.pending.as_ref().unwrap().checkpoint).unwrap(),
+        serde_json::to_vec(&checkpoint).unwrap()
+    );
+    assert!(
+        retried
+            .effects
+            .iter()
+            .any(|e| matches!(e, EngineEffect::RequestGeneration { .. }))
+    );
 }
 
 // ---------------------------------------------------------------------------

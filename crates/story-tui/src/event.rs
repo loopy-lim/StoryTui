@@ -24,7 +24,7 @@ pub enum KeyAction {
 /// Map a Story-screen key. The number-row keys `1..=9` select + confirm the
 /// nth choice directly; arrow/j/k move the cursor; Enter confirms the
 /// highlighted choice.
-pub fn map_key(key: KeyEvent, choice_count: usize, loading: bool) -> KeyAction {
+pub fn map_key(key: KeyEvent, choice_count: usize, loading: bool, has_error: bool) -> KeyAction {
     // Ctrl+C always quits.
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return KeyAction::Quit;
@@ -55,6 +55,7 @@ pub fn map_key(key: KeyEvent, choice_count: usize, loading: bool) -> KeyAction {
             // loading state; nil here, resolved by the App.
             generation_id: story_model::uuid::Uuid::nil(),
         }),
+        KeyCode::Char('r') if has_error => KeyAction::Command(EngineCommand::RegenerateCurrentTurn),
         KeyCode::Esc => KeyAction::Command(EngineCommand::DismissError),
         _ => KeyAction::None,
     }
@@ -82,17 +83,17 @@ mod tests {
     #[test]
     fn ctrl_c_quits() {
         let k = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert_eq!(map_key(k, 3, false), KeyAction::Quit);
+        assert_eq!(map_key(k, 3, false, false), KeyAction::Quit);
     }
 
     #[test]
     fn j_down_arrow_move_down() {
         assert_eq!(
-            map_key(key(KeyCode::Char('j')), 3, false),
+            map_key(key(KeyCode::Char('j')), 3, false, false),
             KeyAction::MoveSelection(1)
         );
         assert_eq!(
-            map_key(key(KeyCode::Down), 3, false),
+            map_key(key(KeyCode::Down), 3, false, false),
             KeyAction::MoveSelection(1)
         );
     }
@@ -100,18 +101,18 @@ mod tests {
     #[test]
     fn k_up_arrow_move_up() {
         assert_eq!(
-            map_key(key(KeyCode::Char('k')), 3, false),
+            map_key(key(KeyCode::Char('k')), 3, false, false),
             KeyAction::MoveSelection(-1)
         );
         assert_eq!(
-            map_key(key(KeyCode::Up), 3, false),
+            map_key(key(KeyCode::Up), 3, false, false),
             KeyAction::MoveSelection(-1)
         );
     }
 
     #[test]
     fn number_row_confirms_within_range() {
-        let a = map_key(key(KeyCode::Char('2')), 3, false);
+        let a = map_key(key(KeyCode::Char('2')), 3, false, false);
         let KeyAction::Command(EngineCommand::SubmitChoice { choice_id }) = a else {
             panic!("not a submit: {a:?}");
         };
@@ -120,14 +121,17 @@ mod tests {
 
     #[test]
     fn number_row_out_of_range_is_none() {
-        assert_eq!(map_key(key(KeyCode::Char('9')), 2, false), KeyAction::None);
+        assert_eq!(
+            map_key(key(KeyCode::Char('9')), 2, false, false),
+            KeyAction::None
+        );
     }
 
     #[test]
     fn cancel_only_when_loading() {
-        let idle = map_key(key(KeyCode::Char('c')), 3, false);
+        let idle = map_key(key(KeyCode::Char('c')), 3, false, false);
         assert_eq!(idle, KeyAction::None, "c ignored when not loading");
-        let loading = map_key(key(KeyCode::Char('c')), 3, true);
+        let loading = map_key(key(KeyCode::Char('c')), 3, true, false);
         assert!(matches!(
             loading,
             KeyAction::Command(EngineCommand::CancelGeneration { .. })
@@ -136,6 +140,21 @@ mod tests {
 
     #[test]
     fn q_quits() {
-        assert_eq!(map_key(key(KeyCode::Char('q')), 3, false), KeyAction::Quit);
+        assert_eq!(
+            map_key(key(KeyCode::Char('q')), 3, false, false),
+            KeyAction::Quit
+        );
+    }
+
+    #[test]
+    fn r_retries_only_when_error_is_visible() {
+        assert_eq!(
+            map_key(key(KeyCode::Char('r')), 3, false, false),
+            KeyAction::None
+        );
+        assert_eq!(
+            map_key(key(KeyCode::Char('r')), 3, false, true),
+            KeyAction::Command(EngineCommand::RegenerateCurrentTurn)
+        );
     }
 }
