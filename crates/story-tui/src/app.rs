@@ -96,6 +96,7 @@ impl App {
     /// Replace the view (e.g. the host published a new one). Clamps the
     /// selection to the new choice count.
     pub fn set_view(&mut self, view: AppViewModel) {
+        let previous_turn = self.view.status.turn;
         let count = view.choices.len();
         if count == 0 {
             self.selected = 0;
@@ -103,7 +104,15 @@ impl App {
             self.selected = count - 1;
         }
         self.view = view;
-        self.narration_scroll = 0;
+        // Once a later turn is committed, follow the newest scene at the
+        // bottom of the chronological stack. `u16::MAX` is intentionally a
+        // sentinel: the renderer clamps it to the exact wrapped-line limit
+        // for the current terminal size.
+        if self.view.status.turn > previous_turn && previous_turn > 0 {
+            self.narration_scroll = u16::MAX;
+        } else if self.view.status.turn < previous_turn {
+            self.narration_scroll = 0;
+        }
     }
 
     /// Refresh the auxiliary list data from the host-owned engine state.
@@ -196,6 +205,14 @@ impl App {
                 KeyCode::PageDown => self.list_scroll = self.list_scroll.saturating_add(5),
                 _ => {}
             }
+            return None;
+        }
+        // While a turn is being generated, choices must stay visually and
+        // logically fixed. Only cancellation and quitting remain available.
+        if self.view.loading.is_some()
+            && !matches!(key.code, KeyCode::Char('c' | 'ㅊ' | 'q' | 'ㅂ'))
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+        {
             return None;
         }
         if !self.view.loading.is_some()
@@ -617,6 +634,26 @@ mod tests {
                 slot_id: "slot-1".to_string()
             })
         );
+    }
+
+    #[test]
+    fn committed_later_turn_follows_the_bottom_of_story_stack() {
+        let mut app = App::new(sample_view(3));
+        let mut next = sample_view(3);
+        next.status.turn = 2;
+        app.set_view(next);
+        assert_eq!(app.narration_scroll, u16::MAX);
+    }
+
+    #[test]
+    fn loading_turn_does_not_move_choice_selection() {
+        let mut app = App::new(sample_view(3));
+        app.view.loading = Some(story_model::LoadingState {
+            generation_id: Uuid::nil(),
+            message_ko: "생성 중...".to_string(),
+        });
+        app.handle_key(key(KeyCode::Down), None);
+        assert_eq!(app.selected, 0);
     }
 
     #[test]

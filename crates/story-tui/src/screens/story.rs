@@ -174,8 +174,14 @@ pub fn render_story(
         frame.render_stateful_widget(scrollbar, narration_chunks[1], &mut scrollbar_state);
     }
 
-    // Choices.
-    render_choices(frame, chunks[1], view, selected);
+    // While generation is pending, this panel replaces the choices in place.
+    // It avoids a detached center overlay and makes it clear that selection is
+    // temporarily locked rather than changing under the player's cursor.
+    if let Some(loading) = &view.loading {
+        render_choice_loading(frame, chunks[1], &loading.message_ko);
+    } else {
+        render_choices(frame, chunks[1], view, selected);
+    }
 
     if input_mode {
         render_input(frame, chunks[2], true, input);
@@ -187,8 +193,6 @@ pub fn render_story(
     // Overlays on top.
     if let Some(ref err) = view.error {
         render_error_overlay(frame, area, err);
-    } else if let Some(ref loading) = view.loading {
-        render_loading_overlay(frame, area, &loading.message_ko);
     }
 }
 
@@ -254,7 +258,7 @@ fn story_stack_text(entries: &[StoryStackEntry]) -> Text<'static> {
         )));
         if let Some(action) = &entry.player_action {
             lines.push(Line::from(Span::styled(
-                "플레이어 행동",
+                "당신의 선택",
                 Style::default()
                     .fg(Color::LightYellow)
                     .add_modifier(Modifier::BOLD),
@@ -265,15 +269,38 @@ fn story_stack_text(entries: &[StoryStackEntry]) -> Text<'static> {
             )));
             lines.push(Line::from(""));
         }
-        lines.push(Line::from(Span::styled(
-            "모델 서술",
-            Style::default()
-                .fg(Color::LightBlue)
-                .add_modifier(Modifier::BOLD),
-        )));
         lines.extend(markdown_lines(&entry.narration));
     }
     Text::from(lines)
+}
+
+fn render_choice_loading(frame: &mut Frame, area: Rect, message: &str) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(Span::styled(
+            "선택지 · 생성 중",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let body = Text::from(vec![
+        Line::from(Span::styled(
+            message.to_string(),
+            Style::default().fg(Color::LightYellow),
+        )),
+        Line::from(Span::styled(
+            "선택지는 생성이 끝나면 표시됩니다. [C] 취소",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ]);
+    frame.render_widget(
+        Paragraph::new(body)
+            .block(block)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 /// Render the small Markdown subset used by Story Packs at the TUI boundary.
@@ -577,24 +604,6 @@ fn render_status(frame: &mut Frame, area: Rect, view: &AppViewModel) {
         .border_style(Style::default().fg(Color::DarkGray));
     let para = Paragraph::new(line).block(block);
     frame.render_widget(para, area);
-}
-
-fn render_loading_overlay(frame: &mut Frame, area: Rect, message: &str) {
-    let h = 3u16;
-    let w = (message.width() as u16 + 4).max(20);
-    let centered = centered_rect(area, w, h);
-    frame.render_widget(Clear, centered);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
-        .title(Span::styled(
-            "로딩",
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
-    let para = Paragraph::new(Line::from(message))
-        .alignment(Alignment::Center)
-        .block(block);
-    frame.render_widget(para, centered);
 }
 
 fn render_error_overlay(frame: &mut Frame, area: Rect, err: &story_model::DomainErrorView) {
