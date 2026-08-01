@@ -153,6 +153,21 @@ fn snapshot_story_scrollbar_shows_progress_for_long_transcript() {
 }
 
 #[test]
+fn snapshot_story_scrollbar_reaches_bottom_at_max_scroll() {
+    let mut view = base_view();
+    view.narration = (0..24)
+        .map(|n| {
+            format!(
+                "{}번째 기록입니다. 비가 그친 카페에서 유나는 대답을 망설인다.",
+                n + 1
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    insta::assert_snapshot!(render_to_string_with_scroll(view, 80, 24, u16::MAX));
+}
+
+#[test]
 fn snapshot_story_loading_overlay() {
     let mut v = base_view();
     v.loading = Some(LoadingState {

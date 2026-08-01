@@ -168,7 +168,12 @@ pub fn render_story(
             .track_style(Style::default().fg(Color::DarkGray))
             .begin_symbol(None)
             .end_symbol(None);
-        let mut scrollbar_state = ScrollbarState::new(content_lines)
+        // `ScrollbarState::content_length` is the number of reachable scroll
+        // positions for a wrapped paragraph, not its total visual line count.
+        // Feeding it `content_lines` leaves the thumb stranded in the middle
+        // even at the final line; `max_scroll + 1` makes the last offset map
+        // to the bottom of the track.
+        let mut scrollbar_state = ScrollbarState::new(max_scroll as usize + 1)
             .position(scroll_position as usize)
             .viewport_content_length(narration_area.height as usize);
         frame.render_stateful_widget(scrollbar, narration_chunks[1], &mut scrollbar_state);

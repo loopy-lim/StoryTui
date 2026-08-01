@@ -121,6 +121,7 @@ impl App {
         history: &[story_model::HistoryEntry],
         memories: &[story_model::MemoryEntry],
     ) {
+        let previous_story_count = self.story_stack.len();
         self.history_items = history
             .iter()
             .rev()
@@ -141,6 +142,12 @@ impl App {
                 narration: entry.narration.clone(),
             })
             .collect();
+        // The host refreshes the chronological stack before it publishes the
+        // next view. Following this concrete history change is more reliable
+        // than inferring it solely from a turn number.
+        if previous_story_count > 0 && self.story_stack.len() > previous_story_count {
+            self.narration_scroll = u16::MAX;
+        }
         self.memory_items = memories
             .iter()
             .rev()
@@ -720,10 +727,17 @@ mod tests {
             },
         ];
 
+        app.set_lists(&entries[..1], &[]);
+        assert_eq!(app.narration_scroll, 0, "first scene opens at the top");
         app.set_lists(&entries, &[]);
 
         assert_eq!(app.story_stack.len(), 2);
         assert_eq!(app.story_stack[0].narration, "첫 장면");
         assert_eq!(app.story_stack[1].narration, "다음 장면");
+        assert_eq!(
+            app.narration_scroll,
+            u16::MAX,
+            "new scene follows the bottom"
+        );
     }
 }
