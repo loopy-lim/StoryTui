@@ -10,7 +10,10 @@
 //! and the [`crate::engine::reduce`] function.
 
 use story_model::uuid::Uuid;
-use story_model::{AppViewModel, DomainErrorView, GeneratedTurnDraft, ParsedAction, TurnRequest};
+use story_model::{
+    AppViewModel, DirectorPlan, DirectorRequest, DomainErrorView, GeneratedTurnDraft, ParsedAction,
+    TurnRequest, WriterFinish, WriterRequest,
+};
 
 /// A user / host intent handed to the engine. The engine validates each
 /// command against its current state and returns a [`crate::engine::Transition`].
@@ -57,6 +60,28 @@ pub enum EngineCommand {
         /// `GeneratedTurnDraft` carries narration + choices + a patch).
         draft: Box<GeneratedTurnDraft>,
     },
+    /// (W10 2-stage path, ST-033) Director generation completed. The engine
+    /// validates + dry-runs `plan`; on rejection the Writer is NEVER called
+    /// (the host sees [`crate::engine_cmd::EngineEffect::ShowRecoverableError`]).
+    /// `generation_id` must match the pending one; a mismatch is silently
+    /// discarded (late-discard semantics identical to [`Self::AcceptGeneration`]).
+    /// No-op when the engine is on the MVP single-call path.
+    AcceptDirectorPlan {
+        /// The pending generation id this Director plan belongs to.
+        generation_id: Uuid,
+        /// The Director's structural plan (boxed to keep the enum cheap).
+        plan: Box<DirectorPlan>,
+    },
+    /// (W10 2-stage path, ST-034) Writer stream completed. `finish.full_text`
+    /// is the finalized narration (the engine runs the lint pass; partial /
+    /// pre-`[DONE]` text never reaches this command). The engine commits the
+    /// previously-validated Director plan's patch + choices with the Writer's
+    /// narration. Late-discard on `generation_id` mismatch; no-op on the MVP
+    /// single-call path.
+    AcceptWriterFinish {
+        /// The aggregated Writer finish returned by the provider.
+        finish: Box<WriterFinish>,
+    },
     /// Cancel an in-flight generation. Restores the checkpoint if the id
     /// matches; otherwise a no-op.
     CancelGeneration {
@@ -82,6 +107,26 @@ pub enum EngineEffect {
         generation_id: Uuid,
         /// The assembled prompt + sampling parameters.
         request: TurnRequest,
+    },
+    /// (W10 2-stage path, ST-033) Call the provider's Director path. The host
+    /// invokes `provider.direct(request, cancel)` and feeds the result back as
+    /// [`EngineCommand::AcceptDirectorPlan`]. Only emitted when
+    /// [`crate::engine::EngineState::use_director_writer`] is `true`.
+    RequestDirector {
+        /// The pending generation id this request belongs to.
+        generation_id: Uuid,
+        /// The assembled Director prompt + sampling parameters.
+        request: DirectorRequest,
+    },
+    /// (W10 2-stage path, ST-034) Call the provider's Writer streaming path.
+    /// The host invokes `provider.write_stream(request, sink, cancel)`, drives
+    /// [`story_model::WriterEvent::Chunk`]s to the renderer, and feeds the
+    /// final aggregated text back as [`EngineCommand::AcceptWriterFinish`].
+    RequestWriter {
+        /// The pending generation id this request belongs to.
+        generation_id: Uuid,
+        /// The assembled Writer prompt + sampling parameters.
+        request: WriterRequest,
     },
     /// Render this view. The latest published view is what the player sees.
     /// (Boxed: `AppViewModel` carries narration + choices + status, large

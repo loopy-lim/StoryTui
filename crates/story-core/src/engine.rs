@@ -20,20 +20,24 @@
 //!   `generation_id` that does not match) is silently discarded: the returned
 //!   [`Transition`] is identity (state unchanged, no effects).
 
+use sha2::Digest;
 use story_model::chrono::Utc;
 use story_model::uuid::Uuid;
 use story_model::{
-    AppViewModel, CharacterId, CharacterState, ChoiceRef, DomainErrorView, Emotion, GameState,
-    HistoryEntry, LoadingState, PackMetadata, ParsedAction, SavePayload, Screen, StateChangeLog,
-    StatePatch, StoryPack, StoryRules, TurnRequest,
+    AppViewModel, CharacterId, CharacterState, ChoiceRef, DirectorPlan, DirectorRequest,
+    DomainErrorView, Emotion, GameState, HistoryEntry, LoadingState, PackMetadata, ParsedAction,
+    SavePayload, Screen, StateChangeLog, StatePatch, StoryPack, StoryRules, TurnRequest,
+    WriterFinish, WriterRequest,
 };
 
+use crate::director::{ValidatedPlan, validate_plan};
 use crate::engine_cmd::{EngineCommand, EngineEffect};
 use crate::error::{
     CoreError, ENGINE_GENERATION_IN_FLIGHT, ENGINE_NO_CHOICES, ENGINE_UNKNOWN_CHOICE,
 };
 use crate::prompt_context::build_prompt;
 use crate::reducer::{ApplyResult, apply_patch};
+use crate::writer::{WriterResult, finalize_writer_output};
 
 /// Sentinel `player_choice_id` for the opening generation (no player choice).
 const OPENING_CHOICE_ID: &str = "__opening__";
@@ -98,6 +102,17 @@ pub struct EngineState {
     /// effect after each accepted turn, writing to the [`AUTOSAVE_SLOT`].
     /// Disable for headless benchmarks / tests that don't persist.
     pub autosave_on_accept: bool,
+    /// When `true`, [`EngineCommand::SubmitChoice`] / [`EngineCommand::SubmitFreeAction`]
+    /// route through the optional Director → Writer two-stage path (W10,
+    /// ST-033/034): the engine emits [`EngineEffect::RequestDirector`] and
+    /// expects [`EngineCommand::AcceptDirectorPlan`] →
+    /// [`EngineEffect::RequestWriter`] → [`EngineCommand::AcceptWriterFinish`].
+    ///
+    /// **Default `false` (ADR-005, load-bearing):** the MVP single-call path
+    /// ([`EngineEffect::RequestGeneration`] / [`EngineCommand::AcceptGeneration`])
+    /// stays the default until a real 20-turn A/B gate proves the 2-stage path
+    /// is at least as good. The flag is never flipped by the engine itself.
+    pub use_director_writer: bool,
 }
 
 /// A committed-state snapshot the player can rewind to via
@@ -128,6 +143,12 @@ pub struct PendingGeneration {
     /// Carried through to the accepted turn's `HistoryEntry.player_action` and
     /// into the prompt (with the player-sovereignty clause).
     pub player_action: Option<ParsedAction>,
+    /// (2-stage path) The Director's validated plan, set by
+    /// [`EngineCommand::AcceptDirectorPlan`] between the Director and Writer
+    /// calls. Always `None` on the MVP single-call path. `None` between
+    /// [`EngineCommand::SubmitChoice`] and `AcceptDirectorPlan` on the 2-stage
+    /// path.
+    pub validated_plan: Option<Box<ValidatedPlan>>,
 }
 
 /// The result of [`reduce`]: a new state, the effects the host should perform,
@@ -168,6 +189,7 @@ impl EngineState {
             checkpoints: Vec::new(),
             audit_tail: Vec::new(),
             autosave_on_accept: true,
+            use_director_writer: false,
         }
     }
 
@@ -203,11 +225,28 @@ pub fn reduce(
 ) -> Result<Transition, CoreError> {
     match cmd {
         EngineCommand::StartNewGame => reduce_start_new_game(state, pack),
-        EngineCommand::SubmitChoice { choice_id } => reduce_submit_choice(state, pack, choice_id),
+        EngineCommand::SubmitChoice { choice_id } => {
+            if state.use_director_writer {
+                reduce_submit_choice_director(state, pack, choice_id)
+            } else {
+                reduce_submit_choice(state, pack, choice_id)
+            }
+        }
         EngineCommand::SubmitFreeAction { action } => {
-            reduce_submit_free_action(state, pack, *action)
+            if state.use_director_writer {
+                reduce_submit_free_action_director(state, pack, *action)
+            } else {
+                reduce_submit_free_action(state, pack, *action)
+            }
         }
         EngineCommand::AcceptGeneration { draft } => reduce_accept(state, pack, *draft),
+        EngineCommand::AcceptDirectorPlan {
+            generation_id,
+            plan,
+        } => reduce_accept_director_plan(state, pack, generation_id, *plan),
+        EngineCommand::AcceptWriterFinish { finish } => {
+            reduce_accept_writer_finish(state, pack, *finish)
+        }
         EngineCommand::RegenerateCurrentTurn => Ok(reduce_regenerate(state, pack)),
         EngineCommand::RestoreCheckpoint { checkpoint_id } => {
             Ok(reduce_restore_checkpoint(state, pack, checkpoint_id))
@@ -230,6 +269,7 @@ fn reduce_start_new_game(state: &EngineState, pack: &StoryPack) -> Result<Transi
         player_choice_id: OPENING_CHOICE_ID.to_string(),
         requested_at_turn: game.turn,
         player_action: None,
+        validated_plan: None,
     };
     let request = build_turn_request(generation_id, pack, &game, None);
     let mut next = clone_state(state);
@@ -283,6 +323,7 @@ fn reduce_submit_choice(
         player_choice_id: choice_id,
         requested_at_turn: state.game.turn,
         player_action: None,
+        validated_plan: None,
     };
     let request = build_turn_request(generation_id, pack, &state.game, None);
 
@@ -327,6 +368,7 @@ fn reduce_submit_free_action(
         player_choice_id: FREE_ACTION_CHOICE_ID.to_string(),
         requested_at_turn: state.game.turn,
         player_action: Some(action.clone()),
+        validated_plan: None,
     };
     let request = build_turn_request(generation_id, pack, &state.game, Some(&action));
 
@@ -364,6 +406,10 @@ fn reduce_regenerate(state: &EngineState, pack: &StoryPack) -> Transition {
         player_choice_id: pending.player_choice_id.clone(),
         requested_at_turn: pending.requested_at_turn,
         player_action: pending.player_action.clone(),
+        // Regenerate always tears down any in-flight 2-stage plan: the fresh
+        // generation id is for the MVP single-call path, and even on the
+        // 2-stage path the host will re-issue a new Director request.
+        validated_plan: None,
     };
     let request = build_turn_request(
         generation_id,
@@ -509,6 +555,299 @@ fn reduce_dismiss_error(state: &EngineState, pack: &StoryPack) -> Transition {
 }
 
 // ---------------------------------------------------------------------------
+// optional 2-stage Director/Writer path (W10, ADR-005: off by default)
+// ---------------------------------------------------------------------------
+
+/// Like [`reduce_submit_choice`] but emits [`EngineEffect::RequestDirector`]
+/// instead of [`EngineEffect::RequestGeneration`]. Used when
+/// [`EngineState::use_director_writer`] is `true`.
+fn reduce_submit_choice_director(
+    state: &EngineState,
+    pack: &StoryPack,
+    choice_id: String,
+) -> Result<Transition, CoreError> {
+    if state.pending.is_some() {
+        return Err(CoreError::invalid_command(
+            ENGINE_GENERATION_IN_FLIGHT,
+            "a generation is already in flight; cancel it before submitting another choice",
+        ));
+    }
+    let last_entry =
+        state.game.history.last().ok_or_else(|| {
+            CoreError::invalid_command(ENGINE_NO_CHOICES, "no choices available yet")
+        })?;
+    if !last_entry.choices.iter().any(|c| c.id == choice_id) {
+        return Err(CoreError::invalid_command(
+            ENGINE_UNKNOWN_CHOICE,
+            format!("unknown choice id: {choice_id}"),
+        ));
+    }
+
+    let generation_id = Uuid::new_v4();
+    let pending = PendingGeneration {
+        generation_id,
+        checkpoint: state.game.clone(),
+        player_choice_id: choice_id,
+        requested_at_turn: state.game.turn,
+        player_action: None,
+        validated_plan: None,
+    };
+    let request = build_director_request(generation_id, pack, &state.game, None);
+
+    let mut next = clone_state(state);
+    next.pending = Some(pending.clone());
+    next.lineage = vec![generation_id];
+
+    let loading_view = build_view(&next, pack, Some(&pending), None);
+    let effects = vec![
+        EngineEffect::RequestDirector {
+            generation_id,
+            request,
+        },
+        EngineEffect::PublishView(Box::new(loading_view)),
+    ];
+    Ok(Transition {
+        state: next,
+        effects,
+        audit: Vec::new(),
+    })
+}
+
+/// 2-stage variant of [`reduce_submit_free_action`].
+fn reduce_submit_free_action_director(
+    state: &EngineState,
+    pack: &StoryPack,
+    action: ParsedAction,
+) -> Result<Transition, CoreError> {
+    if state.pending.is_some() {
+        return Err(CoreError::invalid_command(
+            ENGINE_GENERATION_IN_FLIGHT,
+            "a generation is already in flight; cancel it before submitting a free action",
+        ));
+    }
+
+    let generation_id = Uuid::new_v4();
+    let pending = PendingGeneration {
+        generation_id,
+        checkpoint: state.game.clone(),
+        player_choice_id: FREE_ACTION_CHOICE_ID.to_string(),
+        requested_at_turn: state.game.turn,
+        player_action: Some(action.clone()),
+        validated_plan: None,
+    };
+    let request = build_director_request(generation_id, pack, &state.game, Some(&action));
+
+    let mut next = clone_state(state);
+    next.pending = Some(pending.clone());
+    next.lineage = vec![generation_id];
+
+    let loading_view = build_view(&next, pack, Some(&pending), None);
+    let effects = vec![
+        EngineEffect::RequestDirector {
+            generation_id,
+            request,
+        },
+        EngineEffect::PublishView(Box::new(loading_view)),
+    ];
+    Ok(Transition {
+        state: next,
+        effects,
+        audit: Vec::new(),
+    })
+}
+
+/// Handle [`EngineCommand::AcceptDirectorPlan`] (2-stage path): validate +
+/// dry-run; on success store the [`ValidatedPlan`] on the pending generation
+/// and emit [`EngineEffect::RequestWriter`]; on rejection restore the
+/// checkpoint and surface a recoverable error (the Writer is NEVER called).
+fn reduce_accept_director_plan(
+    state: &EngineState,
+    pack: &StoryPack,
+    generation_id: Uuid,
+    plan: DirectorPlan,
+) -> Result<Transition, CoreError> {
+    let Some(pending) = state.pending.as_ref() else {
+        // Late discard — nothing pending. Identity transition, no effects.
+        return Ok(Transition::identity(clone_state(state)));
+    };
+    if pending.generation_id != generation_id {
+        // Mismatched discard. Identity transition, no effects.
+        return Ok(Transition::identity(clone_state(state)));
+    }
+
+    match validate_plan(&plan, &pending.checkpoint, pack) {
+        Ok(validated) => {
+            let digest = plan_digest(&plan);
+            let request = build_writer_request(
+                pending.generation_id,
+                pack,
+                &pending.checkpoint,
+                pending.player_action.as_ref(),
+                digest,
+            );
+            let mut next = clone_state(state);
+            if let Some(ref mut p) = next.pending {
+                p.validated_plan = Some(Box::new(validated));
+            }
+            let loading = next.pending.clone();
+            let loading_view = build_view(&next, pack, loading.as_ref(), None);
+            let effects = vec![
+                EngineEffect::RequestWriter {
+                    generation_id: pending.generation_id,
+                    request,
+                },
+                EngineEffect::PublishView(Box::new(loading_view)),
+            ];
+            Ok(Transition {
+                state: next,
+                effects,
+                audit: Vec::new(),
+            })
+        }
+        Err(err) => {
+            // Restore the checkpoint byte-identically; surface a recoverable
+            // error. The Writer is NEVER called for a rejected plan.
+            let error_view = domain_error_view(&err);
+            let mut restored = clone_state(state);
+            restored.game = pending.checkpoint.clone();
+            restored.pending = None;
+            restored.lineage = Vec::new();
+            let view = build_view(&restored, pack, None, Some(error_view.clone()));
+            Ok(Transition {
+                state: restored,
+                effects: vec![
+                    EngineEffect::ShowRecoverableError(error_view),
+                    EngineEffect::PublishView(Box::new(view)),
+                ],
+                audit: Vec::new(),
+            })
+        }
+    }
+}
+
+/// Handle [`EngineCommand::AcceptWriterFinish`] (2-stage path): finalize the
+/// Writer text (strip + lint embedded patches), then commit the validated
+/// Director plan's patch + choices with the Writer's narration.
+fn reduce_accept_writer_finish(
+    state: &EngineState,
+    pack: &StoryPack,
+    finish: WriterFinish,
+) -> Result<Transition, CoreError> {
+    let Some(pending) = state.pending.as_ref() else {
+        return Ok(Transition::identity(clone_state(state)));
+    };
+    if pending.generation_id != finish.generation_id {
+        return Ok(Transition::identity(clone_state(state)));
+    };
+    let Some(validated) = pending.validated_plan.as_ref() else {
+        // No validated plan — either the host fed back a Writer finish out of
+        // order, or we are on the MVP path. Identity in either case.
+        return Ok(Transition::identity(clone_state(state)));
+    };
+
+    let writer: WriterResult =
+        finalize_writer_output(finish.full_text, validated, pending.generation_id)?;
+    let (next, audit) = assemble_accepted_2stage_turn(state, pack, pending, validated, writer);
+    let view = build_view(&next, pack, None, None);
+    let mut effects = vec![EngineEffect::PublishView(Box::new(view))];
+    if next.autosave_on_accept {
+        effects.push(EngineEffect::PersistStableState {
+            slot_id: AUTOSAVE_SLOT.to_string(),
+            description: Some(format!("턴 {}", next.game.turn)),
+        });
+    }
+    Ok(Transition {
+        state: next,
+        effects,
+        audit,
+    })
+}
+
+/// Build the post-accept `EngineState` for the 2-stage path. Mirrors
+/// [`assemble_accepted_turn`] but the narration comes from the Writer while
+/// the patch + choices come from the Director's validated plan.
+fn assemble_accepted_2stage_turn(
+    state: &EngineState,
+    pack: &StoryPack,
+    pending: &PendingGeneration,
+    validated: &ValidatedPlan,
+    writer: WriterResult,
+) -> (EngineState, Vec<StateChangeLog>) {
+    let history_id = Uuid::new_v4();
+    let fired_events = validated.dry_run.fired_events.clone();
+    let new_memories = crate::memory::memories_from_turn(
+        &validated.dry_run,
+        pack,
+        pending.requested_at_turn + 1,
+        history_id,
+    );
+
+    let mut game = validated.dry_run.state.clone();
+    game.turn = pending.requested_at_turn + 1;
+
+    if pending.player_choice_id != OPENING_CHOICE_ID
+        && pending.player_choice_id != FREE_ACTION_CHOICE_ID
+    {
+        let label = pending
+            .checkpoint
+            .history
+            .last()
+            .and_then(|h| h.choices.iter().find(|c| c.id == pending.player_choice_id))
+            .map(|c| c.label.clone())
+            .unwrap_or_default();
+        game.last_choice = Some(ChoiceRef {
+            choice_id: pending.player_choice_id.clone(),
+            label,
+            turn: pending.requested_at_turn,
+        });
+    }
+
+    crate::memory::resolve_memories(&mut game.memories, &fired_events);
+    game.memories.extend(new_memories);
+
+    let entry = HistoryEntry {
+        id: history_id,
+        turn: game.turn,
+        scene_id: game.current_scene_id.clone(),
+        created_at: Utc::now(),
+        narration: writer.narration.clone(),
+        player_action: pending.player_action.clone(),
+        choices: validated.plan.choices.clone(),
+        applied_patch: validated.plan.proposed_patch.clone(),
+        generation_id: pending.generation_id,
+    };
+    game.history.push(entry);
+    game.stable_generation_id = Some(pending.generation_id);
+
+    let mut checkpoints = state.checkpoints.clone();
+    checkpoints.push(Checkpoint {
+        id: Uuid::new_v4(),
+        game: game.clone(),
+    });
+    if checkpoints.len() > CHECKPOINT_RING {
+        let drop_n = checkpoints.len() - CHECKPOINT_RING;
+        checkpoints.drain(0..drop_n);
+    }
+
+    let audit = validated.dry_run.change_log.clone();
+    let next = EngineState {
+        game,
+        pack_metadata: state.pack_metadata.clone(),
+        pending: None,
+        lineage: Vec::new(),
+        checkpoints,
+        audit_tail: extend_audit_tail(&state.audit_tail, &audit),
+        autosave_on_accept: state.autosave_on_accept,
+        use_director_writer: state.use_director_writer,
+    };
+    // The writer lint pass is non-fatal; the offending text has already been
+    // stripped. Surfacing it through the engine is future work (a tracing
+    // log or a HistoryEntry warning) — for MVP it is intentionally dropped.
+    let _ = writer.lint;
+    (next, audit)
+}
+
+// ---------------------------------------------------------------------------
 // turn acceptance helpers
 // ---------------------------------------------------------------------------
 
@@ -600,6 +939,7 @@ fn assemble_accepted_turn(
         checkpoints,
         audit_tail: extend_audit_tail(&state.audit_tail, &result.change_log),
         autosave_on_accept: state.autosave_on_accept,
+        use_director_writer: state.use_director_writer,
     };
     (next, result.change_log)
 }
@@ -782,6 +1122,90 @@ fn build_turn_request(
     }
 }
 
+/// Build a [`DirectorRequest`] for the 2-stage path. Mirrors
+/// [`build_turn_request`] but targets the non-streaming Director call (lower
+/// temperature, smaller budget — a Director plan is short).
+fn build_director_request(
+    generation_id: Uuid,
+    pack: &StoryPack,
+    game: &GameState,
+    player_action: Option<&ParsedAction>,
+) -> DirectorRequest {
+    let bundle = build_prompt(pack, game, &game.history, player_action);
+    let messages = vec![
+        story_model::ChatMessage {
+            role: "system".to_string(),
+            content: bundle.system,
+        },
+        story_model::ChatMessage {
+            role: "user".to_string(),
+            content: bundle.user,
+        },
+    ];
+    DirectorRequest {
+        generation_id,
+        messages,
+        model: "mock".to_string(),
+        temperature: 0.7,
+        top_p: 0.9,
+        top_k: 40,
+        max_tokens: 1024,
+    }
+}
+
+/// Build a [`WriterRequest`] for the 2-stage path. The Writer is given the
+/// same prompt context plus a digest of the validated plan for attestation.
+fn build_writer_request(
+    generation_id: Uuid,
+    pack: &StoryPack,
+    game: &GameState,
+    player_action: Option<&ParsedAction>,
+    plan_digest: String,
+) -> WriterRequest {
+    let bundle = build_prompt(pack, game, &game.history, player_action);
+    let messages = vec![
+        story_model::ChatMessage {
+            role: "system".to_string(),
+            content: bundle.system,
+        },
+        story_model::ChatMessage {
+            role: "user".to_string(),
+            content: bundle.user,
+        },
+    ];
+    WriterRequest {
+        generation_id,
+        messages,
+        model: "mock".to_string(),
+        temperature: 0.85,
+        top_p: 0.92,
+        top_k: 40,
+        max_tokens: 1800,
+        plan_digest,
+    }
+}
+
+/// Stable lowercase-hex SHA-256 digest of the canonical JSON serialization of
+/// `plan`. Stamped onto the [`WriterRequest`] so the host can attest the
+/// streamed narration belongs to a confirmed plan. `sha2` is already a
+/// `story-core` dependency (used by [`build_prompt`]).
+fn plan_digest(plan: &DirectorPlan) -> String {
+    let bytes = story_model::serde_json::to_vec(plan).unwrap_or_default();
+    let mut hasher = sha2::Sha256::new();
+    sha2::Digest::update(&mut hasher, &bytes);
+    hex_lower(sha2::Digest::finalize(hasher).as_slice())
+}
+
+/// Lowercase-hex encode a byte slice without pulling in a `hex` crate. Kept
+/// in sync with the private helper in [`prompt_context`].
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // error mapping
 // ---------------------------------------------------------------------------
@@ -804,5 +1228,6 @@ fn clone_state(state: &EngineState) -> EngineState {
         checkpoints: state.checkpoints.clone(),
         audit_tail: state.audit_tail.clone(),
         autosave_on_accept: state.autosave_on_accept,
+        use_director_writer: state.use_director_writer,
     }
 }
