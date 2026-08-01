@@ -108,6 +108,34 @@ async fn happy_path_returns_parsed_draft_with_usage() {
     assert_eq!(usage.total_tokens, 15);
 }
 
+#[tokio::test]
+async fn generation_uses_sampling_values_from_provider_config() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(envelope(VALID_TURN)))
+        .mount(&server)
+        .await;
+
+    let mut config = cfg_for(&server);
+    config.temperature = 0.2;
+    config.top_p = 0.88;
+    config.top_k = 0;
+    config.max_tokens = 900;
+    let provider = OpenAiCompatibleProvider::new(config).expect("provider");
+    provider
+        .generate_turn(turn_request(), CancellationToken::new())
+        .await
+        .expect("valid response");
+
+    let requests = server.received_requests().await.expect("recorded request");
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("JSON body");
+    assert_eq!(body["temperature"], 0.2);
+    assert_eq!(body["top_p"], 0.88);
+    assert_eq!(body["max_tokens"], 900);
+    assert!(body.get("top_k").is_none());
+}
+
 // --- health mapping --------------------------------------------------------
 
 #[tokio::test]

@@ -195,11 +195,15 @@ impl OpenAiCompatibleProvider {
         cancel: &CancellationToken,
         temperature_override: Option<f32>,
     ) -> Result<GeneratedTurnDraft, ProviderError> {
-        let bounded_request = bound_context(request, self.config.context_budget_tokens);
-        let mut bounded_request = bounded_request;
-        if let Some(temperature) = temperature_override {
-            bounded_request.temperature = temperature;
-        }
+        // The engine owns prompt construction, while the runtime provider
+        // owns sampling.  Do not let MVP placeholder values embedded in a
+        // TurnRequest silently override the operator's TOML profile.
+        let mut configured_request = request.clone();
+        configured_request.temperature = temperature_override.unwrap_or(self.config.temperature);
+        configured_request.top_p = self.config.top_p;
+        configured_request.top_k = self.config.top_k;
+        configured_request.max_tokens = self.config.max_tokens;
+        let bounded_request = bound_context(&configured_request, self.config.context_budget_tokens);
         let send_rf = !suppress_rf && self.structured_enabled() && request.json_schema.is_some();
         let body = ChatCompletionRequest::from_turn(&bounded_request, &self.config.model, send_rf);
         let max_attempts = self.config.max_retries.saturating_add(1);
