@@ -18,7 +18,7 @@ use story_model::{ActionType, AppViewModel, ParsedAction};
 
 use crate::event::{KeyAction, SELECT_SENTINEL, map_key, parse_direct_select_index};
 use crate::input::InputBuffer;
-use crate::screens::story::{ListMode, render_list, render_story};
+use crate::screens::story::{ListMode, StoryStackEntry, render_list, render_story};
 
 /// The TUI's mutable, display-facing state. The engine-facing state lives in
 /// the host; the App only renders the published view.
@@ -42,7 +42,7 @@ pub struct App {
     pub history_items: Vec<String>,
     pub memory_items: Vec<String>,
     /// Chronological narration stack shown in the main story pane.
-    pub story_stack: Vec<String>,
+    pub story_stack: Vec<StoryStackEntry>,
     pub list_scroll: u16,
 }
 
@@ -93,16 +93,14 @@ impl App {
             .collect();
         self.story_stack = history
             .iter()
-            .map(|entry| {
-                let action = entry
+            .map(|entry| StoryStackEntry {
+                turn: entry.turn,
+                scene_id: entry.scene_id.clone(),
+                player_action: entry
                     .player_action
                     .as_ref()
-                    .map(|action| format!("\n> 나의 행동: {}", action.original_text.trim()))
-                    .unwrap_or_default();
-                format!(
-                    "### 턴 {} · {}{}\n\n{}",
-                    entry.turn, entry.scene_id, action, entry.narration
-                )
+                    .map(|action| action.original_text.trim().to_string()),
+                narration: entry.narration.clone(),
             })
             .collect();
         self.memory_items = memories
@@ -494,7 +492,7 @@ mod tests {
         app.set_lists(&entries, &[]);
 
         assert_eq!(app.story_stack.len(), 2);
-        assert!(app.story_stack[0].contains("첫 장면"));
-        assert!(app.story_stack[1].contains("다음 장면"));
+        assert_eq!(app.story_stack[0].narration, "첫 장면");
+        assert_eq!(app.story_stack[1].narration, "다음 장면");
     }
 }

@@ -27,6 +27,15 @@ pub enum ListMode {
     Memory,
 }
 
+/// One immutable block in the chronological story transcript.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoryStackEntry {
+    pub turn: u32,
+    pub scene_id: String,
+    pub player_action: Option<String>,
+    pub narration: String,
+}
+
 pub fn render_list(frame: &mut Frame, area: Rect, mode: ListMode, items: &[String], scroll: u16) {
     let title = match mode {
         ListMode::History => "이전 생성 기록",
@@ -63,7 +72,7 @@ pub fn render_story(
     narration_scroll: u16,
     input_mode: bool,
     input: &InputBuffer,
-    story_stack: &[String],
+    story_stack: &[StoryStackEntry],
 ) {
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         render_min_size_warning(frame, area);
@@ -122,15 +131,19 @@ pub fn render_story(
     };
 
     // Narration.
-    let stacked_narration = if story_stack.is_empty() {
-        view.narration.clone()
+    let narration_text = if story_stack.is_empty() {
+        markdown_text(&view.narration)
     } else {
-        story_stack.join("\n\n---\n\n")
+        story_stack_text(story_stack)
     };
-    let narration = Paragraph::new(markdown_text(&stacked_narration))
-        .scroll((narration_scroll, 0))
+    let max_scroll = wrapped_line_count(&narration_text, chunks[0].width)
+        .saturating_sub(chunks[0].height as usize) as u16;
+    let narration = Paragraph::new(narration_text)
         .wrap(Wrap { trim: false })
         .style(Style::default().fg(Color::Gray));
+    // Mouse wheels and PageDown can generate an offset beyond the wrapped
+    // content. Clamp it here so the pane never becomes mysteriously blank.
+    let narration = narration.scroll((narration_scroll.min(max_scroll), 0));
     frame.render_widget(narration, chunks[0]);
 
     // Choices.
@@ -149,6 +162,14 @@ pub fn render_story(
     } else if let Some(ref loading) = view.loading {
         render_loading_overlay(frame, area, &loading.message_ko);
     }
+}
+
+fn wrapped_line_count(text: &Text<'_>, width: u16) -> usize {
+    let width = width.max(1) as usize;
+    text.lines
+        .iter()
+        .map(|line| line.width().max(1).div_ceil(width))
+        .sum()
 }
 
 fn render_input(frame: &mut Frame, area: Rect, active: bool, input: &InputBuffer) {
@@ -186,9 +207,54 @@ fn render_input(frame: &mut Frame, area: Rect, active: bool, input: &InputBuffer
     );
 }
 
+fn story_stack_text(entries: &[StoryStackEntry]) -> Text<'static> {
+    let mut lines = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        if index > 0 {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "────────────────────────────────────────",
+                Style::default().fg(Color::DarkGray),
+            )));
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled(
+            format!("턴 {} · {}", entry.turn, entry.scene_id),
+            Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        if let Some(action) = &entry.player_action {
+            lines.push(Line::from(Span::styled(
+                "플레이어 행동",
+                Style::default()
+                    .fg(Color::LightYellow)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(Span::styled(
+                action.clone(),
+                Style::default().fg(Color::Yellow),
+            )));
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled(
+            "모델 서술",
+            Style::default()
+                .fg(Color::LightBlue)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.extend(markdown_lines(&entry.narration));
+    }
+    Text::from(lines)
+}
+
 /// Render the small Markdown subset used by Story Packs at the TUI boundary.
 fn markdown_text(input: &str) -> Text<'static> {
-    let lines: Vec<Line<'static>> = input
+    Text::from(markdown_lines(input))
+}
+
+fn markdown_lines(input: &str) -> Vec<Line<'static>> {
+    input
         .lines()
         .map(|raw| {
             let dialogue = raw
@@ -239,8 +305,7 @@ fn markdown_text(input: &str) -> Text<'static> {
             spans.extend(inline_markdown(body, style));
             Line::from(spans)
         })
-        .collect();
-    Text::from(lines)
+        .collect()
 }
 
 fn inline_markdown(input: &str, base: Style) -> Vec<Span<'static>> {
