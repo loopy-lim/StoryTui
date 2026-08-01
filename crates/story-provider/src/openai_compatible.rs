@@ -193,8 +193,13 @@ impl OpenAiCompatibleProvider {
         request: &TurnRequest,
         suppress_rf: bool,
         cancel: &CancellationToken,
+        temperature_override: Option<f32>,
     ) -> Result<GeneratedTurnDraft, ProviderError> {
         let bounded_request = bound_context(request, self.config.context_budget_tokens);
+        let mut bounded_request = bounded_request;
+        if let Some(temperature) = temperature_override {
+            bounded_request.temperature = temperature;
+        }
         let send_rf = !suppress_rf && self.structured_enabled() && request.json_schema.is_some();
         let body = ChatCompletionRequest::from_turn(&bounded_request, &self.config.model, send_rf);
         let max_attempts = self.config.max_retries.saturating_add(1);
@@ -382,7 +387,7 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
         request: TurnRequest,
         cancel: CancellationToken,
     ) -> Result<GeneratedTurnDraft, ProviderError> {
-        match self.do_generate(&request, false, &cancel).await {
+        match self.do_generate(&request, false, &cancel, None).await {
             Ok(draft) => Ok(draft),
             // Auto-fallback: if structured output was on and the body still
             // failed to parse, disable the capability for the session and retry
@@ -398,7 +403,15 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
                     "structured-output parse failure; retrying without response_format"
                 );
                 self.disable_structured();
-                self.do_generate(&request, true, &cancel).await
+                self.do_generate(&request, true, &cancel, Some(0.2)).await
+            }
+            Err(ProviderError::InvalidGeneration(_))
+                if self.config.structured_output == StructuredOutputMode::On =>
+            {
+                // Free-form JSON is still stochastic on local Qwen/MLX
+                // servers. Retry once at a deterministic temperature before
+                // surfacing a player-facing format error.
+                self.do_generate(&request, true, &cancel, Some(0.2)).await
             }
             Err(other) => Err(other),
         }
