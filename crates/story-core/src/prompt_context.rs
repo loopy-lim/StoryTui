@@ -122,6 +122,12 @@ fn build_system(pack: &StoryPack, player_action: Option<&ParsedAction>) -> Strin
          decisions the player did not specify. Do not invert or shrink the core intent of \
          the player's free-text input.\n",
     );
+    s.push_str(
+        "\n# Continuation and variation\n\
+         Continue from the current state and the recent turns. Do not restart the opening. \
+         Do not copy an exact sentence or repeat the same sensory description from a recent \
+         narration. Advance only one small, observable beat in this turn.\n",
+    );
 
     // When this turn originates from a free-text action, reinforce the
     // sovereignty clause in Korean right where the model reads its role.
@@ -152,8 +158,16 @@ fn build_user(
     s.push_str(&pack.world_md);
     s.push_str("\n\n# Style\n");
     s.push_str(&pack.style_md);
-    s.push_str("\n\n# Opening\n");
-    s.push_str(&pack.opening_md);
+    if recent.is_empty() {
+        s.push_str("\n\n# Opening (first turn only)\n");
+        s.push_str(&pack.opening_md);
+    } else {
+        s.push_str(
+            "\n\n# Opening reference\n\
+             The opening has already been shown. Do not reproduce its prose; continue from \
+             the current state and recent turns below.\n",
+        );
+    }
 
     s.push_str("\n\n# Current state\n");
     s.push_str(&state_snapshot_json(state));

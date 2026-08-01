@@ -257,6 +257,15 @@ fn golden_prompt_snapshot_is_stable() {
 }
 
 #[test]
+fn later_turn_prompt_does_not_repeat_opening_prose() {
+    let (pack, state, recent) = fixture(false);
+    let bundle = build_prompt(&pack, &state, &recent, None);
+    assert!(!bundle.user.contains("유나가 앉아 있다."));
+    assert!(bundle.user.contains("The opening has already been shown."));
+    assert!(bundle.system.contains("Do not restart the opening."));
+}
+
+#[test]
 fn hash_is_64_lowercase_hex_chars() {
     let (pack, state, recent) = fixture(false);
     let bundle = build_prompt(&pack, &state, &recent, None);
