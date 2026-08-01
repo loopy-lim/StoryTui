@@ -223,6 +223,25 @@ fn start_new_game_publishes_opening_and_requests_generation() {
 }
 
 #[test]
+fn generation_request_carries_structured_output_schema() {
+    let pack = sample_pack();
+    let init = EngineState::initial(&pack);
+    let transition = reduce(&init, EngineCommand::StartNewGame, &pack).expect("start");
+    let request = transition
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            EngineEffect::RequestGeneration { request, .. } => Some(request),
+            _ => None,
+        })
+        .expect("StartNewGame emits RequestGeneration");
+    assert!(
+        request.json_schema.is_some(),
+        "generation requests must carry the structured-output schema"
+    );
+}
+
+#[test]
 fn accepted_opening_generation_bumps_turn_and_offers_choices() {
     let pack = sample_pack();
     let (state, gid) = start_and_pending_id(&pack);

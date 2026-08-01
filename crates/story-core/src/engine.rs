@@ -1137,10 +1137,10 @@ pub fn build_view(
 // ---------------------------------------------------------------------------
 
 /// Build a [`TurnRequest`] for one generation: deterministic system + user
-/// prompt via [`build_prompt`], MVP sampling defaults, no structured-output
-/// schema (the slice uses the mock provider). When `player_action` is `Some`,
-/// the prompt carries the parsed free-text action plus the player-sovereignty
-/// clause.
+/// prompt via [`build_prompt`] and MVP sampling defaults. The provider decides
+/// whether to send the schema based on its structured-output mode. When
+/// `player_action` is `Some`, the prompt carries the parsed free-text action
+/// plus the player-sovereignty clause.
 fn build_turn_request(
     generation_id: Uuid,
     pack: &StoryPack,
@@ -1166,8 +1166,30 @@ fn build_turn_request(
         top_p: 0.95,
         top_k: 40,
         max_tokens: 2048,
-        json_schema: None,
+        json_schema: Some(generated_turn_json_schema()),
     }
+}
+
+/// JSON Schema sent to OpenAI-compatible providers that support structured
+/// output. Rust still performs strict parsing and reducer validation after the
+/// response; this schema prevents common malformed-Qwen/MLX output shapes.
+fn generated_turn_json_schema() -> story_model::serde_json::Value {
+    story_model::serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["narration", "choices", "state_patch", "summary"],
+        "properties": {
+            "narration": {"type": "string"},
+            "choices": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 6,
+                "items": {"type": "object", "additionalProperties": true}
+            },
+            "state_patch": {"type": "object", "additionalProperties": true},
+            "summary": {"type": "object", "additionalProperties": true}
+        }
+    })
 }
 
 /// Build a [`DirectorRequest`] for the 2-stage path. Mirrors
