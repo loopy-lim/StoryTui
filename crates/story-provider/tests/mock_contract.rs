@@ -222,12 +222,46 @@ async fn cancel_during_late_response_returns_cancelled_and_never_surfaces_draft(
 async fn direct_and_write_stream_are_unsupported_in_mvp() {
     let p = MockProvider::new("mock");
     let cancel = CancellationToken::new();
-    let direct = p.direct((), cancel.clone()).await;
+    let director_req = story_model::DirectorRequest {
+        generation_id: Uuid::nil(),
+        messages: vec![ChatMessage {
+            role: "system".to_string(),
+            content: "plan".to_string(),
+        }],
+        model: "mock".to_string(),
+        temperature: 0.7,
+        top_p: 0.9,
+        top_k: 40,
+        max_tokens: 1024,
+    };
+    let direct = p.direct(director_req, cancel.clone()).await;
     assert!(
         matches!(direct, Err(ProviderError::UnsupportedCapability(ref s)) if s == "director"),
         "{direct:?}"
     );
-    let stream = p.write_stream((), (), cancel).await;
+
+    let writer_req = story_model::WriterRequest {
+        generation_id: Uuid::nil(),
+        messages: vec![ChatMessage {
+            role: "system".to_string(),
+            content: "write".to_string(),
+        }],
+        model: "mock".to_string(),
+        temperature: 0.85,
+        top_p: 0.92,
+        top_k: 40,
+        max_tokens: 1800,
+        plan_digest: "abcdef".to_string(),
+    };
+    let (_tx, rx) = tokio::sync::mpsc::channel::<story_model::WriterEvent>(8);
+    // We pass a Sender bound to a receiver we never read; the mock ignores it
+    // and returns UnsupportedCapability immediately.
+    let dummy_tx = {
+        let (tx, _rx2) = tokio::sync::mpsc::channel::<story_model::WriterEvent>(8);
+        tx
+    };
+    let _ = rx; // unused receiver; prevents Send-on-closed noise from tx
+    let stream = p.write_stream(writer_req, dummy_tx, cancel).await;
     assert!(
         matches!(stream, Err(ProviderError::UnsupportedCapability(ref s)) if s == "streaming"),
         "{stream:?}"

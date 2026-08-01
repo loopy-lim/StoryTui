@@ -5,14 +5,18 @@
 //! behind implementations of this trait — the trait itself depends only on
 //! cross-boundary DTOs from `story-model` plus a tokio cancellation token.
 //!
-//! MVP scope: `direct` (director planner) and `write_stream` (token streaming)
-//! are placeholder methods that return [`ProviderError::UnsupportedCapability`]
-//! by default. Real implementations land in W6 (HTTP) / W10 (streaming).
+//! The default `direct`/`write_stream` bodies still return
+//! [`ProviderError::UnsupportedCapability`] so providers that do not implement
+//! the optional Director/Writer split (e.g. [`crate::MockProvider`]) compile
+//! unchanged; [`crate::OpenAiCompatibleProvider`] overrides both with real
+//! HTTP + SSE impls (W10).
 
 use async_trait::async_trait;
 use story_model::{
-    GeneratedTurnDraft, ProviderCapabilities, ProviderError, ProviderHealth, TurnRequest,
+    DirectorPlan, DirectorRequest, GeneratedTurnDraft, ProviderCapabilities, ProviderError,
+    ProviderHealth, TurnRequest, WriterEvent, WriterFinish, WriterRequest,
 };
+use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 
 /// Async LLM boundary for StoryTUI.
@@ -40,18 +44,30 @@ pub trait LlmProvider: Send + Sync {
         cancel: CancellationToken,
     ) -> Result<GeneratedTurnDraft, ProviderError>;
 
-    /// Director-planner path (MVP: unsupported). Real impl in W6.
-    async fn direct(&self, _req: (), _cancel: CancellationToken) -> Result<(), ProviderError> {
+    /// Director-planner path (non-streaming). Real impl on
+    /// [`crate::OpenAiCompatibleProvider`]; the default returns
+    /// [`ProviderError::UnsupportedCapability`] so providers that never
+    /// advertise `supports_director` (e.g. [`crate::MockProvider`]) compile
+    /// unchanged.
+    async fn direct(
+        &self,
+        _req: DirectorRequest,
+        _cancel: CancellationToken,
+    ) -> Result<DirectorPlan, ProviderError> {
         Err(ProviderError::UnsupportedCapability("director".into()))
     }
 
-    /// Token-streaming path (MVP: unsupported). Real impl in W10.
+    /// Token-streaming Writer path. `sink` receives [`WriterEvent::Chunk`]s as
+    /// each SSE data line lands; the method returns the final
+    /// [`WriterFinish`] once `[DONE]` is observed. Real impl on
+    /// [`crate::OpenAiCompatibleProvider`]; the default returns
+    /// [`ProviderError::UnsupportedCapability`].
     async fn write_stream(
         &self,
-        _req: (),
-        _sink: (),
+        _req: WriterRequest,
+        _sink: Sender<WriterEvent>,
         _cancel: CancellationToken,
-    ) -> Result<(), ProviderError> {
+    ) -> Result<WriterFinish, ProviderError> {
         Err(ProviderError::UnsupportedCapability("streaming".into()))
     }
 }

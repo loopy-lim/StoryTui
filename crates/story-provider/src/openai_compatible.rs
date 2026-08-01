@@ -16,16 +16,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use reqwest::redirect::Policy;
 use reqwest::{Client, StatusCode};
 use story_model::{
-    GeneratedTurnDraft, ProviderCapabilities, ProviderError, ProviderHealth, TurnRequest,
+    DirectorPlan, DirectorRequest, GeneratedTurnDraft, ProviderCapabilities, ProviderError,
+    ProviderHealth, TokenUsage, TurnRequest, WriterEvent, WriterFinish, WriterRequest,
 };
+use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{ProviderConfig, StructuredOutputMode};
 use crate::envelope::ChatCompletionRequest;
 use crate::recovery::parse_generated_turn;
+use crate::sse::{SseEvent, SseParser};
 
 /// Maximum backoff cap. The exponential backoff starts at `BASE_BACKOFF_MS`.
 const MAX_BACKOFF: Duration = Duration::from_millis(1_000);
@@ -317,6 +321,259 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
             Err(other) => Err(other),
         }
     }
+
+    /// Director planner (W10, ST-033): non-streaming POST + strict parse into
+    /// [`DirectorPlan`]. 4xx is NOT retried; 5xx / connect / timeout retry up
+    /// to `max_retries` with bounded exponential backoff; `cancel` is honored
+    /// before every attempt AND raced against the in-flight request — same
+    /// contract as [`Self::generate_turn`].
+    async fn direct(
+        &self,
+        request: DirectorRequest,
+        cancel: CancellationToken,
+    ) -> Result<DirectorPlan, ProviderError> {
+        let body = ChatCompletionRequest::from_director(&request, &self.config.model);
+        let max_attempts = self.config.max_retries.saturating_add(1);
+
+        for attempt in 0..max_attempts {
+            if cancel.is_cancelled() {
+                return Err(ProviderError::Cancelled);
+            }
+            let send = self.client.post(self.chat_url()).json(&body).send();
+            let result = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
+                r = send => r,
+            };
+
+            let resp = match result {
+                Ok(r) => r,
+                Err(e) => {
+                    if attempt + 1 < max_attempts {
+                        Self::sleep_or_cancel(attempt, &cancel).await?;
+                        continue;
+                    }
+                    return Err(map_send_error(e, self.config.request_timeout_ms));
+                }
+            };
+
+            let status = resp.status();
+            if status.is_client_error() {
+                // 4xx MUST NOT be retried (ADR-002).
+                return Err(ProviderError::Protocol(format!("HTTP {}", status.as_u16())));
+            }
+            if !status.is_success() {
+                if attempt + 1 < max_attempts {
+                    Self::sleep_or_cancel(attempt, &cancel).await?;
+                    continue;
+                }
+                return Err(ProviderError::Protocol(format!("HTTP {}", status.as_u16())));
+            }
+
+            let parsed: crate::envelope::ChatCompletionResponse = match resp.json().await {
+                Ok(p) => p,
+                Err(e) => {
+                    return Err(ProviderError::Protocol(format!(
+                        "response decode failed: {e}"
+                    )));
+                }
+            };
+            let content = parsed.content();
+
+            // Strict parse into DirectorPlan. The model is contractually
+            // expected to emit exactly this shape; any drift ⇒ InvalidGeneration
+            // (sanitized detail via the serde error, which never embeds the
+            // raw body).
+            let plan: DirectorPlan = serde_json::from_str(&content).map_err(|e| {
+                ProviderError::InvalidGeneration(format!("director plan strict parse failed: {e}"))
+            })?;
+            return Ok(plan);
+        }
+        Err(ProviderError::Protocol(
+            "retry budget exhausted".to_string(),
+        ))
+    }
+
+    /// Streaming Writer (W10, ST-034): POST with `stream:true`, parse the SSE
+    /// byte stream via [`SseParser`], forward each delta as a
+    /// [`WriterEvent::Chunk`] to `sink`, coalesce the full text, and return a
+    /// [`WriterFinish`] on `[DONE]`. On cancel / disconnect / late chunk the
+    /// method stops and discards any pending text (returns `Cancelled` /
+    /// `Protocol`). `cancel` is honored via `tokio::select!`.
+    async fn write_stream(
+        &self,
+        request: WriterRequest,
+        sink: Sender<WriterEvent>,
+        cancel: CancellationToken,
+    ) -> Result<WriterFinish, ProviderError> {
+        let body = ChatCompletionRequest::from_writer(&request, &self.config.model);
+        let generation_id = request.generation_id;
+
+        if cancel.is_cancelled() {
+            return Err(ProviderError::Cancelled);
+        }
+
+        // Single attempt — once the stream has started we cannot transparently
+        // retry (chunks may have already been surfaced to the UI). Pre-stream
+        // errors (connect / 4xx / 5xx) are surfaced immediately.
+        let send = self.client.post(self.chat_url()).json(&body).send();
+        let resp = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
+            r = send => r.map_err(|e| map_send_error(e, self.config.request_timeout_ms))?,
+        };
+
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(ProviderError::Protocol(format!("HTTP {}", status.as_u16())));
+        }
+
+        let mut stream = resp.bytes_stream();
+        let mut parser = SseParser::new();
+        let mut full_text = String::new();
+        let mut usage: Option<TokenUsage> = None;
+        let mut saw_done = false;
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    // Cancel discards any buffered / in-flight text.
+                    return Err(ProviderError::Cancelled);
+                }
+                chunk = stream.next() => {
+                    match chunk {
+                        None => break,
+                        Some(Err(e)) => {
+                            return Err(map_send_error(e, self.config.request_timeout_ms));
+                        }
+                        Some(Ok(bytes)) => {
+                            for ev in parser.feed(bytes.as_ref()) {
+                                match ev {
+                                    SseEvent::Data(payload) => {
+                                        if let Some(parsed) = parse_stream_delta(&payload) {
+                                            if let Some(text) = parsed.text
+                                                && !text.is_empty()
+                                            {
+                                                // Forward to the sink; ignore a full
+                                                // channel (the host may have dropped the
+                                                // receiver). Coalesce regardless.
+                                                let _ = sink.try_send(WriterEvent::Chunk {
+                                                    text: text.clone(),
+                                                });
+                                                full_text.push_str(&text);
+                                            }
+                                            if let Some(u) = parsed.usage {
+                                                usage = Some(u);
+                                            }
+                                        }
+                                        // Unknown payloads (keep-alive comments,
+                                        // unparseable deltas) are ignored.
+                                    }
+                                    SseEvent::Done => {
+                                        saw_done = true;
+                                        break;
+                                    }
+                                    SseEvent::Incomplete => {}
+                                }
+                            }
+                            if saw_done {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !saw_done {
+            // Stream ended without `[DONE]` — treat as a protocol error so the
+            // host surfaces a recoverable error rather than partial text.
+            return Err(ProviderError::Protocol(
+                "stream ended without [DONE]".to_string(),
+            ));
+        }
+
+        // Best-effort final notification; a dropped receiver is not an error.
+        let _ = sink.try_send(WriterEvent::Done {
+            usage: usage.clone(),
+        });
+
+        Ok(WriterFinish {
+            generation_id,
+            full_text,
+            usage,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OpenAI streaming-delta payload parsing
+// ---------------------------------------------------------------------------
+
+/// Decoded payload from one OpenAI streaming chunk: the delta text (if any) and
+/// the optional per-chunk / final usage. `None` if the payload is unparseable
+/// or carries neither (e.g. a keep-alive chunk).
+struct ParsedDelta {
+    text: Option<String>,
+    usage: Option<TokenUsage>,
+}
+
+/// Serde-tolerant decoder for one OpenAI streaming `data:` payload. Unknown
+/// fields are ignored; missing `choices` / `delta` / `content` default to
+/// empty.
+fn parse_stream_delta(payload: &str) -> Option<ParsedDelta> {
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct StreamChunk {
+        #[serde(default)]
+        choices: Vec<StreamChoice>,
+        #[serde(default)]
+        usage: Option<StreamUsage>,
+    }
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct StreamChoice {
+        #[serde(default)]
+        delta: Option<StreamDelta>,
+    }
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct StreamDelta {
+        #[serde(default)]
+        content: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct StreamUsage {
+        #[serde(default)]
+        prompt_tokens: Option<u32>,
+        #[serde(default)]
+        completion_tokens: Option<u32>,
+        #[serde(default)]
+        total_tokens: Option<u32>,
+    }
+    impl StreamUsage {
+        fn to_token_usage(&self) -> Option<TokenUsage> {
+            let prompt = self.prompt_tokens?;
+            let completion = self.completion_tokens.unwrap_or(0);
+            let total = self.total_tokens.unwrap_or(prompt + completion);
+            Some(TokenUsage {
+                prompt_tokens: prompt,
+                completion_tokens: completion,
+                total_tokens: total,
+            })
+        }
+    }
+
+    let parsed: StreamChunk = serde_json::from_str(payload).ok()?;
+    let text = parsed
+        .choices
+        .first()
+        .and_then(|c| c.delta.as_ref())
+        .and_then(|d| d.content.clone());
+    let usage = parsed.usage.and_then(|u| u.to_token_usage());
+    Some(ParsedDelta { text, usage })
 }
 
 #[cfg(test)]

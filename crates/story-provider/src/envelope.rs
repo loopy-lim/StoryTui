@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use story_model::{ChatMessage, TokenUsage, TurnRequest};
+use story_model::{ChatMessage, DirectorRequest, TokenUsage, TurnRequest, WriterRequest};
 
 /// Serialize `&u32` only when it is non-zero (some servers reject `top_k`).
 fn skip_zero_u32(v: &u32) -> bool {
@@ -90,6 +90,39 @@ impl ChatCompletionRequest {
             max_tokens: req.max_tokens,
             stream: false,
             response_format,
+        }
+    }
+
+    /// Build a non-streaming envelope for a Director generation request (W10).
+    /// Mirrors [`Self::from_turn`] but takes the Director sampling fields and
+    /// forces `stream: false` and no `response_format` (the Director's JSON
+    /// shape is enforced by a strict client-side parse, not `response_format`).
+    pub fn from_director(req: &DirectorRequest, model: &str) -> Self {
+        Self {
+            model: model.to_string(),
+            messages: req.messages.clone(),
+            temperature: req.temperature,
+            top_p: req.top_p,
+            top_k: req.top_k,
+            max_tokens: req.max_tokens,
+            stream: false,
+            response_format: None,
+        }
+    }
+
+    /// Build a streaming envelope for a Writer generation request (W10). Forces
+    /// `stream: true` so the server returns an SSE body; no `response_format`
+    /// — the Writer emits prose, not JSON.
+    pub fn from_writer(req: &WriterRequest, model: &str) -> Self {
+        Self {
+            model: model.to_string(),
+            messages: req.messages.clone(),
+            temperature: req.temperature,
+            top_p: req.top_p,
+            top_k: req.top_k,
+            max_tokens: req.max_tokens,
+            stream: true,
+            response_format: None,
         }
     }
 }

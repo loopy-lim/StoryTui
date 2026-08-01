@@ -16,12 +16,14 @@ pub mod mock;
 pub mod openai_compatible;
 pub mod provider;
 pub mod recovery;
+pub mod sse;
 
 pub use config::{ProviderConfig, StructuredOutputMode};
 pub use mock::{MockProvider, MockResponse};
 pub use openai_compatible::{OpenAiCompatibleProvider, is_loopback_base_url};
 pub use provider::LlmProvider;
 pub use recovery::{ParseOutcome, parse_generated_turn};
+pub use sse::{SseEvent, SseParser};
 
 // Convenient re-export of the boundary DTOs / error for downstream crates.
 pub use story_model::{
