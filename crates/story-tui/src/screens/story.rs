@@ -63,6 +63,7 @@ pub fn render_story(
     narration_scroll: u16,
     input_mode: bool,
     input: &InputBuffer,
+    story_stack: &[String],
 ) {
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         render_min_size_warning(frame, area);
@@ -121,7 +122,12 @@ pub fn render_story(
     };
 
     // Narration.
-    let narration = Paragraph::new(markdown_text(&view.narration))
+    let stacked_narration = if story_stack.is_empty() {
+        view.narration.clone()
+    } else {
+        story_stack.join("\n\n---\n\n")
+    };
+    let narration = Paragraph::new(markdown_text(&stacked_narration))
         .scroll((narration_scroll, 0))
         .wrap(Wrap { trim: false })
         .style(Style::default().fg(Color::Gray));

@@ -41,6 +41,8 @@ pub struct App {
     /// Display-ready history and memory rows supplied by the host.
     pub history_items: Vec<String>,
     pub memory_items: Vec<String>,
+    /// Chronological narration stack shown in the main story pane.
+    pub story_stack: Vec<String>,
     pub list_scroll: u16,
 }
 
@@ -57,6 +59,7 @@ impl App {
             list_mode: None,
             history_items: Vec::new(),
             memory_items: Vec::new(),
+            story_stack: Vec::new(),
             list_scroll: 0,
         }
     }
@@ -86,6 +89,20 @@ impl App {
             .map(|entry| {
                 let preview = entry.narration.lines().next().unwrap_or_default();
                 format!("턴 {} · {} — {}", entry.turn, entry.scene_id, preview)
+            })
+            .collect();
+        self.story_stack = history
+            .iter()
+            .map(|entry| {
+                let action = entry
+                    .player_action
+                    .as_ref()
+                    .map(|action| format!("\n> 나의 행동: {}", action.original_text.trim()))
+                    .unwrap_or_default();
+                format!(
+                    "### 턴 {} · {}{}\n\n{}",
+                    entry.turn, entry.scene_id, action, entry.narration
+                )
             })
             .collect();
         self.memory_items = memories
@@ -219,6 +236,7 @@ impl App {
             self.narration_scroll,
             self.input_mode,
             &self.input,
+            &self.story_stack,
         );
     }
 
@@ -443,5 +461,40 @@ mod tests {
         let mut app = App::new(sample_view(3));
         app.handle_key(key(KeyCode::Char('q')), None);
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn set_lists_builds_chronological_story_stack() {
+        let mut app = App::new(sample_view(1));
+        let entries = vec![
+            story_model::HistoryEntry {
+                id: Uuid::new_v4(),
+                turn: 1,
+                scene_id: "station".to_string(),
+                created_at: chrono::Utc::now(),
+                narration: "첫 장면".to_string(),
+                player_action: None,
+                choices: Vec::new(),
+                applied_patch: story_model::StatePatch::default(),
+                generation_id: Uuid::new_v4(),
+            },
+            story_model::HistoryEntry {
+                id: Uuid::new_v4(),
+                turn: 2,
+                scene_id: "cafe".to_string(),
+                created_at: chrono::Utc::now(),
+                narration: "다음 장면".to_string(),
+                player_action: None,
+                choices: Vec::new(),
+                applied_patch: story_model::StatePatch::default(),
+                generation_id: Uuid::new_v4(),
+            },
+        ];
+
+        app.set_lists(&entries, &[]);
+
+        assert_eq!(app.story_stack.len(), 2);
+        assert!(app.story_stack[0].contains("첫 장면"));
+        assert!(app.story_stack[1].contains("다음 장면"));
     }
 }
