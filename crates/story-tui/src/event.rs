@@ -31,6 +31,7 @@ pub fn map_key(key: KeyEvent, choice_count: usize, loading: bool, has_error: boo
     }
     match key.code {
         KeyCode::Char('q') => KeyAction::Quit,
+        KeyCode::Char('n') => KeyAction::Command(EngineCommand::StartNewGame),
         KeyCode::Char('j') | KeyCode::Down => KeyAction::MoveSelection(1),
         KeyCode::Char('k') | KeyCode::Up => KeyAction::MoveSelection(-1),
         KeyCode::Enter => {
@@ -143,6 +144,14 @@ mod tests {
         assert_eq!(
             map_key(key(KeyCode::Char('q')), 3, false, false),
             KeyAction::Quit
+        );
+    }
+
+    #[test]
+    fn n_starts_a_new_game() {
+        assert_eq!(
+            map_key(key(KeyCode::Char('n')), 0, false, false),
+            KeyAction::Command(EngineCommand::StartNewGame)
         );
     }
 

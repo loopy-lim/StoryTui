@@ -244,7 +244,7 @@ fn render_status(frame: &mut Frame, area: Rect, view: &AppViewModel) {
         Some(n) => format!("{label}:{n}"),
         None => format!("{label}:—"),
     };
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::raw(stat("애정", view.status.affection)),
         Span::raw("  "),
         Span::raw(stat("신뢰", view.status.trust)),
@@ -255,7 +255,19 @@ fn render_status(frame: &mut Frame, area: Rect, view: &AppViewModel) {
             format!("턴: {}", view.status.turn),
             Style::default().add_modifier(Modifier::BOLD),
         ),
-    ]);
+    ];
+    if view.status.turn == 0 && view.choices.is_empty() && view.loading.is_none() {
+        spans.extend([
+            Span::raw("    "),
+            Span::styled(
+                "[N] 게임 시작",
+                Style::default()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]);
+    }
+    let line = Line::from(spans);
     let block = Block::default()
         .borders(Borders::TOP)
         .border_style(Style::default().fg(Color::DarkGray));

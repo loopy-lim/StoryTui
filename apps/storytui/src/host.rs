@@ -83,18 +83,6 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
     let (tx, mut rx) = unbounded_channel();
     let mut cancellation: Option<(story_model::uuid::Uuid, CancellationToken)> = None;
 
-    dispatch(
-        EngineCommand::StartNewGame,
-        &mut engine,
-        &mut app,
-        &pack,
-        &provider,
-        &save_store,
-        &tx,
-        &mut cancellation,
-    )
-    .await?;
-
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
 

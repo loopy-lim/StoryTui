@@ -24,3 +24,17 @@
 - 요청된 JSON Schema 또는 명시된 JSON 필드만 반환한다.
 - Markdown code fence와 JSON 앞뒤 설명을 쓰지 않는다.
 - 존재하지 않는 캐릭터, 장소, flag, item 또는 event ID를 만들지 않는다.
+
+MVP 단일 호출 출력 계약:
+- 최상위 필드는 정확히 `narration`, `choices`, `state_patch`, `summary`만 사용한다.
+- 상태 변경 객체 이름은 반드시 `state_patch`다. `patches`, `patch`, `state`, `plan`을 사용하지 않는다.
+- Director 계획 필드(`scene_goal`, `required_beats`, `reveal_fact_ids`, `must_not_reveal_fact_ids` 등)를 반환하지 않는다.
+- `narration`은 플레이어에게 보여줄 장면 본문만, `choices`는 플레이어가 고를 수 있는 선택지만 담는다.
+- `state_patch`는 허용된 상태 변경만 담고, `summary`는 구조화된 회고 정보만 담는다.
+
+정확한 출력 템플릿(필드명과 자료형을 바꾸지 않는다):
+```json
+{"narration":"장면 본문","choices":[{"id":"choice-1","label":"대화의 첫 방향","intent":"대화를 시작한다","tone":null,"target":null,"risk":"low","hidden_requirements":[],"preview":null}],"state_patch":{"affection_delta":{},"trust_delta":{},"tension_delta":{},"relationship_transitions":{},"set_flags":{},"number_delta":{},"set_strings":{},"inventory_delta":{},"add_events":[],"next_location":null,"next_time_slot":null,"proposed_route":null},"summary":{"facts":[],"unresolved":[],"relationship_changes":[],"knowledge_changes":[],"interpretation":null,"address_form_changes":[],"important_player_actions":[],"source_history_ids":[]}}
+```
+- `choices` 안에는 반드시 `id`, `label`, `intent`, `tone`, `target`, `risk`, `hidden_requirements`, `preview`를 모두 포함한다.
+- 빈 상태 변경은 위 템플릿처럼 빈 객체/배열 또는 `null`로 표현한다. `option`, `text`, `location`, `mood`, `weather` 같은 임의 필드는 사용하지 않는다.

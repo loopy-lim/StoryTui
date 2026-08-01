@@ -1184,10 +1184,56 @@ fn generated_turn_json_schema() -> story_model::serde_json::Value {
                 "type": "array",
                 "minItems": 1,
                 "maxItems": 6,
-                "items": {"type": "object", "additionalProperties": true}
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["id", "label", "intent", "tone", "target", "risk", "hidden_requirements", "preview"],
+                    "properties": {
+                        "id": {"type": "string"},
+                        "label": {"type": "string"},
+                        "intent": {"type": "string"},
+                        "tone": {"type": ["string", "null"]},
+                        "target": {"type": ["string", "null"]},
+                        "risk": {"type": "string", "enum": ["safe", "low", "medium", "high", "severe"]},
+                        "hidden_requirements": {"type": "array", "items": {"type": "object"}},
+                        "preview": {"type": ["string", "null"]}
+                    }
+                }
             },
-            "state_patch": {"type": "object", "additionalProperties": true},
-            "summary": {"type": "object", "additionalProperties": true}
+            "state_patch": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["affection_delta", "trust_delta", "tension_delta", "relationship_transitions", "set_flags", "number_delta", "set_strings", "inventory_delta", "add_events", "next_location", "next_time_slot", "proposed_route"],
+                "properties": {
+                    "affection_delta": {"type": "object", "additionalProperties": {"type": "integer"}},
+                    "trust_delta": {"type": "object", "additionalProperties": {"type": "integer"}},
+                    "tension_delta": {"type": "object", "additionalProperties": {"type": "integer"}},
+                    "relationship_transitions": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "set_flags": {"type": "object", "additionalProperties": {"type": "boolean"}},
+                    "number_delta": {"type": "object", "additionalProperties": {"type": "integer"}},
+                    "set_strings": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "inventory_delta": {"type": "object", "additionalProperties": {"type": "integer"}},
+                    "add_events": {"type": "array", "items": {"type": "string"}},
+                    "next_location": {"type": ["string", "null"]},
+                    "next_time_slot": {"type": ["string", "null"]},
+                    "proposed_route": {"type": ["string", "null"]}
+                }
+            },
+            "summary": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["facts", "unresolved", "relationship_changes", "knowledge_changes", "interpretation", "address_form_changes", "important_player_actions", "source_history_ids"],
+                "properties": {
+                    "facts": {"type": "array", "items": {"type": "string"}},
+                    "unresolved": {"type": "array", "items": {"type": "string"}},
+                    "relationship_changes": {"type": "array", "items": {"type": "string"}},
+                    "knowledge_changes": {"type": "array", "items": {"type": "string"}},
+                    "interpretation": {"type": ["string", "null"]},
+                    "address_form_changes": {"type": "array", "items": {"type": "string"}},
+                    "important_player_actions": {"type": "array", "items": {"type": "string"}},
+                    "source_history_ids": {"type": "array", "items": {"type": "string"}}
+                }
+            }
         }
     })
 }

@@ -1,0 +1,25 @@
+# StoryTUI local OMLX profile. Keep secrets out of this file.
+save_dir = "saves"
+
+[provider]
+kind = "openai_compatible"
+name = "omlx-local"
+base_url = "http://127.0.0.1:8000"
+chat_path = "/v1/chat/completions"
+health_path = "/health"
+# OMLX requires an API key for authenticated API routes. The value is read
+# from this environment variable and is never written to diagnostics/saves.
+# Authentication is optional. For an authenticated server, set either
+# api_key_env or api_key_file in a private override profile.
+temperature = 0.85
+top_p = 0.92
+top_k = 40
+max_tokens = 1800
+request_timeout_ms = 180000
+connect_timeout_ms = 3000
+max_retries = 2
+context_budget_tokens = 24576
+# This local Qwen/MLX endpoint accepts response_format but does not reliably
+# enforce nested JSON Schema. Use the safe prompt contract plus Rust-side
+# validation until the server's constrained decoding is reliable.
+structured_output = "off"
