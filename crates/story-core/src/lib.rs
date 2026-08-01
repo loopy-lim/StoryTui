@@ -4,6 +4,7 @@
 //! never depend on terminal, HTTP, or filesystem crates (ADR-003).
 
 pub mod action_parse;
+pub mod director;
 pub mod engine;
 pub mod engine_cmd;
 pub mod error;
@@ -16,3 +17,4 @@ pub mod state_machine;
 pub mod summary;
 pub mod tests_support;
 pub mod validator;
+pub mod writer;

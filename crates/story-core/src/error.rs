@@ -120,3 +120,20 @@ pub const SUMMARY_MISSING_SOURCE_HISTORY_IDS: &str = "summary_missing_source_his
 /// A `TurnSummary` listed a `source_history_id` that is not present in the
 /// supplied source history entries (an invented/unsourced fact, ST-030).
 pub const SUMMARY_UNSOURCED_FACT: &str = "summary_unsourced_fact";
+
+// ---------------------------------------------------------------------------
+// Director / Writer reason codes (W10, ST-033/034)
+// ---------------------------------------------------------------------------
+
+/// `reveal_fact_ids` overlaps `must_not_reveal_fact_ids`, or a reveal targets a
+/// character's declared `unknown_facts` (knowledge-scope violation).
+pub const DIRECTOR_REVEAL_CONFLICT: &str = "director_reveal_conflict";
+/// `emotion_arcs` references a character id not present in `state.characters`.
+pub const DIRECTOR_UNKNOWN_CHARACTER: &str = "director_unknown_character";
+/// `choices` count outside `[1, 6]`, or a choice has empty `id`/`label`/`intent`.
+pub const DIRECTOR_INVALID_CHOICE: &str = "director_invalid_choice";
+/// `end_condition` is empty / whitespace-only.
+pub const DIRECTOR_EMPTY_END_CONDITION: &str = "director_empty_end_condition";
+/// The proposed patch passed the W3 validator but failed the reducer dry-run
+/// (e.g. an event effect went out of range) — the Writer is NOT called.
+pub const DIRECTOR_DRY_RUN_FAILED: &str = "director_dry_run_failed";
