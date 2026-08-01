@@ -121,10 +121,17 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                     HostMessage::Generation { generation_id, result } => {
                         let command = match result {
                             Ok(draft) => EngineCommand::AcceptGeneration { draft: Box::new(draft) },
-                            Err(error) => EngineCommand::ProviderFailed {
-                                generation_id,
-                                error: provider_error_view(error),
-                            },
+                            Err(error) => {
+                                // `ProviderError::InvalidGeneration` contains only a
+                                // sanitized parser detail (never the raw model body).
+                                // Keep it in the terminal log for diagnosis while the
+                                // player-facing overlay stays concise.
+                                tracing::warn!(%generation_id, %error, "turn generation rejected");
+                                EngineCommand::ProviderFailed {
+                                    generation_id,
+                                    error: provider_error_view(error),
+                                }
+                            }
                         };
                         dispatch(command, &mut engine, &mut app, &pack, &provider, &save_store, &tx, &mut cancellation).await?;
                     }
