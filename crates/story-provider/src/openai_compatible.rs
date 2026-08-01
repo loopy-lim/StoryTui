@@ -148,6 +148,48 @@ impl OpenAiCompatibleProvider {
         join_url(&self.config.base_url, &self.config.health_path)
     }
 
+    /// OpenAI-compatible model-list URL.
+    pub fn models_url(&self) -> String {
+        join_url(&self.config.base_url, "/v1/models")
+    }
+
+    /// Fetch the models exposed by the configured OpenAI-compatible server.
+    ///
+    /// The endpoint follows OpenAI's `{ "data": [{ "id": "..." }] }`
+    /// envelope. Empty identifiers are ignored and the returned identifiers
+    /// are sorted and deduplicated so a TUI can render a stable chooser.
+    /// This is intentionally a single GET: unlike generation, model discovery
+    /// has no cancellation token or retry contract.
+    pub async fn list_models(&self) -> Result<Vec<String>, ProviderError> {
+        let response = self
+            .authorize(self.client.get(self.models_url()))
+            .send()
+            .await
+            .map_err(|error| map_send_error(error, self.config.request_timeout_ms))?;
+
+        if !response.status().is_success() {
+            return Err(ProviderError::Protocol(format!(
+                "HTTP {}",
+                response.status().as_u16()
+            )));
+        }
+
+        let response: ModelListResponse = response.json().await.map_err(|error| {
+            ProviderError::Protocol(format!("model-list response decode failed: {error}"))
+        })?;
+        let mut ids: Vec<String> = response
+            .data
+            .into_iter()
+            .filter_map(|model| {
+                let id = model.id.trim();
+                (!id.is_empty()).then(|| id.to_string())
+            })
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(ids)
+    }
+
     /// `true` iff the configured `base_url` host is loopback (ADR-002). Surfaced
     /// for the status bar / coordinator; a non-loopback provider still
     /// functions (the warning is non-blocking).
@@ -277,6 +319,16 @@ impl OpenAiCompatibleProvider {
             "retry budget exhausted".to_string(),
         ))
     }
+}
+
+#[derive(serde::Deserialize)]
+struct ModelListResponse {
+    data: Vec<ModelListItem>,
+}
+
+#[derive(serde::Deserialize)]
+struct ModelListItem {
+    id: String,
 }
 
 /// Keep the input side of a request within the configured soft context budget.

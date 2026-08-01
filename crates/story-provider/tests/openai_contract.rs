@@ -15,7 +15,7 @@ use story_provider::{
     is_loopback_base_url,
 };
 use tokio_util::sync::CancellationToken;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// A valid `GeneratedTurn` JSON body (recovery-parser input), mirroring the
@@ -134,6 +134,65 @@ async fn generation_uses_sampling_values_from_provider_config() {
     assert_eq!(body["top_p"], 0.88);
     assert_eq!(body["max_tokens"], 900);
     assert!(body.get("top_k").is_none());
+}
+
+// --- model-list discovery --------------------------------------------------
+
+#[tokio::test]
+async fn model_list_uses_auth_and_returns_stable_nonempty_ids() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .and(header("authorization", "Bearer local-secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "object": "list",
+            "data": [
+                {"id": " qwen-32b "},
+                {"id": ""},
+                {"id": "qwen-7b"},
+                {"id": "qwen-32b"},
+                {"id": "   "}
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    let mut config = cfg_for(&server);
+    config.api_key = Some("local-secret".to_string());
+    let provider = OpenAiCompatibleProvider::new(config).expect("provider");
+
+    assert_eq!(
+        provider.list_models().await.expect("model list"),
+        vec!["qwen-32b", "qwen-7b"]
+    );
+}
+
+#[tokio::test]
+async fn model_list_surfaces_http_and_decode_errors() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    let provider = OpenAiCompatibleProvider::new(cfg_for(&server)).expect("provider");
+    let error = provider.list_models().await.expect_err("401 must fail");
+    assert!(matches!(error, ProviderError::Protocol(message) if message == "HTTP 401"));
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": {}})))
+        .mount(&server)
+        .await;
+    let provider = OpenAiCompatibleProvider::new(cfg_for(&server)).expect("provider");
+    let error = provider
+        .list_models()
+        .await
+        .expect_err("invalid envelope must fail");
+    assert!(
+        matches!(error, ProviderError::Protocol(message) if message.starts_with("model-list response decode failed:"))
+    );
 }
 
 // --- health mapping --------------------------------------------------------
@@ -381,4 +440,5 @@ fn chat_and_health_urls_join_correctly() {
         "http://127.0.0.1:8080/v1/chat/completions"
     );
     assert_eq!(provider.health_url(), "http://127.0.0.1:8080/health");
+    assert_eq!(provider.models_url(), "http://127.0.0.1:8080/v1/models");
 }
