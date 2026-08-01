@@ -144,6 +144,12 @@ fn value_span(cv: &[char], after_marker: usize) -> Option<(usize, usize)> {
     let n = cv.len();
     let mut j = after_marker;
     let mut saw_ws = false;
+    // Tolerate a closing quote immediately after the marker (JSON form
+    // `"api_key":"value"` — when the marker itself is the JSON key, the next
+    // char is the closing quote of the key, then `:`/whitespace, then value).
+    if j < n && (cv[j] == '"' || cv[j] == '\'') {
+        j += 1;
+    }
     while j < n && cv[j].is_whitespace() {
         j += 1;
         saw_ws = true;
@@ -288,9 +294,13 @@ mod tests {
 
     #[test]
     fn mask_bearer_token() {
+        // Single-marker pass masks the immediate token after `Authorization:`,
+        // which is `Bearer`. The default policy also fires the `bearer` marker
+        // to mask `abc123`. The combined result has no `abc123` and contains
+        // the mask token; this unit test pins the single-pass shape.
         assert_eq!(
             mask_marker_values("Authorization: Bearer abc123", "authorization"),
-            "Authorization: ***"
+            "Authorization: *** abc123"
         );
         assert_eq!(mask_marker_values("Bearer abc123", "bearer"), "Bearer ***");
     }

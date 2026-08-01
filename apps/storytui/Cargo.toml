@@ -5,6 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lib]
+name = "storytui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "storytui"
+path = "src/main.rs"
+
 [dependencies]
 story-core.workspace = true
 story-model.workspace = true
@@ -14,6 +22,7 @@ story-tui.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tokio-util.workspace = true

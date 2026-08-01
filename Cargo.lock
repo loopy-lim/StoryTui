@@ -2397,6 +2397,7 @@ dependencies = [
 name = "storytui"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "story-core",
  "story-model",
  "story-persistence",
