@@ -8,6 +8,7 @@
 //! `Wrap { trim: false }`; ratatui 0.30 measures display width through
 //! `unicode-width`, so double-width Hangul aligns correctly.
 
+use crate::input::InputBuffer;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -20,9 +21,49 @@ use unicode_width::UnicodeWidthStr;
 pub const MIN_WIDTH: u16 = 60;
 pub const MIN_HEIGHT: u16 = 16;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListMode {
+    History,
+    Memory,
+}
+
+pub fn render_list(frame: &mut Frame, area: Rect, mode: ListMode, items: &[String], scroll: u16) {
+    let title = match mode {
+        ListMode::History => "이전 생성 기록",
+        ListMode::Memory => "기억 목록",
+    };
+    let rows: Vec<Line> = if items.is_empty() {
+        vec![Line::from("아직 기록이 없습니다.")]
+    } else {
+        items.iter().map(|item| Line::from(item.clone())).collect()
+    };
+    let paragraph = Paragraph::new(rows)
+        .scroll((scroll, 0))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::LightCyan))
+                .title(Span::styled(
+                    format!("{} · PgUp/PgDn 스크롤 · Esc 닫기", title),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(Clear, area);
+    frame.render_widget(paragraph, area);
+}
+
 /// Render the Story screen for `view`, highlighting `selected` (clamped to the
 /// choice count). `selected` is an index into `view.choices`.
-pub fn render_story(frame: &mut Frame, area: Rect, view: &AppViewModel, selected: usize) {
+pub fn render_story(
+    frame: &mut Frame,
+    area: Rect,
+    view: &AppViewModel,
+    selected: usize,
+    narration_scroll: u16,
+    input_mode: bool,
+    input: &InputBuffer,
+) {
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         render_min_size_warning(frame, area);
         return;
@@ -62,15 +103,26 @@ pub fn render_story(frame: &mut Frame, area: Rect, view: &AppViewModel, selected
         .borders(Borders::TOP)
         .border_style(Style::default().fg(Color::DarkGray));
     let body = inner.inner(area);
-    let chunks = Layout::vertical([
-        Constraint::Fill(3),
-        Constraint::Length(view.choices.len().max(1) as u16 + 2),
-        Constraint::Length(2),
-    ])
-    .split(body);
+    let chunks = if input_mode {
+        Layout::vertical([
+            Constraint::Fill(3),
+            Constraint::Length(view.choices.len().max(1) as u16 + 2),
+            Constraint::Length(3),
+            Constraint::Length(2),
+        ])
+        .split(body)
+    } else {
+        Layout::vertical([
+            Constraint::Fill(3),
+            Constraint::Length(view.choices.len().max(1) as u16 + 2),
+            Constraint::Length(2),
+        ])
+        .split(body)
+    };
 
     // Narration.
     let narration = Paragraph::new(markdown_text(&view.narration))
+        .scroll((narration_scroll, 0))
         .wrap(Wrap { trim: false })
         .style(Style::default().fg(Color::Gray));
     frame.render_widget(narration, chunks[0]);
@@ -78,8 +130,12 @@ pub fn render_story(frame: &mut Frame, area: Rect, view: &AppViewModel, selected
     // Choices.
     render_choices(frame, chunks[1], view, selected);
 
-    // Status line.
-    render_status(frame, chunks[2], view);
+    if input_mode {
+        render_input(frame, chunks[2], true, input);
+        render_status(frame, chunks[3], view);
+    } else {
+        render_status(frame, chunks[2], view);
+    }
 
     // Overlays on top.
     if let Some(ref err) = view.error {
@@ -87,6 +143,41 @@ pub fn render_story(frame: &mut Frame, area: Rect, view: &AppViewModel, selected
     } else if let Some(ref loading) = view.loading {
         render_loading_overlay(frame, area, &loading.message_ko);
     }
+}
+
+fn render_input(frame: &mut Frame, area: Rect, active: bool, input: &InputBuffer) {
+    let title = if active {
+        "직접 입력 · Enter 전송 · Esc 취소"
+    } else {
+        "직접 입력 [I]"
+    };
+    let text = if active {
+        format!("{}▌", input.text())
+    } else {
+        "원하는 행동이나 대사를 직접 입력할 수 있습니다.".to_string()
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if active {
+            Color::LightCyan
+        } else {
+            Color::DarkGray
+        }))
+        .title(Span::styled(
+            title,
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+    frame.render_widget(
+        Paragraph::new(text)
+            .style(Style::default().fg(if active {
+                Color::White
+            } else {
+                Color::DarkGray
+            }))
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 /// Render the small Markdown subset used by Story Packs at the TUI boundary.

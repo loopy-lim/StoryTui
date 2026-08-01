@@ -1,7 +1,7 @@
 use std::io::{self, Stdout};
 use std::sync::Arc;
 
-use crossterm::event::{Event, EventStream, KeyEventKind};
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -37,7 +37,12 @@ impl TerminalGuard {
     fn enter() -> io::Result<(Self, UiTerminal)> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, crossterm::cursor::Hide)?;
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            crossterm::cursor::Hide
+        )?;
         // Avoid an eager `clear()` here. Crossterm's clear path may query the
         // cursor position, which is unsupported by some PTYs and is not
         // needed because alternate-screen entry starts from a fresh surface.
@@ -50,7 +55,12 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
         let mut stdout = io::stdout();
-        let _ = execute!(stdout, LeaveAlternateScreen, crossterm::cursor::Show);
+        let _ = execute!(
+            stdout,
+            DisableMouseCapture,
+            LeaveAlternateScreen,
+            crossterm::cursor::Show
+        );
     }
 }
 
@@ -94,14 +104,16 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
         tokio::select! {
             maybe_event = events.next() => {
                 let Some(Ok(event)) = maybe_event else { break };
-                if let Event::Key(key) = event
-                    && key.kind != KeyEventKind::Release
-                {
-                    let pending = app.view.loading.as_ref().map(|v| v.generation_id);
-                    if let Some(command) = app.handle_key(key, pending) {
-                        dispatch(command, &mut engine, &mut app, &pack, &provider, &save_store, &tx, &mut cancellation).await?;
+                match event {
+                    Event::Key(key) if key.kind != KeyEventKind::Release => {
+                        let pending = app.view.loading.as_ref().map(|v| v.generation_id);
+                        if let Some(command) = app.handle_key(key, pending) {
+                            dispatch(command, &mut engine, &mut app, &pack, &provider, &save_store, &tx, &mut cancellation).await?;
+                        }
                     }
-                }
+                    Event::Mouse(mouse) => app.handle_mouse(mouse),
+                    _ => {}
+                    }
                 if app.should_quit { break; }
             }
             Some(message) = rx.recv() => {
@@ -155,6 +167,7 @@ async fn dispatch(
         e.to_string()
     })?;
     *engine = transition.state;
+    app.set_lists(&engine.game.history, &engine.game.memories);
 
     for effect in transition.effects {
         match effect {

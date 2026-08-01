@@ -9,15 +9,16 @@
 //! input to intents and renders the view it was handed. The host (`apps/
 //! storytui`) owns the event loop and the `EngineState`.
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use story_core::engine_cmd::EngineCommand;
-use story_model::AppViewModel;
 use story_model::uuid::Uuid;
+use story_model::{ActionType, AppViewModel, ParsedAction};
 
 use crate::event::{KeyAction, SELECT_SENTINEL, map_key, parse_direct_select_index};
-use crate::screens::story::render_story;
+use crate::input::InputBuffer;
+use crate::screens::story::{ListMode, render_list, render_story};
 
 /// The TUI's mutable, display-facing state. The engine-facing state lives in
 /// the host; the App only renders the published view.
@@ -29,6 +30,18 @@ pub struct App {
     pub selected: usize,
     /// Set when the user requests quit (`q` / Ctrl+C).
     pub should_quit: bool,
+    /// Vertical scroll offset for the narration pane.
+    pub narration_scroll: u16,
+    /// Whether custom free-text input is active.
+    pub input_mode: bool,
+    /// Grapheme-safe custom input buffer.
+    pub input: InputBuffer,
+    /// Currently open auxiliary list, if any.
+    pub list_mode: Option<ListMode>,
+    /// Display-ready history and memory rows supplied by the host.
+    pub history_items: Vec<String>,
+    pub memory_items: Vec<String>,
+    pub list_scroll: u16,
 }
 
 impl App {
@@ -38,6 +51,13 @@ impl App {
             view,
             selected: 0,
             should_quit: false,
+            narration_scroll: 0,
+            input_mode: false,
+            input: InputBuffer::new(500),
+            list_mode: None,
+            history_items: Vec::new(),
+            memory_items: Vec::new(),
+            list_scroll: 0,
         }
     }
 
@@ -51,6 +71,50 @@ impl App {
             self.selected = count - 1;
         }
         self.view = view;
+        self.narration_scroll = 0;
+    }
+
+    /// Refresh the auxiliary list data from the host-owned engine state.
+    pub fn set_lists(
+        &mut self,
+        history: &[story_model::HistoryEntry],
+        memories: &[story_model::MemoryEntry],
+    ) {
+        self.history_items = history
+            .iter()
+            .rev()
+            .map(|entry| {
+                let preview = entry.narration.lines().next().unwrap_or_default();
+                format!("턴 {} · {} — {}", entry.turn, entry.scene_id, preview)
+            })
+            .collect();
+        self.memory_items = memories
+            .iter()
+            .rev()
+            .map(|memory| {
+                let preview = memory
+                    .interpretation
+                    .clone()
+                    .or_else(|| {
+                        memory
+                            .facts
+                            .first()
+                            .map(|f| format!("{} {} {}", f.subject, f.predicate, f.object))
+                    })
+                    .unwrap_or_else(|| "내용 없음".to_string());
+                format!(
+                    "턴 {} · {:?}{}",
+                    memory.created_turn,
+                    memory.kind,
+                    if memory.unresolved {
+                        " · 미해결"
+                    } else {
+                        ""
+                    }
+                ) + " — "
+                    + &preview
+            })
+            .collect();
     }
 
     /// Handle one key. `pending_generation_id` lets `c` resolve to the real
@@ -61,6 +125,65 @@ impl App {
         key: KeyEvent,
         pending_generation_id: Option<Uuid>,
     ) -> Option<EngineCommand> {
+        if self.input_mode {
+            return self.handle_input_key(key);
+        }
+        if self.list_mode.is_some() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.list_mode = None;
+                    return None;
+                }
+                KeyCode::Char('h' | 'ㅗ') => {
+                    self.list_mode = Some(ListMode::History);
+                    self.list_scroll = 0;
+                    return None;
+                }
+                KeyCode::Char('m' | 'ㅡ') => {
+                    self.list_mode = Some(ListMode::Memory);
+                    self.list_scroll = 0;
+                    return None;
+                }
+                KeyCode::PageUp => self.list_scroll = self.list_scroll.saturating_sub(5),
+                KeyCode::PageDown => self.list_scroll = self.list_scroll.saturating_add(5),
+                _ => {}
+            }
+            return None;
+        }
+        if !self.view.loading.is_some()
+            && self.view.error.is_none()
+            && !self.view.choices.is_empty()
+            && matches!(key.code, KeyCode::Char('i' | 'ㅑ'))
+        {
+            self.input_mode = true;
+            self.input.clear();
+            return None;
+        }
+        if matches!(key.code, KeyCode::Char('h' | 'ㅗ')) {
+            self.list_mode = Some(ListMode::History);
+            self.list_scroll = 0;
+            return None;
+        }
+        if matches!(key.code, KeyCode::Char('m' | 'ㅡ')) {
+            self.list_mode = Some(ListMode::Memory);
+            self.list_scroll = 0;
+            return None;
+        }
+        match key.code {
+            KeyCode::PageUp => {
+                self.narration_scroll = self.narration_scroll.saturating_sub(5);
+                return None;
+            }
+            KeyCode::PageDown => {
+                self.narration_scroll = self.narration_scroll.saturating_add(5);
+                return None;
+            }
+            KeyCode::Home if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.narration_scroll = 0;
+                return None;
+            }
+            _ => {}
+        }
         let loading = self.view.loading.is_some();
         let has_error = self.view.error.is_some();
         let choice_count = self.view.choices.len();
@@ -80,7 +203,88 @@ impl App {
 
     /// Render the Story screen for the current view.
     pub fn render(&self, frame: &mut Frame, area: Rect) {
-        render_story(frame, area, &self.view, self.selected);
+        if let Some(mode) = self.list_mode {
+            let items = match mode {
+                ListMode::History => &self.history_items,
+                ListMode::Memory => &self.memory_items,
+            };
+            render_list(frame, area, mode, items, self.list_scroll);
+            return;
+        }
+        render_story(
+            frame,
+            area,
+            &self.view,
+            self.selected,
+            self.narration_scroll,
+            self.input_mode,
+            &self.input,
+        );
+    }
+
+    /// Handle mouse-wheel scrolling without changing the selected choice.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        let delta: i32 = match mouse.kind {
+            MouseEventKind::ScrollUp => -3,
+            MouseEventKind::ScrollDown => 3,
+            _ => return,
+        };
+        if self.list_mode.is_some() {
+            if delta < 0 {
+                self.list_scroll = self.list_scroll.saturating_sub(delta.unsigned_abs() as u16);
+            } else {
+                self.list_scroll = self.list_scroll.saturating_add(delta as u16);
+            }
+        } else if delta < 0 {
+            self.narration_scroll = self
+                .narration_scroll
+                .saturating_sub(delta.unsigned_abs() as u16);
+        } else {
+            self.narration_scroll = self.narration_scroll.saturating_add(delta as u16);
+        }
+    }
+
+    fn handle_input_key(&mut self, key: KeyEvent) -> Option<EngineCommand> {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.should_quit = true;
+            return None;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.input_mode = false;
+                self.input.clear();
+            }
+            KeyCode::Enter => {
+                let text = self.input.text();
+                if text.trim().is_empty() {
+                    return None;
+                }
+                self.input_mode = false;
+                self.input.clear();
+                return Some(EngineCommand::SubmitFreeAction {
+                    action: Box::new(ParsedAction {
+                        action_type: ActionType::GeneralAction,
+                        target: None,
+                        intent: None,
+                        tone: None,
+                        content: text.trim().to_string(),
+                        original_text: text,
+                        confidence: Some(0.0),
+                    }),
+                });
+            }
+            KeyCode::Backspace => self.input.backspace(),
+            KeyCode::Delete => self.input.delete(),
+            KeyCode::Left => self.input.cursor_left(),
+            KeyCode::Right => self.input.cursor_right(),
+            KeyCode::Home => self.input.cursor_start(),
+            KeyCode::End => self.input.cursor_end(),
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.input.insert_grapheme(&c.to_string());
+            }
+            _ => {}
+        }
+        None
     }
 
     fn move_selection(&mut self, delta: i32) {

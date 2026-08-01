@@ -173,6 +173,26 @@ fn normalize_common_wire_aliases(input: &str) -> String {
         }
     }
     if let Some(Value::Object(patch)) = object.get_mut("state_patch") {
+        for key in [
+            "affection_delta",
+            "trust_delta",
+            "tension_delta",
+            "relationship_transitions",
+            "set_flags",
+            "number_delta",
+            "set_strings",
+            "inventory_delta",
+        ] {
+            patch
+                .entry(key.to_string())
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        }
+        patch
+            .entry("add_events".to_string())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        for key in ["next_location", "next_time_slot", "proposed_route"] {
+            patch.entry(key.to_string()).or_insert(Value::Null);
+        }
         if let Some(Value::String(slot)) = patch.get_mut("next_time_slot") {
             *slot = match slot.as_str() {
                 "새벽" => "dawn",
@@ -185,21 +205,55 @@ fn normalize_common_wire_aliases(input: &str) -> String {
             .to_string();
         }
         if let Some(Value::Object(transitions)) = patch.get_mut("relationship_transitions") {
-            for value in transitions.values_mut() {
-                if let Value::String(stage) = value {
-                    *stage = match stage.as_str() {
-                        "낯선 사이" => "stranger",
-                        "아는 사이" => "acquaintance",
-                        "친구" => "friend",
-                        "가까운 친구" => "close_friend",
-                        "연애 관심" => "romantic_interest",
-                        "연인" => "partner",
-                        "소원한 사이" => "estranged",
-                        _ => stage,
-                    }
-                    .to_string();
+            transitions.retain(|_, value| {
+                let Value::String(stage) = value else {
+                    return false;
+                };
+                let normalized = match stage.as_str() {
+                    "낯선 사이" => Some("stranger"),
+                    "아는 사이" => Some("acquaintance"),
+                    "친구" => Some("friend"),
+                    "가까운 친구" => Some("close_friend"),
+                    "연애 관심" => Some("romantic_interest"),
+                    "연인" => Some("partner"),
+                    "소원한 사이" => Some("estranged"),
+                    "stranger" | "acquaintance" | "friend" | "close_friend"
+                    | "romantic_interest" | "partner" | "estranged" => Some(stage.as_str()),
+                    _ => None,
+                };
+                if let Some(normalized) = normalized {
+                    *stage = normalized.to_string();
+                    true
+                } else {
+                    false
                 }
-            }
+            });
+        }
+    }
+    if let Some(Value::Object(summary)) = object.get_mut("summary") {
+        for key in [
+            "facts",
+            "unresolved",
+            "relationship_changes",
+            "knowledge_changes",
+            "address_form_changes",
+            "important_player_actions",
+            "source_history_ids",
+        ] {
+            summary
+                .entry(key.to_string())
+                .or_insert_with(|| Value::Array(Vec::new()));
+        }
+        summary
+            .entry("interpretation".to_string())
+            .or_insert(Value::Null);
+        if let Some(Value::Array(items)) = summary.get_mut("interpretation") {
+            let text = items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" ");
+            *summary.get_mut("interpretation").expect("checked above") = Value::String(text);
         }
     }
     if root == original {

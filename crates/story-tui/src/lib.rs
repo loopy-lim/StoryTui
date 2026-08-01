@@ -14,4 +14,4 @@ pub use event::{KeyAction, SELECT_SENTINEL, map_key, parse_direct_select_index};
 pub use screens::save_load::{
     MIN_HEIGHT as SAVE_LOAD_MIN_HEIGHT, MIN_WIDTH as SAVE_LOAD_MIN_WIDTH, render_save_load,
 };
-pub use screens::story::{MIN_HEIGHT, MIN_WIDTH, render_story};
+pub use screens::story::{ListMode, MIN_HEIGHT, MIN_WIDTH, render_list, render_story};
