@@ -24,7 +24,7 @@
 
 use sha2::{Digest, Sha256};
 use story_model::serde_json;
-use story_model::{GameState, HistoryEntry, ParsedAction, StoryPack};
+use story_model::{Choice, GameState, HistoryEntry, ParsedAction, StoryPack};
 
 /// The assembled prompt: system + user strings plus the canonical hash.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,8 +50,21 @@ pub fn build_prompt(
     recent: &[HistoryEntry],
     player_action: Option<&ParsedAction>,
 ) -> PromptBundle {
+    build_prompt_with_choice(pack, state, recent, player_action, None)
+}
+
+/// As [`build_prompt`], but includes the numbered choice the player just
+/// selected. A normal choice is not represented by `ParsedAction`, so omitting
+/// it makes successive turns look identical to the model.
+pub fn build_prompt_with_choice(
+    pack: &StoryPack,
+    state: &GameState,
+    recent: &[HistoryEntry],
+    player_action: Option<&ParsedAction>,
+    player_choice: Option<&Choice>,
+) -> PromptBundle {
     let system = build_system(pack, player_action);
-    let user = build_user(pack, state, recent, player_action);
+    let user = build_user(pack, state, recent, player_action, player_choice);
 
     let mut hasher = Sha256::new();
     hasher.update(system.as_bytes());
@@ -151,6 +164,7 @@ fn build_user(
     state: &GameState,
     recent: &[HistoryEntry],
     player_action: Option<&ParsedAction>,
+    player_choice: Option<&Choice>,
 ) -> String {
     let mut s = String::new();
 
@@ -187,6 +201,19 @@ fn build_user(
                 act.content,
                 serde_json::to_string(&act.action_type).unwrap_or_else(|_| "\"?\"".to_string())
             ));
+        }
+    }
+
+    if let Some(choice) = player_choice {
+        s.push_str("\n# Player selected choice\n");
+        s.push_str(&format!("id: {}\n", choice.id));
+        s.push_str(&format!("label: {}\n", choice.label));
+        s.push_str(&format!("intent: {}\n", choice.intent));
+        if let Some(tone) = &choice.tone {
+            s.push_str(&format!("tone: {tone}\n"));
+        }
+        if let Some(target) = &choice.target {
+            s.push_str(&format!("target: {}\n", target.0));
         }
     }
 

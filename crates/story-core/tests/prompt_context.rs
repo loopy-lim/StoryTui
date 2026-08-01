@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use story_core::prompt_context::{PromptBundle, build_prompt};
+use story_core::prompt_context::{PromptBundle, build_prompt, build_prompt_with_choice};
 use story_model::{
     ActionType, CharacterDef, CharacterId, CharacterState, Emotion, GameState, HistoryEntry,
     LocationDef, LocationId, PackContentPolicy, PackInitialState, PackMetadata, PackRating,
@@ -263,6 +263,25 @@ fn later_turn_prompt_does_not_repeat_opening_prose() {
     assert!(!bundle.user.contains("유나가 앉아 있다."));
     assert!(bundle.user.contains("The opening has already been shown."));
     assert!(bundle.system.contains("Do not restart the opening."));
+}
+
+#[test]
+fn selected_numbered_choice_is_included_in_next_prompt() {
+    let (pack, state, recent) = fixture(false);
+    let choice = story_model::Choice {
+        id: "ask-why".to_string(),
+        label: "왜 떠났는지 조심스럽게 묻는다".to_string(),
+        intent: "유나의 부재 이유를 묻는다".to_string(),
+        tone: Some("careful".to_string()),
+        target: Some(story_model::CharacterId("yuna".to_string())),
+        risk: story_model::RiskLevel::Medium,
+        hidden_requirements: vec![],
+        preview: None,
+    };
+    let bundle = build_prompt_with_choice(&pack, &state, &recent, None, Some(&choice));
+    assert!(bundle.user.contains("# Player selected choice"));
+    assert!(bundle.user.contains("label: 왜 떠났는지 조심스럽게 묻는다"));
+    assert!(bundle.user.contains("intent: 유나의 부재 이유를 묻는다"));
 }
 
 #[test]

@@ -12,7 +12,7 @@ use ratatui::backend::CrosstermBackend;
 use story_core::engine::{EngineState, build_view, reduce};
 use story_core::engine_cmd::{EngineCommand, EngineEffect};
 use story_model::{
-    DomainErrorView, ProviderError, ProviderHealth, SAVE_SCHEMA_VERSION, SaveEnvelope,
+    DomainErrorView, ProviderError, ProviderHealth, SAVE_SCHEMA_VERSION, SaveEnvelope, StoryPack,
 };
 use story_persistence::{CHECKSUM_ALGORITHM, PackLoader, SaveStore};
 use story_provider::{LlmProvider, OpenAiCompatibleProvider};
@@ -65,8 +65,9 @@ impl Drop for TerminalGuard {
 }
 
 pub async fn run(config: RuntimeConfig) -> Result<(), String> {
-    let pack = PackLoader::load(&config.pack_dir)
+    let mut pack = PackLoader::load(&config.pack_dir)
         .map_err(|e| format!("Story Pack을 불러오지 못했습니다: {e}"))?;
+    apply_player_profile(&mut pack, &config.player);
     let provider = Arc::new(
         OpenAiCompatibleProvider::new(config.provider.clone())
             .map_err(|e| format!("provider를 만들지 못했습니다: {e}"))?,
@@ -145,6 +146,33 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
         token.cancel();
     }
     Ok(())
+}
+
+fn apply_player_profile(pack: &mut StoryPack, profile: &storytui::config::PlayerProfile) {
+    let name = profile
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+    let persona = profile
+        .persona
+        .as_deref()
+        .map(str::trim)
+        .filter(|persona| !persona.is_empty());
+    if name.is_none() && persona.is_none() {
+        return;
+    }
+    pack.prompts.system.push_str("\n\n# Player profile\n");
+    if let Some(name) = name {
+        pack.prompts.system.push_str(&format!(
+            "플레이어의 이름은 `{name}`이다. 다른 이름이나 '이름 씨' 같은 임시 호칭을 만들지 말고, 필요한 호칭에는 `{name} 씨`를 사용한다.\n"
+        ));
+    }
+    if let Some(persona) = persona {
+        pack.prompts.system.push_str(&format!(
+            "플레이어 페르소나: {persona}\n플레이어가 직접 입력하지 않은 행동·감정은 이 페르소나만으로 확정하지 않는다.\n"
+        ));
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // host adapter keeps all effect-owned handles safe

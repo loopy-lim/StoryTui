@@ -35,7 +35,7 @@ use crate::engine_cmd::{EngineCommand, EngineEffect};
 use crate::error::{
     CoreError, ENGINE_GENERATION_IN_FLIGHT, ENGINE_NO_CHOICES, ENGINE_UNKNOWN_CHOICE,
 };
-use crate::prompt_context::build_prompt;
+use crate::prompt_context::{build_prompt, build_prompt_with_choice};
 use crate::reducer::{ApplyResult, apply_patch};
 use crate::writer::{WriterResult, finalize_writer_output};
 
@@ -279,7 +279,7 @@ fn reduce_start_new_game(state: &EngineState, pack: &StoryPack) -> Result<Transi
         player_action: None,
         validated_plan: None,
     };
-    let request = build_turn_request(generation_id, pack, &game, None);
+    let request = build_turn_request(generation_id, pack, &game, None, None);
     let mut next = clone_state(state);
     next.game = game;
     next.pack_metadata = pack.metadata.clone();
@@ -318,12 +318,12 @@ fn reduce_submit_choice(
         state.game.history.last().ok_or_else(|| {
             CoreError::invalid_command(ENGINE_NO_CHOICES, "no choices available yet")
         })?;
-    if !last_entry.choices.iter().any(|c| c.id == choice_id) {
+    let Some(selected_choice) = last_entry.choices.iter().find(|c| c.id == choice_id) else {
         return Err(CoreError::invalid_command(
             ENGINE_UNKNOWN_CHOICE,
             format!("unknown choice id: {choice_id}"),
         ));
-    }
+    };
 
     let generation_id = Uuid::new_v4();
     let pending = PendingGeneration {
@@ -334,7 +334,13 @@ fn reduce_submit_choice(
         player_action: None,
         validated_plan: None,
     };
-    let request = build_turn_request(generation_id, pack, &state.game, None);
+    let request = build_turn_request(
+        generation_id,
+        pack,
+        &state.game,
+        None,
+        Some(selected_choice),
+    );
 
     let mut next = clone_state(state);
     next.pending = Some(pending.clone());
@@ -380,7 +386,7 @@ fn reduce_submit_free_action(
         player_action: Some(action.clone()),
         validated_plan: None,
     };
-    let request = build_turn_request(generation_id, pack, &state.game, Some(&action));
+    let request = build_turn_request(generation_id, pack, &state.game, Some(&action), None);
 
     let mut next = clone_state(state);
     next.pending = Some(pending.clone());
@@ -422,11 +428,18 @@ fn reduce_regenerate(state: &EngineState, pack: &StoryPack) -> Transition {
         // 2-stage path the host will re-issue a new Director request.
         validated_plan: None,
     };
+    let selected_choice = pending.checkpoint.history.last().and_then(|entry| {
+        entry
+            .choices
+            .iter()
+            .find(|choice| choice.id == pending.player_choice_id)
+    });
     let request = build_turn_request(
         generation_id,
         pack,
         &pending.checkpoint,
         pending.player_action.as_ref(),
+        selected_choice,
     );
 
     let mut next = clone_state(state);
@@ -1146,8 +1159,9 @@ fn build_turn_request(
     pack: &StoryPack,
     game: &GameState,
     player_action: Option<&ParsedAction>,
+    player_choice: Option<&story_model::Choice>,
 ) -> TurnRequest {
-    let bundle = build_prompt(pack, game, &game.history, player_action);
+    let bundle = build_prompt_with_choice(pack, game, &game.history, player_action, player_choice);
     let messages = vec![
         story_model::ChatMessage {
             role: "system".to_string(),

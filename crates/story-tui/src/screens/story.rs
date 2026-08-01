@@ -100,19 +100,18 @@ pub fn render_story(
             Style::default().fg(Color::LightCyan),
         ),
     ]);
+    let frame_chunks = Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).split(area);
     let title_block = Block::default()
-        .borders(Borders::TOP)
+        .borders(Borders::BOTTOM)
         .border_style(Style::default().fg(Color::DarkGray));
     let title_para = Paragraph::new(title_line)
         .block(title_block)
         .wrap(Wrap { trim: false });
-    frame.render_widget(title_para, area);
+    frame.render_widget(title_para, frame_chunks[0]);
 
-    // Body below the title rule.
-    let inner = Block::default()
-        .borders(Borders::TOP)
-        .border_style(Style::default().fg(Color::DarkGray));
-    let body = inner.inner(area);
+    // Reserve the title rows before laying out the story body. Rendering both
+    // against `area` made the first stack heading overlap the global title.
+    let body = frame_chunks[1];
     let chunks = if input_mode {
         Layout::vertical([
             Constraint::Fill(3),
