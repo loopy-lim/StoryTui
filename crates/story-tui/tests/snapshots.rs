@@ -118,6 +118,14 @@ fn snapshot_story_normal_120x40() {
 }
 
 #[test]
+fn snapshot_story_long_choice_wraps_without_truncation() {
+    let mut view = base_view();
+    view.choices[0].label = "그날 무슨 일이 있었는지, 지금이라도 솔직하게 이야기해 줄 수 있나요? 그리고 제가 기다렸던 이유도 알고 싶어요."
+        .to_string();
+    insta::assert_snapshot!(render_to_string(view, 80, 24));
+}
+
+#[test]
 fn snapshot_story_loading_overlay() {
     let mut v = base_view();
     v.loading = Some(LoadingState {

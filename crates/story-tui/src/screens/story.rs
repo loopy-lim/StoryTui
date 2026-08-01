@@ -13,7 +13,9 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, List, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap,
+};
 use story_model::{AppViewModel, RiskLevel, TimeSlot};
 use unicode_width::UnicodeWidthStr;
 
@@ -112,10 +114,11 @@ pub fn render_story(
     // Reserve the title rows before laying out the story body. Rendering both
     // against `area` made the first stack heading overlap the global title.
     let body = frame_chunks[1];
+    let choice_height = choice_area_height(view, body.width);
     let chunks = if input_mode {
         Layout::vertical([
             Constraint::Fill(3),
-            Constraint::Length(view.choices.len().max(1) as u16 + 2),
+            Constraint::Length(choice_height),
             Constraint::Length(3),
             Constraint::Length(2),
         ])
@@ -123,7 +126,7 @@ pub fn render_story(
     } else {
         Layout::vertical([
             Constraint::Fill(3),
-            Constraint::Length(view.choices.len().max(1) as u16 + 2),
+            Constraint::Length(choice_height),
             Constraint::Length(2),
         ])
         .split(body)
@@ -368,19 +371,15 @@ fn render_choices(frame: &mut Frame, area: Rect, view: &AppViewModel, selected: 
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let items: Vec<Line> = view
+    // A List does not wrap its items itself. Build each choice as a multi-line
+    // item before rendering so Korean labels stay readable and selection still
+    // highlights the entire choice.
+    let content_width = choice_content_width(inner.width);
+    let items: Vec<ListItem> = view
         .choices
         .iter()
         .enumerate()
-        .map(|(i, c)| {
-            let marker = format!("{}. ", i + 1);
-            let label = Span::raw(format!("{}{}", marker, c.label));
-            let risk = Span::styled(
-                format!("  ({})", risk_label(c.risk)),
-                Style::default().fg(risk_color(c.risk)),
-            );
-            Line::from(vec![label, risk])
-        })
+        .map(|(i, choice)| choice_item(i, choice.label.as_str(), choice.risk, content_width))
         .collect();
     let list = List::new(items)
         .style(Style::default().fg(Color::White))
@@ -390,7 +389,9 @@ fn render_choices(frame: &mut Frame, area: Rect, view: &AppViewModel, selected: 
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::REVERSED),
         )
-        .highlight_symbol("▶ ");
+        .highlight_symbol("▶ ")
+        .highlight_spacing(HighlightSpacing::Always)
+        .repeat_highlight_symbol(true);
 
     let mut state = ListState::default();
     let count = view.choices.len();
@@ -398,6 +399,114 @@ fn render_choices(frame: &mut Frame, area: Rect, view: &AppViewModel, selected: 
         state.select(Some(selected.min(count - 1)));
     }
     frame.render_stateful_widget(list, inner, &mut state);
+}
+
+fn choice_area_height(view: &AppViewModel, outer_width: u16) -> u16 {
+    let inner_width = outer_width.saturating_sub(2);
+    let content_width = choice_content_width(inner_width);
+    let rows = view
+        .choices
+        .iter()
+        .enumerate()
+        .map(|(index, choice)| {
+            choice_line_count(index, choice.label.as_str(), choice.risk, content_width)
+        })
+        .sum::<usize>()
+        .max(1);
+    (rows as u16).saturating_add(2)
+}
+
+fn choice_content_width(inner_width: u16) -> usize {
+    inner_width.saturating_sub("▶ ".width() as u16).max(1) as usize
+}
+
+fn choice_line_count(index: usize, label: &str, risk: RiskLevel, width: usize) -> usize {
+    choice_lines(index, label, risk, width).len()
+}
+
+fn choice_item(index: usize, label: &str, risk: RiskLevel, width: usize) -> ListItem<'static> {
+    ListItem::new(Text::from(choice_lines(index, label, risk, width)))
+}
+
+fn choice_lines(index: usize, label: &str, risk: RiskLevel, width: usize) -> Vec<Line<'static>> {
+    let marker = format!("{}. ", index + 1);
+    let continuation = " ".repeat(marker.width());
+    let mut lines = wrap_choice_label(label, &marker, &continuation, width);
+    let risk_text = format!("  ({})", risk_label(risk));
+    let last_width = lines.last().map_or(0, Line::width);
+    if last_width + risk_text.width() <= width {
+        lines
+            .last_mut()
+            .expect("choice labels always have one line")
+            .spans
+            .push(Span::styled(
+                risk_text,
+                Style::default().fg(risk_color(risk)),
+            ));
+    } else {
+        lines.push(Line::from(vec![
+            Span::raw(continuation),
+            Span::styled(risk_text, Style::default().fg(risk_color(risk))),
+        ]));
+    }
+    lines
+}
+
+fn wrap_choice_label(
+    label: &str,
+    first_prefix: &str,
+    continuation: &str,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut prefix = first_prefix.to_string();
+    let mut body = String::new();
+    for word in label.split_whitespace() {
+        let separator = if body.is_empty() { "" } else { " " };
+        if prefix.width() + body.width() + separator.width() + word.width() <= width {
+            body.push_str(separator);
+            body.push_str(word);
+            continue;
+        }
+        if !body.is_empty() {
+            lines.push(Line::from(format!("{prefix}{body}")));
+            prefix = continuation.to_string();
+            body.clear();
+        }
+        append_wrapped_word(
+            &mut lines,
+            &mut prefix,
+            &mut body,
+            word,
+            continuation,
+            width,
+        );
+    }
+    if body.is_empty() && lines.is_empty() {
+        lines.push(Line::from(first_prefix.to_string()));
+    } else if !body.is_empty() {
+        lines.push(Line::from(format!("{prefix}{body}")));
+    }
+    lines
+}
+
+fn append_wrapped_word(
+    lines: &mut Vec<Line<'static>>,
+    prefix: &mut String,
+    body: &mut String,
+    word: &str,
+    continuation: &str,
+    width: usize,
+) {
+    for ch in word.chars() {
+        let ch_width = ch.to_string().width();
+        if prefix.width() + body.width() + ch_width > width && !body.is_empty() {
+            lines.push(Line::from(format!("{prefix}{body}")));
+            *prefix = continuation.to_string();
+            body.clear();
+        }
+        body.push(ch);
+    }
 }
 
 fn render_status(frame: &mut Frame, area: Rect, view: &AppViewModel) {
