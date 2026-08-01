@@ -167,6 +167,15 @@ const VALID_BODY: &str = r#"{
 }"#;
 
 #[test]
+fn legacy_top_level_patches_alias_is_migrated_once() {
+    let raw = VALID_BODY.replace("\"state_patch\"", "\"patches\"");
+    let outcome = parse_generated_turn(&raw, GID).expect("known legacy alias should recover");
+    assert_eq!(outcome.repairs.len(), 1);
+    assert!(outcome.repairs[0].contains("patches"));
+    assert!(outcome.draft.proposed_patch.is_empty());
+}
+
+#[test]
 fn no_json_object_present_is_rejected() {
     let raw = "The model declined to answer. No JSON here.";
     let err = expect_err(raw);
@@ -198,6 +207,42 @@ fn error_does_not_embed_raw_response_body() {
         !msg.contains(marker),
         "raw body marker leaked into error message: {msg}"
     );
+}
+
+#[test]
+fn malformed_unquoted_key_is_rejected_without_raw_parser_body() {
+    // A common model failure: Python/object-literal-looking output instead of
+    // JSON. The parser must fail cleanly; the host maps its serde detail to a
+    // player-safe generic message.
+    let raw = r#"{narration: \"깨진 응답\", choices: []}"#;
+    let err = expect_err(raw);
+    assert!(matches!(err, ProviderError::InvalidGeneration(_)));
+    assert!(!err.to_string().contains("깨진 응답"));
+}
+
+#[test]
+fn malformed_single_quoted_object_is_rejected() {
+    let raw = "{'narration': '깨진 응답', 'choices': []}";
+    let err = expect_err(raw);
+    assert!(matches!(err, ProviderError::InvalidGeneration(_)));
+}
+
+#[test]
+fn top_level_array_is_rejected_as_invalid_generation() {
+    let raw = "[{\"narration\":\"장면\"}]";
+    let err = expect_err(raw);
+    assert!(matches!(err, ProviderError::InvalidGeneration(_)));
+}
+
+#[test]
+fn empty_and_null_responses_are_rejected_as_invalid_generation() {
+    for raw in ["", "   ", "null", "{}"] {
+        let err = expect_err(raw);
+        assert!(
+            matches!(err, ProviderError::InvalidGeneration(_)),
+            "raw response should be invalid: {raw:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

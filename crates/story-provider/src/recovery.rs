@@ -18,6 +18,7 @@
 //! Then validate (choice count 1..=6, non-empty narration) and map into a
 //! [`GeneratedTurnDraft`], stamping the request's `generation_id`.
 
+use story_model::serde_json::Value;
 use story_model::uuid::Uuid;
 use story_model::{Choice, GeneratedTurnDraft, ProviderError, StatePatch, TokenUsage, TurnSummary};
 
@@ -77,15 +78,21 @@ pub fn parse_generated_turn(raw: &str, generation_id: Uuid) -> Result<ParseOutco
         repairs.push("located JSON object (stripped prose/markdown fence)".to_string());
     }
 
-    // (3) First strict parse.
-    let parsed = match serde_json::from_str::<RawGeneratedTurn>(located) {
+    // (3) First strict parse. Migrate only the known Director-era top-level
+    // alias; all other unknown fields remain hard errors.
+    let aliased = rename_legacy_patches(located);
+    if aliased != located {
+        repairs.push("renamed legacy top-level patches to state_patch".to_string());
+    }
+    let parsed = match serde_json::from_str::<RawGeneratedTurn>(&aliased) {
         Ok(p) => p,
         Err(first_err) => {
             // (4) ONE repair pass: string-aware trailing-comma removal.
-            let repaired = strip_trailing_commas(located);
-            if repaired != located {
+            let repaired = strip_trailing_commas(&aliased);
+            if repaired != aliased {
                 repairs.push("stripped trailing commas".to_string());
             }
+            let repaired = rename_legacy_patches(&repaired);
             match serde_json::from_str::<RawGeneratedTurn>(&repaired) {
                 Ok(p) => p,
                 Err(second_err) => {
@@ -121,6 +128,20 @@ pub fn parse_generated_turn(raw: &str, generation_id: Uuid) -> Result<ParseOutco
         usage: parsed.usage,
     };
     Ok(ParseOutcome { draft, repairs })
+}
+
+/// Rename one known legacy top-level field without weakening strict parsing.
+/// Objects containing both names are intentionally left untouched and reject.
+fn rename_legacy_patches(input: &str) -> String {
+    let Ok(Value::Object(mut object)) = serde_json::from_str(input) else {
+        return input.to_string();
+    };
+    if object.contains_key("state_patch") || !object.contains_key("patches") {
+        return input.to_string();
+    }
+    let patches = object.remove("patches").expect("checked above");
+    object.insert("state_patch".to_string(), patches);
+    serde_json::to_string(&Value::Object(object)).unwrap_or_else(|_| input.to_string())
 }
 
 /// Locate the JSON object in `s` as the slice from the first `{` to the last
