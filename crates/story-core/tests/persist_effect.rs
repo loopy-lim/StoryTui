@@ -126,3 +126,30 @@ fn snapshot_payload_is_pure_data_no_fs_call_sites_in_story_core() {
     let payload = init.snapshot_payload();
     assert_eq!(payload.stable_state.story_id, init.game.story_id);
 }
+
+#[test]
+fn snapshot_payload_restores_committed_history_without_pending_generation() {
+    let pack = sample_pack();
+    let (state, gid) = start_and_pending_id(&pack);
+    let accepted = reduce(
+        &state,
+        EngineCommand::AcceptGeneration {
+            draft: Box::new(story_core::tests_support::valid_draft(gid, 1)),
+        },
+        &pack,
+    )
+    .expect("accept");
+
+    let restored = EngineState::from_snapshot_payload(&pack, accepted.state.snapshot_payload());
+    assert_eq!(restored.game.turn, 1);
+    assert_eq!(
+        story_model::serde_json::to_vec(&restored.game.history).unwrap(),
+        story_model::serde_json::to_vec(&accepted.state.game.history).unwrap()
+    );
+    assert_eq!(
+        story_model::serde_json::to_vec(&restored.game.memories).unwrap(),
+        story_model::serde_json::to_vec(&accepted.state.game.memories).unwrap()
+    );
+    assert!(restored.pending.is_none());
+    assert!(restored.retry_pending.is_none());
+}

@@ -9,12 +9,12 @@ use crossterm::terminal::{
 use futures_util::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use story_core::engine::{EngineState, build_view, reduce};
+use story_core::engine::{AUTOSAVE_SLOT, EngineState, build_view, reduce};
 use story_core::engine_cmd::{EngineCommand, EngineEffect};
 use story_model::{
     DomainErrorView, ProviderError, ProviderHealth, SAVE_SCHEMA_VERSION, SaveEnvelope, StoryPack,
 };
-use story_persistence::{CHECKSUM_ALGORITHM, PackLoader, SaveStore};
+use story_persistence::{CHECKSUM_ALGORITHM, PackLoader, SaveError, SaveStore};
 use story_provider::{LlmProvider, OpenAiCompatibleProvider};
 use story_tui::App;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
@@ -89,8 +89,10 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
 
     let (_guard, mut terminal) =
         TerminalGuard::enter().map_err(|e| format!("터미널을 초기화하지 못했습니다: {e}"))?;
-    let mut engine = EngineState::initial(&pack);
+    let mut engine =
+        restore_autosave(&save_store, &pack).unwrap_or_else(|| EngineState::initial(&pack));
     let mut app = App::new(build_view(&engine, &pack, None, None));
+    app.set_lists(&engine.game.history, &engine.game.memories);
     let (tx, mut rx) = unbounded_channel();
     let mut cancellation: Option<(story_model::uuid::Uuid, CancellationToken)> = None;
 
@@ -146,6 +148,37 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
         token.cancel();
     }
     Ok(())
+}
+
+/// Resume only the verified autosave belonging to the currently loaded Pack.
+/// A missing, corrupt, or different-Pack save never prevents the player from
+/// opening a new session; diagnostics stay in the terminal log.
+fn restore_autosave(save_store: &SaveStore, pack: &StoryPack) -> Option<EngineState> {
+    let envelope = match save_store.load(AUTOSAVE_SLOT) {
+        Ok(envelope) => envelope,
+        Err(SaveError::MissingSlot(_)) => return None,
+        Err(error) => {
+            tracing::warn!(%error, "autosave was not resumed");
+            return None;
+        }
+    };
+    let metadata = &pack.metadata;
+    if envelope.story_id != metadata.story_id
+        || envelope.story_version != metadata.story_version
+        || envelope.pack_schema_version != metadata.schema_version
+    {
+        tracing::warn!(
+            saved_story = %envelope.story_id,
+            current_story = %metadata.story_id,
+            "autosave belongs to a different Story Pack version; starting a new session"
+        );
+        return None;
+    }
+    let turn = envelope.payload.stable_state.turn;
+    let history_count = envelope.payload.history.len();
+    let engine = EngineState::from_snapshot_payload(pack, envelope.payload);
+    tracing::info!(turn, history_count, "autosave restored");
+    Some(engine)
 }
 
 fn apply_player_profile(pack: &mut StoryPack, profile: &storytui::config::PlayerProfile) {

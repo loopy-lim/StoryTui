@@ -65,6 +65,18 @@ fn render_to_string(view: AppViewModel, w: u16, h: u16) -> String {
     let backend = TestBackend::new(w, h);
     let mut terminal = Terminal::new(backend).expect("terminal");
     let app = App::new(view);
+    render_app_to_string(&mut terminal, &app)
+}
+
+fn render_to_string_with_scroll(view: AppViewModel, w: u16, h: u16, scroll: u16) -> String {
+    let backend = TestBackend::new(w, h);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    let mut app = App::new(view);
+    app.narration_scroll = scroll;
+    render_app_to_string(&mut terminal, &app)
+}
+
+fn render_app_to_string(terminal: &mut Terminal<TestBackend>, app: &App) -> String {
     terminal
         .draw(|f| {
             app.render(f, f.area());
@@ -123,6 +135,21 @@ fn snapshot_story_long_choice_wraps_without_truncation() {
     view.choices[0].label = "그날 무슨 일이 있었는지, 지금이라도 솔직하게 이야기해 줄 수 있나요? 그리고 제가 기다렸던 이유도 알고 싶어요."
         .to_string();
     insta::assert_snapshot!(render_to_string(view, 80, 24));
+}
+
+#[test]
+fn snapshot_story_scrollbar_shows_progress_for_long_transcript() {
+    let mut view = base_view();
+    view.narration = (0..24)
+        .map(|n| {
+            format!(
+                "{}번째 기록입니다. 비가 그친 카페에서 유나는 대답을 망설인다.",
+                n + 1
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    insta::assert_snapshot!(render_to_string_with_scroll(view, 80, 24, 12));
 }
 
 #[test]

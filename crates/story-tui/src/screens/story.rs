@@ -14,7 +14,8 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap,
+    Block, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Scrollbar,
+    ScrollbarOrientation, ScrollbarState, Wrap,
 };
 use story_model::{AppViewModel, RiskLevel, TimeSlot};
 use unicode_width::UnicodeWidthStr;
@@ -138,15 +139,40 @@ pub fn render_story(
     } else {
         story_stack_text(story_stack)
     };
-    let max_scroll = wrapped_line_count(&narration_text, chunks[0].width)
-        .saturating_sub(chunks[0].height as usize) as u16;
+    // Reserve a right-edge scrollbar only when the story has more lines than
+    // the viewport. The visible thumb then communicates both the current
+    // position and the remaining scroll range without taking space otherwise.
+    let needs_scrollbar =
+        wrapped_line_count(&narration_text, chunks[0].width) > chunks[0].height as usize;
+    let narration_chunks = if needs_scrollbar {
+        Layout::horizontal([Constraint::Fill(1), Constraint::Length(1)]).split(chunks[0])
+    } else {
+        [chunks[0], Rect::default()].into()
+    };
+    let narration_area = narration_chunks[0];
+    let content_lines = wrapped_line_count(&narration_text, narration_area.width);
+    let max_scroll = content_lines.saturating_sub(narration_area.height as usize) as u16;
+    let scroll_position = narration_scroll.min(max_scroll);
     let narration = Paragraph::new(narration_text)
         .wrap(Wrap { trim: false })
         .style(Style::default().fg(Color::Gray));
     // Mouse wheels and PageDown can generate an offset beyond the wrapped
     // content. Clamp it here so the pane never becomes mysteriously blank.
-    let narration = narration.scroll((narration_scroll.min(max_scroll), 0));
-    frame.render_widget(narration, chunks[0]);
+    let narration = narration.scroll((scroll_position, 0));
+    frame.render_widget(narration, narration_area);
+    if needs_scrollbar {
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .thumb_symbol("█")
+            .thumb_style(Style::default().fg(Color::LightCyan))
+            .track_symbol(Some("│"))
+            .track_style(Style::default().fg(Color::DarkGray))
+            .begin_symbol(None)
+            .end_symbol(None);
+        let mut scrollbar_state = ScrollbarState::new(content_lines)
+            .position(scroll_position as usize)
+            .viewport_content_length(narration_area.height as usize);
+        frame.render_stateful_widget(scrollbar, narration_chunks[1], &mut scrollbar_state);
+    }
 
     // Choices.
     render_choices(frame, chunks[1], view, selected);

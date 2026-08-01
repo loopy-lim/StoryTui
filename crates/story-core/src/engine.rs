@@ -211,6 +211,29 @@ impl EngineState {
             stable_state: self.game.clone(),
         }
     }
+
+    /// Restore a stable, checksum-verified save payload for `pack`.
+    ///
+    /// Pending provider work is intentionally never persisted, so a resumed
+    /// game always opens at a committed turn. The payload's top-level history
+    /// and memories are the portable mirrors used on disk and become the
+    /// authoritative display history after restore.
+    pub fn from_snapshot_payload(pack: &StoryPack, payload: SavePayload) -> Self {
+        let mut game = payload.stable_state;
+        game.memories = payload.memories;
+        game.history = payload.history;
+        Self {
+            game,
+            pack_metadata: pack.metadata.clone(),
+            pending: None,
+            retry_pending: None,
+            lineage: Vec::new(),
+            checkpoints: Vec::new(),
+            audit_tail: payload.audit_tail,
+            autosave_on_accept: true,
+            use_director_writer: false,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
