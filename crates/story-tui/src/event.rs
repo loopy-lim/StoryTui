@@ -30,10 +30,12 @@ pub fn map_key(key: KeyEvent, choice_count: usize, loading: bool, has_error: boo
         return KeyAction::Quit;
     }
     match key.code {
-        KeyCode::Char('q') => KeyAction::Quit,
-        KeyCode::Char('n') => KeyAction::Command(EngineCommand::StartNewGame),
-        KeyCode::Char('j') | KeyCode::Down => KeyAction::MoveSelection(1),
-        KeyCode::Char('k') | KeyCode::Up => KeyAction::MoveSelection(-1),
+        // Accept the same physical shortcuts while a Korean 2-beolsik layout
+        // is active: q=ㅂ, r=ㄱ, c=ㅊ, j=ㅓ, k=ㅏ, n=ㅜ.
+        KeyCode::Char('q' | 'ㅂ') => KeyAction::Quit,
+        KeyCode::Char('n' | 'ㅜ') => KeyAction::Command(EngineCommand::StartNewGame),
+        KeyCode::Char('j' | 'ㅓ') | KeyCode::Down => KeyAction::MoveSelection(1),
+        KeyCode::Char('k' | 'ㅏ') | KeyCode::Up => KeyAction::MoveSelection(-1),
         KeyCode::Enter => {
             // Enter on a highlighted choice: the App rewrites the sentinel to
             // the real choice id at `selected`.
@@ -51,12 +53,16 @@ pub fn map_key(key: KeyEvent, choice_count: usize, loading: bool, has_error: boo
                 KeyAction::None
             }
         }
-        KeyCode::Char('c') if loading => KeyAction::Command(EngineCommand::CancelGeneration {
-            // The host fills in the pending generation id from the view's
-            // loading state; nil here, resolved by the App.
-            generation_id: story_model::uuid::Uuid::nil(),
-        }),
-        KeyCode::Char('r') if has_error => KeyAction::Command(EngineCommand::RegenerateCurrentTurn),
+        KeyCode::Char('c' | 'ㅊ') if loading => {
+            KeyAction::Command(EngineCommand::CancelGeneration {
+                // The host fills in the pending generation id from the view's
+                // loading state; nil here, resolved by the App.
+                generation_id: story_model::uuid::Uuid::nil(),
+            })
+        }
+        KeyCode::Char('r' | 'ㄱ') if has_error => {
+            KeyAction::Command(EngineCommand::RegenerateCurrentTurn)
+        }
         KeyCode::Esc => KeyAction::Command(EngineCommand::DismissError),
         _ => KeyAction::None,
     }
@@ -152,6 +158,22 @@ mod tests {
         assert_eq!(
             map_key(key(KeyCode::Char('n')), 0, false, false),
             KeyAction::Command(EngineCommand::StartNewGame)
+        );
+        assert_eq!(
+            map_key(key(KeyCode::Char('ㅜ')), 0, false, false),
+            KeyAction::Command(EngineCommand::StartNewGame)
+        );
+    }
+
+    #[test]
+    fn korean_layout_shortcuts_match_physical_keys() {
+        assert_eq!(
+            map_key(key(KeyCode::Char('ㄱ')), 3, false, true),
+            KeyAction::Command(EngineCommand::RegenerateCurrentTurn)
+        );
+        assert_eq!(
+            map_key(key(KeyCode::Char('ㅂ')), 3, false, false),
+            KeyAction::Quit
         );
     }
 
