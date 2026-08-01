@@ -269,6 +269,25 @@ fn malformed_single_quoted_object_is_rejected() {
 }
 
 #[test]
+fn bare_dialogue_quotes_are_repaired_without_weakening_the_contract() {
+    let raw = VALID_BODY.replace(
+        "비가 그쳤다.",
+        "유나가 \"괜찮아요\"라고 말한 뒤 찻잔을 내려놓는다.",
+    );
+    let outcome = parse_generated_turn(&raw, GID).expect("bare dialogue quotes should recover");
+    assert_eq!(
+        outcome.draft.narration,
+        "유나가 \"괜찮아요\"라고 말한 뒤 찻잔을 내려놓는다."
+    );
+    assert!(
+        outcome
+            .repairs
+            .iter()
+            .any(|repair| repair.contains("bare quotes"))
+    );
+}
+
+#[test]
 fn top_level_array_is_rejected_as_invalid_generation() {
     let raw = "[{\"narration\":\"장면\"}]";
     let err = expect_err(raw);

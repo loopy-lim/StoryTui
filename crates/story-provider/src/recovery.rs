@@ -87,9 +87,15 @@ pub fn parse_generated_turn(raw: &str, generation_id: Uuid) -> Result<ParseOutco
     let parsed = match serde_json::from_str::<RawGeneratedTurn>(&aliased) {
         Ok(p) => p,
         Err(first_err) => {
-            // (4) ONE repair pass: string-aware trailing-comma removal.
-            let repaired = strip_trailing_commas(&aliased);
-            if repaired != aliased {
+            // (4) ONE repair pass: repair a common local-model JSON mistake
+            // (bare dialogue quotes inside a JSON string), then remove
+            // trailing commas. Both operations are string-aware.
+            let quote_repaired = escape_unescaped_quotes(&aliased);
+            if quote_repaired != aliased {
+                repairs.push("escaped bare quotes inside JSON strings".to_string());
+            }
+            let repaired = strip_trailing_commas(&quote_repaired);
+            if repaired != quote_repaired {
                 repairs.push("stripped trailing commas".to_string());
             }
             let repaired = normalize_common_wire_aliases(&rename_legacy_patches(&repaired));
@@ -321,6 +327,66 @@ fn locate_json(s: &str) -> Option<&str> {
         return None;
     }
     Some(&s[start..=end])
+}
+
+/// Escape bare `"` characters a model placed inside a JSON string, such as
+/// `"narration":"그가 "안녕"이라고 말했다"`. A quote closes a string only
+/// when the subsequent JSON punctuation makes that unambiguous; otherwise it
+/// is preserved as a literal quote. This is deliberately syntax-only: it does
+/// not add, remove, or reinterpret any state fields.
+fn escape_unescaped_quotes(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (index, ch) in chars.iter().copied().enumerate() {
+        if !in_string {
+            if ch == '"' {
+                in_string = true;
+            }
+            out.push(ch);
+            continue;
+        }
+        if escaped {
+            out.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            out.push(ch);
+            escaped = true;
+            continue;
+        }
+        if ch != '"' {
+            out.push(ch);
+            continue;
+        }
+
+        if is_json_string_end(&chars[index + 1..]) {
+            out.push(ch);
+            in_string = false;
+        } else {
+            out.push('\\');
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn is_json_string_end(rest: &[char]) -> bool {
+    let Some((first_index, first)) = rest.iter().enumerate().find(|(_, ch)| !ch.is_whitespace())
+    else {
+        return true;
+    };
+    match first {
+        ':' | '}' | ']' => true,
+        ',' => rest[first_index + 1..]
+            .iter()
+            .find(|ch| !ch.is_whitespace())
+            .is_none_or(|next| matches!(next, '"' | '}' | ']')),
+        _ => false,
+    }
 }
 
 /// Remove commas that immediately precede a closing `}` or `]` (allowing
