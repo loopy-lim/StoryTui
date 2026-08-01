@@ -145,8 +145,8 @@ fn rename_legacy_patches(input: &str) -> String {
 }
 
 /// Normalize a small set of unambiguous Korean enum labels emitted by local
-/// models. This does not discard fields or invent IDs; unknown values still
-/// fail strict parsing and engine validation.
+/// models. Missing optional patch/summary fields are filled with their empty
+/// defaults; unknown fields still fail strict parsing and engine validation.
 fn normalize_common_wire_aliases(input: &str) -> String {
     let Ok(mut root) = serde_json::from_str::<Value>(input) else {
         return input.to_string();
@@ -156,19 +156,52 @@ fn normalize_common_wire_aliases(input: &str) -> String {
         return input.to_string();
     };
     if let Some(Value::Array(choices)) = object.get_mut("choices") {
-        for choice in choices {
-            if let Value::Object(choice) = choice
-                && let Some(Value::String(risk)) = choice.get_mut("risk")
-            {
-                *risk = match risk.as_str() {
-                    "안전" => "safe",
-                    "낮음" => "low",
-                    "보통" => "medium",
-                    "높음" => "high",
-                    "심각" => "severe",
-                    _ => risk,
+        for (index, choice) in choices.iter_mut().enumerate() {
+            if let Value::Object(choice) = choice {
+                // Qwen-family models commonly return the older
+                // `{text, on_select}` choice shape. `on_select` can carry an
+                // arbitrary per-choice patch, which is never part of this
+                // engine's contract, so it is deliberately discarded. The
+                // trusted, validated top-level `state_patch` remains the only
+                // source of state mutation.
+                let legacy_text = choice
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                if let Some(text) = legacy_text {
+                    choice
+                        .entry("label".to_string())
+                        .or_insert_with(|| Value::String(text.clone()));
+                    choice
+                        .entry("intent".to_string())
+                        .or_insert_with(|| Value::String(text));
+                    choice.remove("text");
+                    choice.remove("on_select");
                 }
-                .to_string();
+                choice
+                    .entry("id".to_string())
+                    .or_insert_with(|| Value::String(format!("choice-{}", index + 1)));
+                choice.entry("tone".to_string()).or_insert(Value::Null);
+                choice.entry("target".to_string()).or_insert(Value::Null);
+                choice
+                    .entry("risk".to_string())
+                    .or_insert_with(|| Value::String("low".to_string()));
+                choice
+                    .entry("hidden_requirements".to_string())
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                choice.entry("preview".to_string()).or_insert(Value::Null);
+
+                if let Some(Value::String(risk)) = choice.get_mut("risk") {
+                    *risk = match risk.as_str() {
+                        "안전" => "safe",
+                        "낮음" => "low",
+                        "보통" => "medium",
+                        "높음" => "high",
+                        "심각" => "severe",
+                        _ => risk,
+                    }
+                    .to_string();
+                }
             }
         }
     }

@@ -182,6 +182,22 @@ fn korean_enum_labels_from_local_model_are_normalized() {
 }
 
 #[test]
+fn legacy_text_choices_are_migrated_without_trusting_on_select_patch() {
+    let raw = VALID_BODY.replace(
+        r#"{"id":"c1","label":"a","intent":"i","tone":null,"target":null,"risk":"safe","hidden_requirements":[],"preview":null}"#,
+        r#"{"text":"조심스럽게 안부를 묻는다.","on_select":"state_patch={\\\"set_flags\\\":{\\\"unsafe\\\":true}}"}"#,
+    );
+    let draft = parse_generated_turn(&raw, GID)
+        .expect("legacy text choice should recover into the safe choice contract")
+        .draft;
+    assert_eq!(draft.choices[0].id, "choice-1");
+    assert_eq!(draft.choices[0].label, "조심스럽게 안부를 묻는다.");
+    assert_eq!(draft.choices[0].intent, "조심스럽게 안부를 묻는다.");
+    assert_eq!(draft.choices[0].risk, story_model::RiskLevel::Low);
+    assert!(draft.proposed_patch.is_empty());
+}
+
+#[test]
 fn legacy_top_level_patches_alias_is_migrated_once() {
     let raw = VALID_BODY.replace("\"state_patch\"", "\"patches\"");
     let outcome = parse_generated_turn(&raw, GID).expect("known legacy alias should recover");
