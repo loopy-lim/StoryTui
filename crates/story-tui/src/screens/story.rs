@@ -76,10 +76,10 @@ pub fn render_story(
     input_mode: bool,
     input: &InputBuffer,
     story_stack: &[StoryStackEntry],
-) {
+) -> u16 {
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         render_min_size_warning(frame, area);
-        return;
+        return 0;
     }
 
     // Title rule.
@@ -162,7 +162,7 @@ pub fn render_story(
     frame.render_widget(narration, narration_area);
     if needs_scrollbar {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .thumb_symbol("█")
+            .thumb_symbol("┃")
             .thumb_style(Style::default().fg(Color::LightCyan))
             .track_symbol(Some("│"))
             .track_style(Style::default().fg(Color::DarkGray))
@@ -199,6 +199,7 @@ pub fn render_story(
     if let Some(ref err) = view.error {
         render_error_overlay(frame, area, err);
     }
+    max_scroll
 }
 
 fn wrapped_line_count(text: &Text<'_>, width: u16) -> usize {

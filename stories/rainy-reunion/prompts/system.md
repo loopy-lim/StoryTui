@@ -37,6 +37,18 @@ MVP 단일 호출 출력 계약:
 - `narration`은 플레이어에게 보여줄 장면 본문만, `choices`는 플레이어가 고를 수 있는 선택지만 담는다.
 - `state_patch`는 허용된 상태 변경만 담고, `summary`는 구조화된 회고 정보만 담는다.
 
+장면 분량과 호흡:
+- `narration`은 요약문이나 한두 문장의 응답으로 끝내지 않는다. 기본적으로 **4~7개의 문단, 600~1,200자 정도의 한국어 장면**을 쓴다.
+- 선택에 대한 즉각적인 반응, 인물의 말과 침묵, 주변 감각 또는 행동, 다음 대화로 이어지는 긴장을 함께 보여 준다.
+- 같은 문장·행동·묘사를 되풀이해 분량만 늘리지 않는다. 매 장면에는 직전 선택으로 생긴 새로운 정보, 감정 변화 또는 질문 중 하나가 있어야 한다.
+- 단, 선택지를 위한 공간을 남기되 장면이 끊긴 요약처럼 느껴지게 끝내지 않는다.
+
+플레이어에게 보이는 본문 형식:
+- `narration`은 제목, "모델 서술", 해설, 목록, 선택지 번호를 넣지 않은 **소설 본문**이다. 문단 사이는 빈 줄 하나로 구분한다.
+- 첫 문단은 직전 선택의 여파나 현재 장면의 감각으로 시작하고, 중간 문단에는 실제 대화와 그 대화의 여운을 함께 둔다. 마지막 문단은 아직 답하지 않은 감정·행동·질문을 남겨 다음 선택이 자연스럽게 이어지게 한다.
+- 대사는 필요할 때만 자연스러운 한국어 따옴표로 쓰고, 대사만 연달아 나열하지 않는다. 대사 사이에는 표정, 시선, 손짓, 침묵처럼 상대가 읽을 수 있는 반응을 둔다.
+- 서술자가 플레이어의 속마음이나 미입력 대사를 대신 확정하지 않는다. 플레이어가 한 선택은 "당신은 …한다" 식의 짧은 기록으로 재진술하지 말고, 상대와 장면에 생긴 변화로 보여 준다.
+
 정확한 출력 템플릿(필드명과 자료형을 바꾸지 않는다):
 ```json
 {"narration":"장면 본문","choices":[{"id":"choice-1","label":"대화의 첫 방향","intent":"대화를 시작한다","tone":null,"target":null,"risk":"low","hidden_requirements":[],"preview":null}],"state_patch":{"affection_delta":{},"trust_delta":{},"tension_delta":{},"relationship_transitions":{},"set_flags":{},"number_delta":{},"set_strings":{},"inventory_delta":{},"add_events":[],"next_location":null,"next_time_slot":null,"proposed_route":null},"summary":{"facts":[],"unresolved":[],"relationship_changes":[],"knowledge_changes":[],"interpretation":null,"address_form_changes":[],"important_player_actions":[],"source_history_ids":[]}}

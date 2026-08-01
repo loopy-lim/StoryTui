@@ -9,6 +9,8 @@
 //! input to intents and renders the view it was handed. The host (`apps/
 //! storytui`) owns the event loop and the `EngineState`.
 
+use std::cell::Cell;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -57,6 +59,9 @@ pub struct App {
     pub should_quit: bool,
     /// Vertical scroll offset for the narration pane.
     pub narration_scroll: u16,
+    /// Latest layout-derived maximum narration offset. This lets input clamp
+    /// a follow-end sentinel before moving upward.
+    narration_max_scroll: Cell<u16>,
     /// Whether custom free-text input is active.
     pub input_mode: bool,
     /// Grapheme-safe custom input buffer.
@@ -81,6 +86,7 @@ impl App {
             selected: 0,
             should_quit: false,
             narration_scroll: 0,
+            narration_max_scroll: Cell::new(0),
             input_mode: false,
             input: InputBuffer::new(500),
             list_mode: None,
@@ -257,11 +263,11 @@ impl App {
         }
         match key.code {
             KeyCode::PageUp => {
-                self.narration_scroll = self.narration_scroll.saturating_sub(5);
+                self.scroll_narration_by(-5);
                 return None;
             }
             KeyCode::PageDown => {
-                self.narration_scroll = self.narration_scroll.saturating_add(5);
+                self.scroll_narration_by(5);
                 return None;
             }
             KeyCode::Home if key.modifiers.contains(KeyModifiers::ALT) => {
@@ -302,7 +308,7 @@ impl App {
             render_list(frame, area, mode, items, self.list_scroll);
             return;
         }
-        render_story(
+        let max_scroll = render_story(
             frame,
             area,
             &self.view,
@@ -312,6 +318,7 @@ impl App {
             &self.input,
             &self.story_stack,
         );
+        self.narration_max_scroll.set(max_scroll);
     }
 
     /// Open the slot chooser after the host has read the available saves.
@@ -340,8 +347,11 @@ impl App {
             return;
         }
         let delta: i32 = match mouse.kind {
-            MouseEventKind::ScrollUp => -3,
-            MouseEventKind::ScrollDown => 3,
+            // Terminals deliver trackpad movement as a series of wheel
+            // events. One wrapped line per event feels continuous and avoids
+            // jumping past prose while reading upward.
+            MouseEventKind::ScrollUp => -1,
+            MouseEventKind::ScrollDown => 1,
             _ => return,
         };
         if self.list_mode.is_some() {
@@ -350,13 +360,22 @@ impl App {
             } else {
                 self.list_scroll = self.list_scroll.saturating_add(delta as u16);
             }
-        } else if delta < 0 {
-            self.narration_scroll = self
-                .narration_scroll
-                .saturating_sub(delta.unsigned_abs() as u16);
         } else {
-            self.narration_scroll = self.narration_scroll.saturating_add(delta as u16);
+            self.scroll_narration_by(delta);
         }
+    }
+
+    fn scroll_narration_by(&mut self, delta: i32) {
+        let max_scroll = self.narration_max_scroll.get();
+        // `u16::MAX` means "follow the bottom" after a new turn. Convert it
+        // to the real, layout-derived bottom before applying an upward wheel
+        // event so the first upward scroll responds immediately.
+        let current = self.narration_scroll.min(max_scroll);
+        self.narration_scroll = if delta < 0 {
+            current.saturating_sub(delta.unsigned_abs() as u16)
+        } else {
+            current.saturating_add(delta as u16).min(max_scroll)
+        };
     }
 
     fn handle_save_load_key(&mut self, key: KeyEvent) {
@@ -520,7 +539,7 @@ fn save_load_copy(state: &SaveLoadState) -> (&'static str, &'static str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
     use story_model::{ChoiceView, RiskLevel, Screen, StatusLine, TimeSlot};
 
     fn sample_view(choices: usize) -> AppViewModel {
@@ -650,6 +669,25 @@ mod tests {
         next.status.turn = 2;
         app.set_view(next);
         assert_eq!(app.narration_scroll, u16::MAX);
+    }
+
+    #[test]
+    fn first_upward_wheel_event_leaves_follow_end_immediately() {
+        let mut app = App::new(sample_view(3));
+        app.narration_scroll = u16::MAX;
+        app.narration_max_scroll.set(20);
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(
+            app.narration_scroll, 19,
+            "the first upward wheel event must leave follow-end, not count down from u16::MAX"
+        );
     }
 
     #[test]
