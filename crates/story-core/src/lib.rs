@@ -12,6 +12,7 @@ pub mod eval;
 pub mod memory;
 pub mod memory_selector;
 pub mod prompt_context;
+pub mod redact;
 pub mod reducer;
 pub mod state_machine;
 pub mod summary;
