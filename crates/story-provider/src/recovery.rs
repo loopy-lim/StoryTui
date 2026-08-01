@@ -113,6 +113,22 @@ pub fn parse_generated_turn(raw: &str, generation_id: Uuid) -> Result<ParseOutco
             "choice count out of range [1, 6]: got {n}"
         ))));
     }
+    let unique_labels = parsed
+        .choices
+        .iter()
+        .map(|choice| {
+            choice
+                .label
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    if unique_labels.len() != n {
+        return Err(InvalidGeneration(
+            "duplicate choice labels; choices must offer different directions".to_string(),
+        ));
+    }
     if parsed.narration.trim().is_empty() {
         return Err(InvalidGeneration(detail("narration must be non-empty")));
     }

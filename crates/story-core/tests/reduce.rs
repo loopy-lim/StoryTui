@@ -278,6 +278,53 @@ fn accepted_opening_generation_bumps_turn_and_offers_choices() {
 }
 
 #[test]
+fn accepted_numbered_choice_is_recorded_in_history() {
+    let pack = sample_pack();
+    let (state, opening_gid) = start_and_pending_id(&pack);
+    let opened = reduce(
+        &state,
+        EngineCommand::AcceptGeneration {
+            draft: Box::new(valid_draft(opening_gid, 1)),
+        },
+        &pack,
+    )
+    .expect("accept opening")
+    .state;
+    let submitted = reduce(
+        &opened,
+        EngineCommand::SubmitChoice {
+            choice_id: "choice-1".to_string(),
+        },
+        &pack,
+    )
+    .expect("submit choice");
+    let generation_id = submitted
+        .state
+        .pending
+        .as_ref()
+        .expect("pending")
+        .generation_id;
+    let accepted = reduce(
+        &submitted.state,
+        EngineCommand::AcceptGeneration {
+            draft: Box::new(valid_draft(generation_id, 1)),
+        },
+        &pack,
+    )
+    .expect("accept choice")
+    .state;
+
+    let action = accepted
+        .game
+        .history
+        .last()
+        .and_then(|entry| entry.player_action.as_ref())
+        .expect("numbered choice recorded");
+    assert_eq!(action.original_text, "돌아선다");
+    assert_eq!(action.confidence, Some(1.0));
+}
+
+#[test]
 fn full_three_command_cycle_advances_turn_exactly_once_per_generation() {
     let pack = sample_pack();
     let (mut state, gid) = start_and_pending_id(&pack);

@@ -24,10 +24,10 @@ use sha2::Digest;
 use story_model::chrono::Utc;
 use story_model::uuid::Uuid;
 use story_model::{
-    AppViewModel, CharacterId, CharacterState, ChoiceRef, DirectorPlan, DirectorRequest,
-    DomainErrorView, Emotion, GameState, HistoryEntry, LoadingState, PackMetadata, ParsedAction,
-    SavePayload, Screen, StateChangeLog, StatePatch, StoryPack, StoryRules, TurnRequest,
-    WriterFinish, WriterRequest,
+    ActionType, AppViewModel, CharacterId, CharacterState, ChoiceRef, DirectorPlan,
+    DirectorRequest, DomainErrorView, Emotion, GameState, HistoryEntry, LoadingState, PackMetadata,
+    ParsedAction, SavePayload, Screen, StateChangeLog, StatePatch, StoryPack, StoryRules,
+    TurnRequest, WriterFinish, WriterRequest,
 };
 
 use crate::director::{ValidatedPlan, validate_plan};
@@ -870,7 +870,7 @@ fn assemble_accepted_2stage_turn(
         scene_id: game.current_scene_id.clone(),
         created_at: Utc::now(),
         narration: writer.narration.clone(),
-        player_action: pending.player_action.clone(),
+        player_action: recorded_player_action(pending),
         choices: validated.plan.choices.clone(),
         applied_patch: validated.plan.proposed_patch.clone(),
         generation_id: pending.generation_id,
@@ -915,8 +915,8 @@ fn assemble_accepted_2stage_turn(
 ///
 /// - `turn` bumps by exactly 1 from `requested_at_turn`.
 /// - A new `HistoryEntry` is appended (choices offered, applied patch, draft
-///   narration). `player_action` is populated from the pending generation when
-///   the turn originated from a free action; otherwise `None`. The chosen id
+///   narration). `player_action` records both direct text and numbered choices
+///   so the transcript can show what led to the scene. The chosen id
 ///   is recorded on `game.last_choice` (skipped for the opening and free-action
 ///   sentinels).
 /// - The pending generation is cleared and the committed state is pushed onto
@@ -971,7 +971,7 @@ fn assemble_accepted_turn(
         scene_id: game.current_scene_id.clone(),
         created_at: Utc::now(),
         narration: draft.narration.clone(),
-        player_action: pending.player_action.clone(),
+        player_action: recorded_player_action(pending),
         choices: draft.choices.clone(),
         applied_patch: draft.proposed_patch.clone(),
         generation_id: draft.generation_id,
@@ -1003,6 +1003,36 @@ fn assemble_accepted_turn(
         use_director_writer: state.use_director_writer,
     };
     (next, result.change_log)
+}
+
+/// Persist the action that led into a generated scene. Numbered choices are
+/// represented like free input so history and the stacked TUI transcript can
+/// show the player's actual direction.
+fn recorded_player_action(pending: &PendingGeneration) -> Option<ParsedAction> {
+    if let Some(action) = &pending.player_action {
+        return Some(action.clone());
+    }
+    if matches!(
+        pending.player_choice_id.as_str(),
+        OPENING_CHOICE_ID | FREE_ACTION_CHOICE_ID
+    ) {
+        return None;
+    }
+    let choice = pending.checkpoint.history.last().and_then(|entry| {
+        entry
+            .choices
+            .iter()
+            .find(|choice| choice.id == pending.player_choice_id)
+    })?;
+    Some(ParsedAction {
+        action_type: ActionType::GeneralAction,
+        target: choice.target.clone(),
+        intent: Some(choice.intent.clone()),
+        tone: choice.tone.clone(),
+        content: choice.label.clone(),
+        original_text: choice.label.clone(),
+        confidence: Some(1.0),
+    })
 }
 
 /// Append `new_entries` to the audit tail, trimming to the most recent

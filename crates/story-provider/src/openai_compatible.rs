@@ -417,6 +417,21 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
                 // surfacing a player-facing format error.
                 self.do_generate(&request, true, &cancel, Some(0.2)).await
             }
+            Err(ProviderError::InvalidGeneration(detail))
+                if detail.contains("duplicate choice labels") =>
+            {
+                tracing::warn!(
+                    target: "story_provider::openai_compatible",
+                    "duplicate choices; retrying once with an safe variation reminder"
+                );
+                let mut repair_request = request.clone();
+                repair_request.messages.push(story_model::ChatMessage {
+                    role: "user".to_string(),
+                    content: "중요: 선택지 3개는 문장과 전략이 서로 달라야 합니다. 같은 문장을 반복하지 말고, 정면 대응·신중한 탐색·유보 중 서로 다른 방향으로 다시 JSON만 반환하세요.".to_string(),
+                });
+                self.do_generate(&repair_request, true, &cancel, Some(0.3))
+                    .await
+            }
             Err(other) => Err(other),
         }
     }

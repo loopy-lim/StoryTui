@@ -182,6 +182,16 @@ fn korean_enum_labels_from_local_model_are_normalized() {
 }
 
 #[test]
+fn duplicate_choice_labels_are_rejected_for_variation_retry() {
+    let raw = VALID_BODY.replace(
+        r#"{"id":"c1","label":"a","intent":"i","tone":null,"target":null,"risk":"safe","hidden_requirements":[],"preview":null}"#,
+        r#"{"id":"c1","label":"같은 선택","intent":"i","tone":null,"target":null,"risk":"safe","hidden_requirements":[],"preview":null},{"id":"c2","label":"같은 선택","intent":"i","tone":null,"target":null,"risk":"safe","hidden_requirements":[],"preview":null}"#,
+    );
+    let err = expect_err(&raw);
+    assert!(err.to_string().contains("duplicate choice labels"));
+}
+
+#[test]
 fn legacy_text_choices_are_migrated_without_trusting_on_select_patch() {
     let raw = VALID_BODY.replace(
         r#"{"id":"c1","label":"a","intent":"i","tone":null,"target":null,"risk":"safe","hidden_requirements":[],"preview":null}"#,

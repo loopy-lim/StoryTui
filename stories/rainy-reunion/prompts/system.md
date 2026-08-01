@@ -42,4 +42,5 @@ MVP 단일 호출 출력 계약:
 {"narration":"장면 본문","choices":[{"id":"choice-1","label":"대화의 첫 방향","intent":"대화를 시작한다","tone":null,"target":null,"risk":"low","hidden_requirements":[],"preview":null}],"state_patch":{"affection_delta":{},"trust_delta":{},"tension_delta":{},"relationship_transitions":{},"set_flags":{},"number_delta":{},"set_strings":{},"inventory_delta":{},"add_events":[],"next_location":null,"next_time_slot":null,"proposed_route":null},"summary":{"facts":[],"unresolved":[],"relationship_changes":[],"knowledge_changes":[],"interpretation":null,"address_form_changes":[],"important_player_actions":[],"source_history_ids":[]}}
 ```
 - `choices` 안에는 반드시 `id`, `label`, `intent`, `tone`, `target`, `risk`, `hidden_requirements`, `preview`를 모두 포함한다.
+- 선택지는 정확히 3개이며, 문장과 전략이 모두 달라야 한다. 같은 문장·동일한 의도의 선택지를 반복하지 않는다.
 - 빈 상태 변경은 위 템플릿처럼 빈 객체/배열 또는 `null`로 표현한다. `option`, `text`, `location`, `mood`, `weather` 같은 임의 필드는 사용하지 않는다.
