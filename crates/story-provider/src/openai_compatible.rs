@@ -85,6 +85,8 @@ pub struct OpenAiCompatibleProvider {
     /// this starts `true` and is disabled for the session if a parse failure
     /// triggers the no-`response_format` fallback retry.
     structured_supported: AtomicBool,
+    /// Bearer token resolved once from `ProviderConfig::api_key_env`.
+    api_key: Option<String>,
 }
 
 impl OpenAiCompatibleProvider {
@@ -109,13 +111,31 @@ impl OpenAiCompatibleProvider {
             StructuredOutputMode::On | StructuredOutputMode::Auto => true,
             StructuredOutputMode::Off => false,
         };
+        let api_key = config
+            .api_key
+            .clone()
+            .or_else(|| {
+                config
+                    .api_key_env
+                    .as_deref()
+                    .and_then(|name| std::env::var(name).ok())
+            })
+            .filter(|value| !value.trim().is_empty());
         Ok(Self {
             id: config.name.clone(),
             config,
             client,
             loopback,
             structured_supported: AtomicBool::new(structured_supported),
+            api_key,
         })
+    }
+
+    fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.api_key {
+            Some(token) => request.bearer_auth(token),
+            None => request,
+        }
     }
 
     /// Full chat-completions URL.
@@ -174,15 +194,19 @@ impl OpenAiCompatibleProvider {
         suppress_rf: bool,
         cancel: &CancellationToken,
     ) -> Result<GeneratedTurnDraft, ProviderError> {
+        let bounded_request = bound_context(request, self.config.context_budget_tokens);
         let send_rf = !suppress_rf && self.structured_enabled() && request.json_schema.is_some();
-        let body = ChatCompletionRequest::from_turn(request, &self.config.model, send_rf);
+        let body = ChatCompletionRequest::from_turn(&bounded_request, &self.config.model, send_rf);
         let max_attempts = self.config.max_retries.saturating_add(1);
 
         for attempt in 0..max_attempts {
             if cancel.is_cancelled() {
                 return Err(ProviderError::Cancelled);
             }
-            let send = self.client.post(self.chat_url()).json(&body).send();
+            let send = self
+                .authorize(self.client.post(self.chat_url()))
+                .json(&body)
+                .send();
             let result = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
@@ -246,6 +270,61 @@ impl OpenAiCompatibleProvider {
     }
 }
 
+/// Keep the input side of a request within the configured soft context budget.
+/// The output reservation is `request.max_tokens`; the remaining budget is
+/// applied conservatively as a character count, which is intentionally safer
+/// for Korean text than assuming one token per whitespace-delimited word.
+fn bound_context(request: &TurnRequest, context_budget_tokens: u32) -> TurnRequest {
+    let mut bounded = request.clone();
+    let output_reserve = request
+        .max_tokens
+        .min(context_budget_tokens.saturating_sub(1));
+    let input_budget = context_budget_tokens.saturating_sub(output_reserve).max(1) as usize;
+    let used = bounded
+        .messages
+        .iter()
+        .map(|message| message.content.chars().count())
+        .sum::<usize>();
+    if used <= input_budget {
+        return bounded;
+    }
+
+    let system_chars = bounded
+        .messages
+        .iter()
+        .take(bounded.messages.len().saturating_sub(1))
+        .map(|message| message.content.chars().count())
+        .sum::<usize>();
+    let user_budget = input_budget.saturating_sub(system_chars);
+    if let Some(last) = bounded.messages.last_mut() {
+        last.content = truncate_context(&last.content, user_budget);
+    }
+    bounded
+}
+
+fn truncate_context(input: &str, max_chars: usize) -> String {
+    if input.chars().count() <= max_chars {
+        return input.to_string();
+    }
+    const MARKER: &str = "\n...[중략: context budget]...\n";
+    if max_chars <= MARKER.chars().count() + 2 {
+        return input.chars().take(max_chars).collect();
+    }
+    let available = max_chars - MARKER.chars().count();
+    let head = available / 2;
+    let tail = available - head;
+    let prefix: String = input.chars().take(head).collect();
+    let suffix: String = input
+        .chars()
+        .rev()
+        .take(tail)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!("{prefix}{MARKER}{suffix}")
+}
+
 fn map_send_error(e: reqwest::Error, request_timeout_ms: u64) -> ProviderError {
     if e.is_timeout() {
         ProviderError::Timeout {
@@ -273,7 +352,10 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
     }
 
     async fn health(&self) -> Result<ProviderHealth, ProviderError> {
-        let result = self.client.get(self.health_url()).send().await;
+        let result = self
+            .authorize(self.client.get(self.health_url()))
+            .send()
+            .await;
         match result {
             Err(e) => {
                 if e.is_timeout() {
@@ -339,7 +421,10 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
             if cancel.is_cancelled() {
                 return Err(ProviderError::Cancelled);
             }
-            let send = self.client.post(self.chat_url()).json(&body).send();
+            let send = self
+                .authorize(self.client.post(self.chat_url()))
+                .json(&body)
+                .send();
             let result = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
@@ -416,7 +501,10 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
         // Single attempt — once the stream has started we cannot transparently
         // retry (chunks may have already been surfaced to the UI). Pre-stream
         // errors (connect / 4xx / 5xx) are surfaced immediately.
-        let send = self.client.post(self.chat_url()).json(&body).send();
+        let send = self
+            .authorize(self.client.post(self.chat_url()))
+            .json(&body)
+            .send();
         let resp = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
@@ -614,5 +702,33 @@ mod tests {
             b_huge <= MAX_BACKOFF,
             "backoff must be capped: {b_huge:?} > {MAX_BACKOFF:?}"
         );
+    }
+
+    #[test]
+    fn context_budget_truncates_only_when_input_exceeds_budget() {
+        let request = TurnRequest {
+            generation_id: story_model::uuid::Uuid::nil(),
+            messages: vec![
+                story_model::ChatMessage {
+                    role: "system".to_string(),
+                    content: "system".to_string(),
+                },
+                story_model::ChatMessage {
+                    role: "user".to_string(),
+                    content: "가나다라마바사아자차카타파하가나다라마바사아자차카타파하가나다라마바사아자차카타파하가나다라마바사아자차카타파하".to_string(),
+                },
+            ],
+            model: "test".to_string(),
+            temperature: 0.2,
+            top_p: 0.9,
+            top_k: 0,
+            max_tokens: 2,
+            json_schema: None,
+        };
+        let unchanged = bound_context(&request, 100);
+        assert_eq!(unchanged.messages[1].content, request.messages[1].content);
+        let bounded = bound_context(&request, 50);
+        assert!(bounded.messages[1].content.chars().count() <= 48);
+        assert!(bounded.messages[1].content.contains("중략"));
     }
 }

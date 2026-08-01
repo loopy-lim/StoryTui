@@ -167,6 +167,21 @@ const VALID_BODY: &str = r#"{
 }"#;
 
 #[test]
+fn korean_enum_labels_from_local_model_are_normalized() {
+    let raw = VALID_BODY
+        .replace("\"risk\":\"safe\"", "\"risk\":\"낮음\"")
+        .replace("\"next_time_slot\": null", "\"next_time_slot\": \"저녁\"");
+    let draft = parse_generated_turn(&raw, GID)
+        .expect("common Korean enum labels should parse")
+        .draft;
+    assert_eq!(draft.choices[0].risk, story_model::RiskLevel::Low);
+    assert_eq!(
+        draft.proposed_patch.next_time_slot,
+        Some(story_model::TimeSlot::Evening)
+    );
+}
+
+#[test]
 fn legacy_top_level_patches_alias_is_migrated_once() {
     let raw = VALID_BODY.replace("\"state_patch\"", "\"patches\"");
     let outcome = parse_generated_turn(&raw, GID).expect("known legacy alias should recover");

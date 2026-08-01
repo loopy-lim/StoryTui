@@ -80,7 +80,7 @@ pub fn parse_generated_turn(raw: &str, generation_id: Uuid) -> Result<ParseOutco
 
     // (3) First strict parse. Migrate only the known Director-era top-level
     // alias; all other unknown fields remain hard errors.
-    let aliased = rename_legacy_patches(located);
+    let aliased = normalize_common_wire_aliases(&rename_legacy_patches(located));
     if aliased != located {
         repairs.push("renamed legacy top-level patches to state_patch".to_string());
     }
@@ -92,7 +92,7 @@ pub fn parse_generated_turn(raw: &str, generation_id: Uuid) -> Result<ParseOutco
             if repaired != aliased {
                 repairs.push("stripped trailing commas".to_string());
             }
-            let repaired = rename_legacy_patches(&repaired);
+            let repaired = normalize_common_wire_aliases(&rename_legacy_patches(&repaired));
             match serde_json::from_str::<RawGeneratedTurn>(&repaired) {
                 Ok(p) => p,
                 Err(second_err) => {
@@ -142,6 +142,71 @@ fn rename_legacy_patches(input: &str) -> String {
     let patches = object.remove("patches").expect("checked above");
     object.insert("state_patch".to_string(), patches);
     serde_json::to_string(&Value::Object(object)).unwrap_or_else(|_| input.to_string())
+}
+
+/// Normalize a small set of unambiguous Korean enum labels emitted by local
+/// models. This does not discard fields or invent IDs; unknown values still
+/// fail strict parsing and engine validation.
+fn normalize_common_wire_aliases(input: &str) -> String {
+    let Ok(mut root) = serde_json::from_str::<Value>(input) else {
+        return input.to_string();
+    };
+    let original = root.clone();
+    let Value::Object(object) = &mut root else {
+        return input.to_string();
+    };
+    if let Some(Value::Array(choices)) = object.get_mut("choices") {
+        for choice in choices {
+            if let Value::Object(choice) = choice
+                && let Some(Value::String(risk)) = choice.get_mut("risk")
+            {
+                *risk = match risk.as_str() {
+                    "안전" => "safe",
+                    "낮음" => "low",
+                    "보통" => "medium",
+                    "높음" => "high",
+                    "심각" => "severe",
+                    _ => risk,
+                }
+                .to_string();
+            }
+        }
+    }
+    if let Some(Value::Object(patch)) = object.get_mut("state_patch") {
+        if let Some(Value::String(slot)) = patch.get_mut("next_time_slot") {
+            *slot = match slot.as_str() {
+                "새벽" => "dawn",
+                "오전" => "morning",
+                "오후" => "afternoon",
+                "저녁" => "evening",
+                "밤" => "night",
+                _ => slot,
+            }
+            .to_string();
+        }
+        if let Some(Value::Object(transitions)) = patch.get_mut("relationship_transitions") {
+            for value in transitions.values_mut() {
+                if let Value::String(stage) = value {
+                    *stage = match stage.as_str() {
+                        "낯선 사이" => "stranger",
+                        "아는 사이" => "acquaintance",
+                        "친구" => "friend",
+                        "가까운 친구" => "close_friend",
+                        "연애 관심" => "romantic_interest",
+                        "연인" => "partner",
+                        "소원한 사이" => "estranged",
+                        _ => stage,
+                    }
+                    .to_string();
+                }
+            }
+        }
+    }
+    if root == original {
+        input.to_string()
+    } else {
+        serde_json::to_string(&root).unwrap_or_else(|_| input.to_string())
+    }
 }
 
 /// Locate the JSON object in `s` as the slice from the first `{` to the last
