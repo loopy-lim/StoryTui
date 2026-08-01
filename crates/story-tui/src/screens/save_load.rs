@@ -81,6 +81,12 @@ pub fn render_save_load(
         slots
             .iter()
             .map(|s| {
+                if s.story_id.is_empty() {
+                    return Line::from(vec![
+                        Span::raw(format!("[{}] ", s.slot_id)),
+                        Span::styled("빈 슬롯", Style::default().fg(Color::DarkGray)),
+                    ]);
+                }
                 let desc = s
                     .description
                     .clone()

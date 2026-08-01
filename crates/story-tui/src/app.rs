@@ -15,10 +15,35 @@ use ratatui::layout::Rect;
 use story_core::engine_cmd::EngineCommand;
 use story_model::uuid::Uuid;
 use story_model::{ActionType, AppViewModel, ParsedAction};
+use story_persistence::SlotMeta;
 
 use crate::event::{KeyAction, SELECT_SENTINEL, map_key, parse_direct_select_index};
 use crate::input::InputBuffer;
+use crate::screens::save_load::render_save_load;
 use crate::screens::story::{ListMode, StoryStackEntry, render_list, render_story};
+
+/// Which manual save manager the host should open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SaveLoadMode {
+    Save,
+    Load,
+}
+
+/// Filesystem work requested by the UI. The host owns all actual save I/O.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SaveLoadRequest {
+    Open(SaveLoadMode),
+    Save { slot_id: String },
+    Load { slot_id: String },
+}
+
+#[derive(Clone, Debug)]
+struct SaveLoadState {
+    mode: SaveLoadMode,
+    slots: Vec<SlotMeta>,
+    selected: usize,
+    overwrite_confirmation: bool,
+}
 
 /// The TUI's mutable, display-facing state. The engine-facing state lives in
 /// the host; the App only renders the published view.
@@ -44,6 +69,8 @@ pub struct App {
     /// Chronological narration stack shown in the main story pane.
     pub story_stack: Vec<StoryStackEntry>,
     pub list_scroll: u16,
+    save_load: Option<SaveLoadState>,
+    save_load_request: Option<SaveLoadRequest>,
 }
 
 impl App {
@@ -61,6 +88,8 @@ impl App {
             memory_items: Vec::new(),
             story_stack: Vec::new(),
             list_scroll: 0,
+            save_load: None,
+            save_load_request: None,
         }
     }
 
@@ -140,6 +169,10 @@ impl App {
         key: KeyEvent,
         pending_generation_id: Option<Uuid>,
     ) -> Option<EngineCommand> {
+        if self.save_load.is_some() {
+            self.handle_save_load_key(key);
+            return None;
+        }
         if self.input_mode {
             return self.handle_input_key(key);
         }
@@ -184,6 +217,20 @@ impl App {
             self.list_scroll = 0;
             return None;
         }
+        if !self.view.loading.is_some() && self.view.error.is_none() {
+            match key.code {
+                // Same physical keys under Korean 2-beolsik: s=ㄴ, l=ㅣ.
+                KeyCode::Char('s' | 'ㄴ') => {
+                    self.save_load_request = Some(SaveLoadRequest::Open(SaveLoadMode::Save));
+                    return None;
+                }
+                KeyCode::Char('l' | 'ㅣ') => {
+                    self.save_load_request = Some(SaveLoadRequest::Open(SaveLoadMode::Load));
+                    return None;
+                }
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::PageUp => {
                 self.narration_scroll = self.narration_scroll.saturating_sub(5);
@@ -218,6 +265,11 @@ impl App {
 
     /// Render the Story screen for the current view.
     pub fn render(&self, frame: &mut Frame, area: Rect) {
+        if let Some(state) = &self.save_load {
+            let (title, footer) = save_load_copy(state);
+            render_save_load(frame, area, title, &state.slots, state.selected, footer);
+            return;
+        }
         if let Some(mode) = self.list_mode {
             let items = match mode {
                 ListMode::History => &self.history_items,
@@ -238,8 +290,31 @@ impl App {
         );
     }
 
+    /// Open the slot chooser after the host has read the available saves.
+    pub fn open_save_load(&mut self, mode: SaveLoadMode, slots: Vec<SlotMeta>) {
+        self.save_load = Some(SaveLoadState {
+            mode,
+            slots,
+            selected: 0,
+            overwrite_confirmation: false,
+        });
+    }
+
+    /// Consume pending filesystem work requested by the save/load UI.
+    pub fn take_save_load_request(&mut self) -> Option<SaveLoadRequest> {
+        self.save_load_request.take()
+    }
+
+    /// Close the slot chooser after the host completed or rejected an action.
+    pub fn close_save_load(&mut self) {
+        self.save_load = None;
+    }
+
     /// Handle mouse-wheel scrolling without changing the selected choice.
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if self.save_load.is_some() {
+            return;
+        }
         let delta: i32 = match mouse.kind {
             MouseEventKind::ScrollUp => -3,
             MouseEventKind::ScrollDown => 3,
@@ -257,6 +332,55 @@ impl App {
                 .saturating_sub(delta.unsigned_abs() as u16);
         } else {
             self.narration_scroll = self.narration_scroll.saturating_add(delta as u16);
+        }
+    }
+
+    fn handle_save_load_key(&mut self, key: KeyEvent) {
+        let Some(state) = self.save_load.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => self.save_load = None,
+            KeyCode::Up | KeyCode::Char('k' | 'ㅏ') => {
+                state.selected = state.selected.saturating_sub(1);
+                state.overwrite_confirmation = false;
+            }
+            KeyCode::Down | KeyCode::Char('j' | 'ㅓ') => {
+                state.selected = (state.selected + 1).min(state.slots.len().saturating_sub(1));
+                state.overwrite_confirmation = false;
+            }
+            KeyCode::Char('s' | 'ㄴ') => {
+                state.mode = SaveLoadMode::Save;
+                state.overwrite_confirmation = false;
+            }
+            KeyCode::Char('l' | 'ㅣ') => {
+                state.mode = SaveLoadMode::Load;
+                state.overwrite_confirmation = false;
+            }
+            KeyCode::Enter => {
+                let Some(slot) = state.slots.get(state.selected) else {
+                    return;
+                };
+                match state.mode {
+                    SaveLoadMode::Load if !slot.story_id.is_empty() => {
+                        self.save_load_request = Some(SaveLoadRequest::Load {
+                            slot_id: slot.slot_id.clone(),
+                        });
+                    }
+                    SaveLoadMode::Save
+                        if !slot.story_id.is_empty() && !state.overwrite_confirmation =>
+                    {
+                        state.overwrite_confirmation = true;
+                    }
+                    SaveLoadMode::Save => {
+                        self.save_load_request = Some(SaveLoadRequest::Save {
+                            slot_id: slot.slot_id.clone(),
+                        });
+                    }
+                    SaveLoadMode::Load => {}
+                }
+            }
+            _ => {}
         }
     }
 
@@ -352,6 +476,23 @@ impl App {
     }
 }
 
+fn save_load_copy(state: &SaveLoadState) -> (&'static str, &'static str) {
+    match (state.mode, state.overwrite_confirmation) {
+        (SaveLoadMode::Save, true) => (
+            "저장 / 덮어쓰기 확인",
+            "Enter 한 번 더: 덮어쓰기 · Esc 취소 · S 저장 · L 불러오기",
+        ),
+        (SaveLoadMode::Save, false) => (
+            "수동 저장",
+            "↑↓ 이동 · Enter 저장 · S 저장 · L 불러오기 · Esc 닫기",
+        ),
+        (SaveLoadMode::Load, _) => (
+            "저장 불러오기",
+            "↑↓ 이동 · Enter 불러오기 · S 저장 · L 불러오기 · Esc 닫기",
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,6 +531,21 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    fn save_slot(slot_id: &str, occupied: bool) -> SlotMeta {
+        SlotMeta {
+            slot_id: slot_id.to_string(),
+            story_id: if occupied {
+                "rainy-reunion".to_string()
+            } else {
+                String::new()
+            },
+            saved_at: story_model::chrono::Utc::now(),
+            chapter_label: String::new(),
+            scene_label: String::new(),
+            description: None,
+        }
+    }
+
     #[test]
     fn move_selection_clamps_to_bounds() {
         let mut app = App::new(sample_view(3));
@@ -423,6 +579,44 @@ mod tests {
             panic!("not submit: {cmd:?}");
         };
         assert_eq!(choice_id, "c-1", "'2' selects index 1");
+    }
+
+    #[test]
+    fn save_shortcut_requests_host_to_open_manual_slots() {
+        let mut app = App::new(sample_view(3));
+        app.handle_key(key(KeyCode::Char('s')), None);
+        assert_eq!(
+            app.take_save_load_request(),
+            Some(SaveLoadRequest::Open(SaveLoadMode::Save))
+        );
+    }
+
+    #[test]
+    fn occupied_slot_requires_second_enter_before_overwrite() {
+        let mut app = App::new(sample_view(3));
+        app.open_save_load(SaveLoadMode::Save, vec![save_slot("slot-1", true)]);
+        app.handle_key(key(KeyCode::Enter), None);
+        assert_eq!(app.take_save_load_request(), None);
+        app.handle_key(key(KeyCode::Enter), None);
+        assert_eq!(
+            app.take_save_load_request(),
+            Some(SaveLoadRequest::Save {
+                slot_id: "slot-1".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn empty_manual_slot_saves_on_first_enter() {
+        let mut app = App::new(sample_view(3));
+        app.open_save_load(SaveLoadMode::Save, vec![save_slot("slot-1", false)]);
+        app.handle_key(key(KeyCode::Enter), None);
+        assert_eq!(
+            app.take_save_load_request(),
+            Some(SaveLoadRequest::Save {
+                slot_id: "slot-1".to_string()
+            })
+        );
     }
 
     #[test]

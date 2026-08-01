@@ -562,6 +562,14 @@ fn render_status(frame: &mut Frame, area: Rect, view: &AppViewModel) {
                     .add_modifier(Modifier::BOLD),
             ),
         ]);
+    } else if view.loading.is_none() && view.error.is_none() {
+        spans.extend([
+            Span::raw("    "),
+            Span::styled(
+                "[S] 저장  [L] 불러오기",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
     }
     let line = Line::from(spans);
     let block = Block::default()
