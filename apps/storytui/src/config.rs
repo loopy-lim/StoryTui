@@ -1,7 +1,8 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use story_provider::ProviderConfig;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -21,6 +22,120 @@ pub struct PlayerProfile {
     pub name: Option<String>,
     #[serde(default)]
     pub persona: Option<String>,
+}
+
+/// Per-user generation preferences stored independently from the project
+/// provider configuration.
+///
+/// Every field is optional so an absent value continues to inherit the StoryTUI
+/// default or the checked-in configuration file. This file intentionally never
+/// contains endpoint or authentication settings.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct UserSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_budget_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+}
+
+impl UserSettings {
+    fn apply_to(&self, provider: &mut ProviderConfig) {
+        if let Some(model) = &self.model {
+            provider.model = model.clone();
+        }
+        if let Some(max_tokens) = self.max_tokens {
+            provider.max_tokens = max_tokens;
+        }
+        if let Some(context_budget_tokens) = self.context_budget_tokens {
+            provider.context_budget_tokens = context_budget_tokens;
+        }
+        if let Some(temperature) = self.temperature {
+            provider.temperature = temperature;
+        }
+    }
+}
+
+/// The user-owned settings file under a save directory.
+pub fn user_settings_path(save_dir: &Path) -> PathBuf {
+    save_dir.join("user-settings.toml")
+}
+
+fn load_user_settings(save_dir: &Path) -> Result<UserSettings, String> {
+    let path = user_settings_path(save_dir);
+    if !path.exists() {
+        return Ok(UserSettings::default());
+    }
+
+    let text = fs::read_to_string(&path)
+        .map_err(|e| format!("사용자 설정을 읽지 못했습니다 ({}): {e}", path.display()))?;
+    toml::from_str(&text).map_err(|e| {
+        format!(
+            "사용자 설정 TOML이 올바르지 않습니다 ({}): {e}",
+            path.display()
+        )
+    })
+}
+
+/// Atomically persist the user-selectable provider preferences.
+///
+/// The output deliberately includes only model and sampling/context overrides;
+/// base URLs, credentials, and project defaults remain in the base config.
+pub fn save_user_settings(save_dir: &Path, settings: &UserSettings) -> Result<(), String> {
+    fs::create_dir_all(save_dir).map_err(|e| {
+        format!(
+            "세이브 디렉터리를 만들지 못했습니다 ({}): {e}",
+            save_dir.display()
+        )
+    })?;
+
+    let path = user_settings_path(save_dir);
+    let body = toml::to_string_pretty(settings)
+        .map_err(|e| format!("사용자 설정을 직렬화하지 못했습니다: {e}"))?;
+    let unique = format!(
+        ".user-settings-{}-{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let temporary = save_dir.join(unique);
+
+    let write_result = (|| -> Result<(), String> {
+        let mut file = fs::File::create(&temporary).map_err(|e| {
+            format!(
+                "사용자 설정 임시 파일을 만들지 못했습니다 ({}): {e}",
+                temporary.display()
+            )
+        })?;
+        file.write_all(body.as_bytes()).map_err(|e| {
+            format!(
+                "사용자 설정 임시 파일을 쓰지 못했습니다 ({}): {e}",
+                temporary.display()
+            )
+        })?;
+        file.sync_all().map_err(|e| {
+            format!(
+                "사용자 설정 임시 파일을 동기화하지 못했습니다 ({}): {e}",
+                temporary.display()
+            )
+        })?;
+        fs::rename(&temporary, &path).map_err(|e| {
+            format!(
+                "사용자 설정을 적용하지 못했습니다 ({}): {e}",
+                path.display()
+            )
+        })
+    })();
+
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write_result
 }
 
 impl Default for FileConfig {
@@ -125,6 +240,9 @@ pub fn load(cli: &CliOptions) -> Result<RuntimeConfig, String> {
         None => (FileConfig::default(), None),
     };
 
+    let settings = load_user_settings(&file.save_dir)?;
+    settings.apply_to(&mut file.provider);
+
     if let Some(value) = &cli.model {
         file.provider.model = value.clone();
     }
@@ -165,7 +283,25 @@ pub fn load(cli: &CliOptions) -> Result<RuntimeConfig, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::FileConfig;
+    use std::fs;
+    use std::path::PathBuf;
+
+    use super::{
+        CliOptions, FileConfig, UserSettings, load, save_user_settings, user_settings_path,
+    };
+
+    fn test_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "storytui-config-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create test directory");
+        dir
+    }
 
     #[test]
     fn player_profile_is_optional_and_loads_from_toml() {
@@ -177,5 +313,81 @@ mod tests {
             config.player.persona.as_deref(),
             Some("말수가 적고 관찰력이 좋다")
         );
+    }
+
+    #[test]
+    fn user_settings_override_base_before_cli_overrides() {
+        let dir = test_dir("load-order");
+        let save_dir = dir.join("saves");
+        let pack_dir = dir.join("pack");
+        let config_path = dir.join("storytui.toml");
+        fs::create_dir_all(&pack_dir).expect("pack directory");
+        fs::write(
+            &config_path,
+            format!(
+                "save_dir = \"{}\"\n[provider]\nmodel = \"base-model\"\nmax_tokens = 100\ncontext_budget_tokens = 200\ntemperature = 0.1\n",
+                save_dir.display()
+            ),
+        )
+        .expect("base config");
+        save_user_settings(
+            &save_dir,
+            &UserSettings {
+                model: Some("saved-model".to_string()),
+                max_tokens: Some(300),
+                context_budget_tokens: Some(400),
+                temperature: Some(0.7),
+            },
+        )
+        .expect("save settings");
+
+        let runtime = load(&CliOptions {
+            provider_config: Some(config_path),
+            pack: Some(pack_dir),
+            model: Some("cli-model".to_string()),
+            ..CliOptions::default()
+        })
+        .expect("load config");
+
+        assert_eq!(runtime.provider.model, "cli-model");
+        assert_eq!(runtime.provider.max_tokens, 300);
+        assert_eq!(runtime.provider.context_budget_tokens, 400);
+        assert_eq!(runtime.provider.temperature, 0.7);
+        fs::remove_dir_all(dir).expect("clean test directory");
+    }
+
+    #[test]
+    fn saves_only_user_overrides_and_replaces_existing_file() {
+        let dir = test_dir("save");
+        let settings = UserSettings {
+            model: Some("qwen-local".to_string()),
+            max_tokens: Some(1_800),
+            context_budget_tokens: None,
+            temperature: Some(0.2),
+        };
+        let path = user_settings_path(&dir);
+        fs::write(&path, "base_url = \"must-not-survive\"\n").expect("old settings");
+
+        save_user_settings(&dir, &settings).expect("save settings");
+
+        let text = fs::read_to_string(&path).expect("saved settings");
+        assert_eq!(
+            toml::from_str::<UserSettings>(&text).expect("parse settings"),
+            settings
+        );
+        assert!(text.contains("model = \"qwen-local\""));
+        assert!(text.contains("max_tokens = 1800"));
+        assert!(text.contains("temperature = 0.2"));
+        assert!(!text.contains("context_budget_tokens"));
+        assert!(!text.contains("base_url"));
+        assert_eq!(
+            fs::read_dir(&dir)
+                .expect("read save directory")
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+                .count(),
+            0
+        );
+        fs::remove_dir_all(dir).expect("clean test directory");
     }
 }
