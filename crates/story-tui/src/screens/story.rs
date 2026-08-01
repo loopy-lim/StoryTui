@@ -14,8 +14,7 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Scrollbar,
-    ScrollbarOrientation, ScrollbarState, Wrap,
+    Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
 };
 use story_model::{AppViewModel, RiskLevel, TimeSlot};
 use unicode_width::UnicodeWidthStr;
@@ -112,48 +111,38 @@ pub fn render_story(
         .wrap(Wrap { trim: false });
     frame.render_widget(title_para, frame_chunks[0]);
 
-    // Reserve the title rows before laying out the story body. Rendering both
-    // against `area` made the first stack heading overlap the global title.
+    // The title stays as a compact context anchor. Everything below it — the
+    // chronological transcript, current choices, input, and status — is one
+    // document so scrolling reads like a terminal conversation rather than a
+    // tiny, isolated prose viewport.
     let body = frame_chunks[1];
-    let choice_height = choice_area_height(view, body.width);
-    let chunks = if input_mode {
-        Layout::vertical([
-            Constraint::Fill(3),
-            Constraint::Length(choice_height),
-            Constraint::Length(3),
-            Constraint::Length(2),
-        ])
-        .split(body)
-    } else {
-        Layout::vertical([
-            Constraint::Fill(3),
-            Constraint::Length(choice_height),
-            Constraint::Length(2),
-        ])
-        .split(body)
-    };
-
-    // Narration.
-    let narration_text = if story_stack.is_empty() {
-        markdown_text(&view.narration)
-    } else {
-        story_stack_text(story_stack)
-    };
-    // Reserve a right-edge scrollbar only when the story has more lines than
-    // the viewport. The visible thumb then communicates both the current
-    // position and the remaining scroll range without taking space otherwise.
-    let needs_scrollbar =
-        wrapped_line_count(&narration_text, chunks[0].width) > chunks[0].height as usize;
+    let initial_document =
+        story_document_text(view, selected, input_mode, input, story_stack, body.width);
+    // When scrolling is necessary, rebuild for the one-cell narrower text
+    // column. This keeps Korean wrapping and scrollbar length in agreement.
+    let needs_scrollbar = wrapped_line_count(&initial_document, body.width) > body.height as usize;
     let narration_chunks = if needs_scrollbar {
-        Layout::horizontal([Constraint::Fill(1), Constraint::Length(1)]).split(chunks[0])
+        Layout::horizontal([Constraint::Fill(1), Constraint::Length(1)]).split(body)
     } else {
-        [chunks[0], Rect::default()].into()
+        [body, Rect::default()].into()
     };
     let narration_area = narration_chunks[0];
-    let content_lines = wrapped_line_count(&narration_text, narration_area.width);
+    let document = if needs_scrollbar {
+        story_document_text(
+            view,
+            selected,
+            input_mode,
+            input,
+            story_stack,
+            narration_area.width,
+        )
+    } else {
+        initial_document
+    };
+    let content_lines = wrapped_line_count(&document, narration_area.width);
     let max_scroll = content_lines.saturating_sub(narration_area.height as usize) as u16;
     let scroll_position = narration_scroll.min(max_scroll);
-    let narration = Paragraph::new(narration_text)
+    let narration = Paragraph::new(document)
         .wrap(Wrap { trim: false })
         .style(Style::default().fg(Color::Gray));
     // Mouse wheels and PageDown can generate an offset beyond the wrapped
@@ -179,27 +168,87 @@ pub fn render_story(
         frame.render_stateful_widget(scrollbar, narration_chunks[1], &mut scrollbar_state);
     }
 
-    // While generation is pending, this panel replaces the choices in place.
-    // It avoids a detached center overlay and makes it clear that selection is
-    // temporarily locked rather than changing under the player's cursor.
-    if let Some(loading) = &view.loading {
-        render_choice_loading(frame, chunks[1], &loading.message_ko);
-    } else {
-        render_choices(frame, chunks[1], view, selected);
-    }
-
-    if input_mode {
-        render_input(frame, chunks[2], true, input);
-        render_status(frame, chunks[3], view);
-    } else {
-        render_status(frame, chunks[2], view);
-    }
-
     // Overlays on top.
     if let Some(ref err) = view.error {
         render_error_overlay(frame, area, err);
     }
     max_scroll
+}
+
+fn story_document_text(
+    view: &AppViewModel,
+    selected: usize,
+    input_mode: bool,
+    input: &InputBuffer,
+    story_stack: &[StoryStackEntry],
+    width: u16,
+) -> Text<'static> {
+    let mut lines = if story_stack.is_empty() {
+        markdown_lines(&view.narration)
+    } else {
+        story_stack_text(story_stack).lines
+    };
+    lines.extend([Line::from(""), divider_line(width), Line::from("")]);
+    lines.push(Line::from(Span::styled(
+        "선택지",
+        Style::default()
+            .fg(Color::LightCyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    if let Some(loading) = &view.loading {
+        lines.push(Line::from(Span::styled(
+            loading.message_ko.clone(),
+            Style::default().fg(Color::LightYellow),
+        )));
+        lines.push(Line::from(Span::styled(
+            "선택지는 생성이 끝나면 표시됩니다. [C] 취소",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        let choice_width = width.saturating_sub(2).max(1) as usize;
+        for (index, choice) in view.choices.iter().enumerate() {
+            let highlight = index == selected.min(view.choices.len().saturating_sub(1));
+            for (line_index, mut line) in
+                choice_lines(index, choice.label.as_str(), choice.risk, choice_width)
+                    .into_iter()
+                    .enumerate()
+            {
+                line.spans.insert(
+                    0,
+                    Span::raw(if line_index == 0 && highlight {
+                        "▶ "
+                    } else {
+                        "  "
+                    }),
+                );
+                if highlight {
+                    line.style = Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                        .add_modifier(Modifier::REVERSED);
+                }
+                lines.push(line);
+            }
+        }
+    }
+    if input_mode {
+        lines.extend([
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("직접 입력: {}▌", input.text()),
+                Style::default().fg(Color::White),
+            )),
+        ]);
+    }
+    lines.extend([Line::from(""), divider_line(width), status_line(view)]);
+    Text::from(lines)
+}
+
+fn divider_line(width: u16) -> Line<'static> {
+    Line::from(Span::styled(
+        "─".repeat(width.max(1) as usize),
+        Style::default().fg(Color::DarkGray),
+    ))
 }
 
 fn wrapped_line_count(text: &Text<'_>, width: u16) -> usize {
@@ -208,41 +257,6 @@ fn wrapped_line_count(text: &Text<'_>, width: u16) -> usize {
         .iter()
         .map(|line| line.width().max(1).div_ceil(width))
         .sum()
-}
-
-fn render_input(frame: &mut Frame, area: Rect, active: bool, input: &InputBuffer) {
-    let title = if active {
-        "직접 입력 · Enter 전송 · Esc 취소"
-    } else {
-        "직접 입력 [I]"
-    };
-    let text = if active {
-        format!("{}▌", input.text())
-    } else {
-        "원하는 행동이나 대사를 직접 입력할 수 있습니다.".to_string()
-    };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(if active {
-            Color::LightCyan
-        } else {
-            Color::DarkGray
-        }))
-        .title(Span::styled(
-            title,
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
-    frame.render_widget(
-        Paragraph::new(text)
-            .style(Style::default().fg(if active {
-                Color::White
-            } else {
-                Color::DarkGray
-            }))
-            .block(block)
-            .wrap(Wrap { trim: false }),
-        area,
-    );
 }
 
 fn story_stack_text(entries: &[StoryStackEntry]) -> Text<'static> {
@@ -278,40 +292,6 @@ fn story_stack_text(entries: &[StoryStackEntry]) -> Text<'static> {
         lines.extend(markdown_lines(&entry.narration));
     }
     Text::from(lines)
-}
-
-fn render_choice_loading(frame: &mut Frame, area: Rect, message: &str) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
-        .title(Span::styled(
-            "선택지 · 생성 중",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
-    let body = Text::from(vec![
-        Line::from(Span::styled(
-            message.to_string(),
-            Style::default().fg(Color::LightYellow),
-        )),
-        Line::from(Span::styled(
-            "선택지는 생성이 끝나면 표시됩니다. [C] 취소",
-            Style::default().fg(Color::DarkGray),
-        )),
-    ]);
-    frame.render_widget(
-        Paragraph::new(body)
-            .block(block)
-            .alignment(Alignment::Center)
-            .wrap(Wrap { trim: false }),
-        area,
-    );
-}
-
-/// Render the small Markdown subset used by Story Packs at the TUI boundary.
-fn markdown_text(input: &str) -> Text<'static> {
-    Text::from(markdown_lines(input))
 }
 
 fn markdown_lines(input: &str) -> Vec<Line<'static>> {
@@ -419,74 +399,6 @@ fn next_markdown_marker(input: &str) -> Option<(usize, &'static str)> {
         .min_by_key(|(index, marker)| (*index, std::cmp::Reverse(marker.len())))
 }
 
-fn render_choices(frame: &mut Frame, area: Rect, view: &AppViewModel, selected: usize) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(Span::styled(
-            "선택지",
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    // A List does not wrap its items itself. Build each choice as a multi-line
-    // item before rendering so Korean labels stay readable and selection still
-    // highlights the entire choice.
-    let content_width = choice_content_width(inner.width);
-    let items: Vec<ListItem> = view
-        .choices
-        .iter()
-        .enumerate()
-        .map(|(i, choice)| choice_item(i, choice.label.as_str(), choice.risk, content_width))
-        .collect();
-    let list = List::new(items)
-        .style(Style::default().fg(Color::White))
-        .highlight_style(
-            Style::default()
-                .add_modifier(Modifier::BOLD)
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::REVERSED),
-        )
-        .highlight_symbol("▶ ")
-        .highlight_spacing(HighlightSpacing::Always)
-        .repeat_highlight_symbol(true);
-
-    let mut state = ListState::default();
-    let count = view.choices.len();
-    if count > 0 {
-        state.select(Some(selected.min(count - 1)));
-    }
-    frame.render_stateful_widget(list, inner, &mut state);
-}
-
-fn choice_area_height(view: &AppViewModel, outer_width: u16) -> u16 {
-    let inner_width = outer_width.saturating_sub(2);
-    let content_width = choice_content_width(inner_width);
-    let rows = view
-        .choices
-        .iter()
-        .enumerate()
-        .map(|(index, choice)| {
-            choice_line_count(index, choice.label.as_str(), choice.risk, content_width)
-        })
-        .sum::<usize>()
-        .max(1);
-    (rows as u16).saturating_add(2)
-}
-
-fn choice_content_width(inner_width: u16) -> usize {
-    inner_width.saturating_sub("▶ ".width() as u16).max(1) as usize
-}
-
-fn choice_line_count(index: usize, label: &str, risk: RiskLevel, width: usize) -> usize {
-    choice_lines(index, label, risk, width).len()
-}
-
-fn choice_item(index: usize, label: &str, risk: RiskLevel, width: usize) -> ListItem<'static> {
-    ListItem::new(Text::from(choice_lines(index, label, risk, width)))
-}
-
 fn choice_lines(index: usize, label: &str, risk: RiskLevel, width: usize) -> Vec<Line<'static>> {
     let marker = format!("{}. ", index + 1);
     let continuation = " ".repeat(marker.width());
@@ -568,7 +480,7 @@ fn append_wrapped_word(
     }
 }
 
-fn render_status(frame: &mut Frame, area: Rect, view: &AppViewModel) {
+fn status_line(view: &AppViewModel) -> Line<'static> {
     let stat = |label: &str, v: Option<i16>| match v {
         Some(n) => format!("{label}:{n}"),
         None => format!("{label}:—"),
@@ -604,12 +516,7 @@ fn render_status(frame: &mut Frame, area: Rect, view: &AppViewModel) {
             ),
         ]);
     }
-    let line = Line::from(spans);
-    let block = Block::default()
-        .borders(Borders::TOP)
-        .border_style(Style::default().fg(Color::DarkGray));
-    let para = Paragraph::new(line).block(block);
-    frame.render_widget(para, area);
+    Line::from(spans)
 }
 
 fn render_error_overlay(frame: &mut Frame, area: Rect, err: &story_model::DomainErrorView) {
