@@ -523,6 +523,7 @@ fn reduce_accept(
             let mut restored = clone_state(state);
             restored.game = pending.checkpoint.clone();
             restored.pending = None;
+            restored.retry_pending = Some(pending.clone());
             restored.lineage = Vec::new();
             let view = build_view(&restored, pack, None, Some(error_view.clone()));
             Ok(Transition {
@@ -755,6 +756,7 @@ fn reduce_accept_director_plan(
             let mut restored = clone_state(state);
             restored.game = pending.checkpoint.clone();
             restored.pending = None;
+            restored.retry_pending = Some(pending.clone());
             restored.lineage = Vec::new();
             let view = build_view(&restored, pack, None, Some(error_view.clone()));
             Ok(Transition {
