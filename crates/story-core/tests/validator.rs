@@ -457,6 +457,17 @@ fn adjacent_location_passes() {
 }
 
 #[test]
+fn same_location_is_accepted_as_noop() {
+    let st = fresh_state(); // loc-classroom
+    let rules = fresh_rules();
+    let patch = StatePatch {
+        next_location: Some(LocationId("loc-classroom".to_string())),
+        ..StatePatch::default()
+    };
+    run(&st, &rules, &patch).expect("staying in the current location is valid");
+}
+
+#[test]
 fn nonadjacent_forced_by_event_passes() {
     let st = fresh_state(); // loc-classroom
     let mut rules = fresh_rules();

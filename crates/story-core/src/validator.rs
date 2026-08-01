@@ -346,6 +346,13 @@ fn check_location_transition(
         return Ok(());
     };
 
+    // Staying in the current location is a valid no-op. Location adjacency
+    // describes movement between distinct locations and usually does not list
+    // a location as adjacent to itself.
+    if next == &state.location {
+        return Ok(());
+    }
+
     // Exempt: an event in add_events whose force_location equals `next`.
     let event_forces_next = patch.add_events.iter().any(|ev_id| {
         rules
