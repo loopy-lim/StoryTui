@@ -11,6 +11,7 @@ pub mod error;
 pub mod eval;
 pub mod memory;
 pub mod memory_selector;
+pub mod narrative;
 pub mod prompt_context;
 pub mod redact;
 pub mod reducer;

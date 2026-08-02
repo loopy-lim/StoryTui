@@ -136,6 +136,42 @@ async fn generation_uses_sampling_values_from_provider_config() {
     assert!(body.get("top_k").is_none());
 }
 
+#[tokio::test]
+async fn short_valid_scene_gets_one_best_effort_expansion_without_becoming_an_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        // Return the same short fixture twice: the provider must retain the
+        // original valid scene rather than turn a quality target into failure.
+        .respond_with(ResponseTemplate::new(200).set_body_json(envelope(VALID_TURN)))
+        .mount(&server)
+        .await;
+
+    let mut config = cfg_for(&server);
+    config.min_narration_chars = 100;
+    let provider = OpenAiCompatibleProvider::new(config).expect("provider");
+    let draft = provider
+        .generate_turn(turn_request(), CancellationToken::new())
+        .await
+        .expect("a short but valid scene remains usable");
+    assert_eq!(draft.narration, "비가 그쳤다.");
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert_eq!(requests.len(), 2, "one quality retry is allowed");
+    let retry_body: serde_json::Value =
+        serde_json::from_slice(&requests[1].body).expect("JSON retry body");
+    assert!(
+        retry_body["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .any(|message| message["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("최소 100자"))),
+        "the retry must explicitly request the configured target length"
+    );
+}
+
 // --- model-list discovery --------------------------------------------------
 
 #[tokio::test]
@@ -307,6 +343,35 @@ async fn server_error_5xx_then_200_retried_once() {
 }
 
 #[tokio::test]
+async fn malformed_200_envelope_is_retried_then_valid_response_succeeds() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{truncated"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(envelope(VALID_TURN)))
+        .mount(&server)
+        .await;
+
+    let provider = OpenAiCompatibleProvider::new(cfg_for(&server)).expect("provider");
+    let draft = provider
+        .generate_turn(turn_request(), CancellationToken::new())
+        .await
+        .expect("a transient malformed envelope must recover");
+    assert_eq!(draft.narration, "비가 그쳤다.");
+    assert_eq!(
+        server.received_requests().await.expect("recorded").len(),
+        2,
+        "a malformed HTTP 200 envelope receives one retry"
+    );
+}
+
+#[tokio::test]
 async fn cancel_honored_no_retry_storm() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -373,6 +438,28 @@ async fn malformed_body_returns_invalid_generation() {
 }
 
 #[tokio::test]
+async fn malformed_http_envelope_stops_before_assistant_content_parsing() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        // This is not an OpenAI response envelope at all. It reproduces the
+        // same boundary as the live `response decode failed` log entries.
+        .respond_with(ResponseTemplate::new(200).set_body_string("{not-json"))
+        .mount(&server)
+        .await;
+
+    let provider = OpenAiCompatibleProvider::new(cfg_for(&server)).expect("provider");
+    let err = provider
+        .generate_turn(turn_request(), CancellationToken::new())
+        .await
+        .expect_err("invalid envelope must fail before assistant content parsing");
+    assert!(
+        matches!(err, ProviderError::Protocol(ref message) if message.starts_with("response decode failed:")),
+        "expected envelope decode error, got {err:?}"
+    );
+}
+
+#[tokio::test]
 async fn auto_fallback_retries_without_response_format_on_parse_failure() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -405,6 +492,44 @@ async fn auto_fallback_retries_without_response_format_on_parse_failure() {
     assert!(
         !provider.capabilities().supports_structured_output,
         "capability MUST be disabled for the session after the fallback"
+    );
+}
+
+#[tokio::test]
+async fn auto_retry_keeps_response_format_for_contract_failure() {
+    let server = MockServer::start().await;
+    // An unknown `risk` value is valid JSON but violates a game-contract enum.
+    // It must receive one lower-temperature retry while constrained decoding
+    // remains enabled.
+    let contract_invalid = VALID_TURN.replace("\"risk\":\"safe\"", "\"risk\":\"unknown\"");
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(envelope(&contract_invalid)))
+        .mount(&server)
+        .await;
+
+    let mut c = cfg_for(&server);
+    c.structured_output = StructuredOutputMode::Auto;
+    let provider = OpenAiCompatibleProvider::new(c).expect("provider");
+    let mut req = turn_request();
+    req.json_schema = Some(serde_json::json!({"type": "object"}));
+
+    let _ = provider
+        .generate_turn(req, CancellationToken::new())
+        .await
+        .expect_err("both contract-invalid replies must fail");
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 2, "one bounded contract retry is expected");
+    for request in &requests {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).expect("JSON request");
+        assert!(
+            body.get("response_format").is_some(),
+            "contract retry must retain constrained decoding"
+        );
+    }
+    assert!(
+        provider.capabilities().supports_structured_output,
+        "a contract error does not prove the server lacks structured-output support"
     );
 }
 

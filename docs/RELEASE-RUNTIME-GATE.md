@@ -35,7 +35,8 @@ app restart that restores the autosave checkpoint.
 # 1. Start the MLX server (separate terminal) on the loopback default.
 #    e.g. `mlx_lm.server --model mlx-community/<model> --host 127.0.0.1 --port 8080`
 
-# 2. Point the app at it and start a new game.
+# 2. Point the app at it and start a new game. The host loop is wired; the
+#    remaining gate is real-session evidence, not CLI plumbing.
 cargo run --release -p storytui -- \
     --provider-config ./path/to/your/provider.toml \
     --pack ./stories/rainy-reunion

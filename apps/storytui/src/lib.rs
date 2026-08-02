@@ -8,4 +8,5 @@
 #![warn(clippy::all)]
 
 pub mod bench;
+pub mod config;
 pub mod diagnostic;

@@ -333,3 +333,125 @@ fn different_recent_history_changes_hash() {
     let b2 = build_prompt(&pack, &state, &recent[..recent.len() - 1], None);
     assert_ne!(b1.hash, b2.hash, "hash must react to history changes");
 }
+
+fn recap_history_entry(turn: u32, narration: &str) -> HistoryEntry {
+    HistoryEntry {
+        id: uuid::Uuid::nil(),
+        turn,
+        scene_id: "cafe-reunion".to_string(),
+        created_at: chrono::DateTime::from_timestamp(1_700_000_000 + turn as i64, 0).unwrap(),
+        narration: narration.to_string(),
+        player_action: None,
+        choices: vec![],
+        applied_patch: StatePatch::default(),
+        generation_id: uuid::Uuid::nil(),
+    }
+}
+
+#[test]
+fn earlier_turns_beyond_the_window_appear_as_a_recap() {
+    // Regression guard for content regression: when the session is longer than
+    // the recent window, the turns before it must come back as a compact recap
+    // so the model keeps long-term continuity instead of repeating old beats.
+    let (pack, state, _) = fixture(false);
+    // 6 turns with a window of 4 ⇒ turns 1–2 are recap, turns 3–6 are recent.
+    let recent = vec![
+        recap_history_entry(1, "오래전 첫 만남의 장면이다."),
+        recap_history_entry(2, "두 번째 장면, 비가 내렸다."),
+        recap_history_entry(3, "세 번째 장면이다."),
+        recap_history_entry(4, "네 번째 장면이다."),
+        recap_history_entry(5, "다섯 번째 장면이다."),
+        recap_history_entry(6, "여섯 번째 장면, 가장 최근이다."),
+    ];
+    let bundle = build_prompt(&pack, &state, &recent, None);
+
+    assert!(
+        bundle.user.contains("# Earlier story (recap"),
+        "recap header must appear when history exceeds the window"
+    );
+    // Older turns are summarized in the recap.
+    assert!(bundle.user.contains("오래전 첫 만남"));
+    assert!(bundle.user.contains("두 번째 장면"));
+    // The recent window is still rendered in full.
+    assert!(bundle.user.contains("# Recent turns"));
+    assert!(bundle.user.contains("여섯 번째 장면"));
+    // The recap must NOT reproduce the most recent turn (that lives in Recent).
+    let recent_section = bundle
+        .user
+        .split("# Recent turns")
+        .nth(1)
+        .unwrap_or_default();
+    assert!(!recent_section.contains("오래전 첫 만남"));
+}
+
+#[test]
+fn short_session_has_no_recap_section() {
+    // Sessions within the recent window must stay byte-identical (no recap
+    // header), so the golden snapshot and short-turn prompts are unaffected.
+    let (pack, state, recent) = fixture(false);
+    let bundle = build_prompt(&pack, &state, &recent, None);
+    assert!(!bundle.user.contains("# Earlier story"));
+}
+
+#[test]
+fn recent_arc_renders_from_stored_summaries() {
+    let (pack, mut state, _) = fixture(false);
+    state.recent_summaries.extend([
+        "유나가 경계하며 한 발 물러섰다".to_string(),
+        "유나가 창밖만 바라본다".to_string(),
+    ]);
+    // Same length as history ⇒ aligned ⇒ stored digests are used verbatim.
+    let recent = vec![
+        recap_history_entry(1, "무시할 서사 1."),
+        recap_history_entry(2, "무시할 서사 2."),
+    ];
+    let bundle = build_prompt(&pack, &state, &recent, None);
+    assert!(bundle.user.contains("# Recent arc"));
+    assert!(bundle.user.contains("유나가 경계하며 한 발 물러섰다"));
+}
+
+#[test]
+fn repetition_note_fires_when_a_motif_is_shared() {
+    let (pack, state, _) = fixture(false);
+    // No stored summaries ⇒ alignment false ⇒ digests derived from narration;
+    // every narration shares "커피".
+    let recent: Vec<HistoryEntry> = (1..=6)
+        .map(|t| recap_history_entry(t, &format!("유나가 커피를 {t}번 내렸다")))
+        .collect();
+    let bundle = build_prompt(&pack, &state, &recent, None);
+    assert!(
+        bundle.user.contains("# 반복 감지"),
+        "expected a repetition note: {}",
+        bundle.user
+    );
+    assert!(bundle.user.contains("커피"));
+}
+
+#[test]
+fn no_repetition_note_when_each_turn_differs() {
+    let (pack, state, _) = fixture(false);
+    let recent = vec![
+        recap_history_entry(1, "유나가 웃었다."),
+        recap_history_entry(2, "편지가 발견됐다."),
+    ];
+    let bundle = build_prompt(&pack, &state, &recent, None);
+    assert!(!bundle.user.contains("# 반복 감지"));
+}
+
+#[test]
+fn anti_repeat_phrase_block_is_gone() {
+    // The surface-level # Anti-repeat list was replaced by the richer
+    // # Recent arc + # 반복 감지 blocks.
+    let (pack, state, recent) = fixture(false);
+    let bundle = build_prompt(&pack, &state, &recent, None);
+    assert!(!bundle.user.contains("# Anti-repeat"));
+}
+
+#[test]
+fn empty_history_has_no_recent_arc_block() {
+    let (pack, state, _) = fixture(false);
+    let bundle = build_prompt(&pack, &state, &[], None);
+    assert!(!bundle.user.contains("# Recent arc"));
+    assert!(!bundle.user.contains("# 반복 감지"));
+}
+

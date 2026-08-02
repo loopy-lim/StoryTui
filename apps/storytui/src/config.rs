@@ -13,6 +13,11 @@ pub struct FileConfig {
     pub save_dir: PathBuf,
     #[serde(default)]
     pub player: PlayerProfile,
+    /// Maintainer-only two-stage Director → Writer rollout switch. It remains
+    /// off until the local-model quality gate has been satisfied; it is not a
+    /// player-facing story control.
+    #[serde(default)]
+    pub use_director_writer: bool,
 }
 
 /// Player identity injected into the model prompt for this local session.
@@ -64,7 +69,10 @@ pub fn user_settings_path(save_dir: &Path) -> PathBuf {
     save_dir.join("user-settings.toml")
 }
 
-fn load_user_settings(save_dir: &Path) -> Result<UserSettings, String> {
+/// Load the persisted player-controlled generation preferences. The host uses
+/// this when it updates one field (such as the selected model) so existing
+/// overrides are preserved.
+pub fn load_user_settings(save_dir: &Path) -> Result<UserSettings, String> {
     let path = user_settings_path(save_dir);
     if !path.exists() {
         return Ok(UserSettings::default());
@@ -144,6 +152,7 @@ impl Default for FileConfig {
             provider: ProviderConfig::defaults(),
             save_dir: default_save_dir(),
             player: PlayerProfile::default(),
+            use_director_writer: false,
         }
     }
 }
@@ -157,6 +166,7 @@ pub struct RuntimeConfig {
     pub provider: ProviderConfig,
     pub save_dir: PathBuf,
     pub player: PlayerProfile,
+    pub use_director_writer: bool,
     pub pack_dir: PathBuf,
     pub source_path: Option<PathBuf>,
 }
@@ -276,6 +286,7 @@ pub fn load(cli: &CliOptions) -> Result<RuntimeConfig, String> {
         provider: file.provider,
         save_dir: file.save_dir,
         player: file.player,
+        use_director_writer: file.use_director_writer,
         pack_dir,
         source_path,
     })

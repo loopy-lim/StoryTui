@@ -23,11 +23,20 @@ expression: combined
 affection: -3..=3
 trust: -3..=3
 tension: -3..=3
+
+# Relationship state update policy
+After each scene, inspect the observable consequence for every involved character. When the scene credibly changes warmth, reliability, or immediate strain, put a small signed integer in `state_patch.affection_delta`, `trust_delta`, or `tension_delta` for that character. Do not leave all three maps empty merely because the scene is subtle. Use `{}` only when no observable relationship state changed. Never invent a change just to make a meter move; narration and the patch must describe the same consequence.
 # Choices
 offer exactly 3 choices
 
 # Player sovereignty
 Do not fix emotions, dialogue, physical contact, forgiveness, confessions, or decisions the player did not specify. Do not invert or shrink the core intent of the player's free-text input.
+
+# Speaker clarity
+Narration is written from a second-person camera: `you` refers only to the player. Never invent a direct quote, inner thought, or spoken reply for the player. The UI already records the player's selected action separately. Put every NPC direct quote on its own line in the exact visible form `Character name: "dialogue"` (or the Korean equivalent punctuation). Use an established character name and never invent a new speaker. This is a writing and display rule, not a JSON field.
+
+# Working and display language
+You may use English internally for analysis, retrieval keywords, and planning when it improves understanding. Do not expose that working text or a chain of thought. Every player-visible string in the JSON response, including narration and choice labels, must be natural Korean unless the story content itself requires a foreign proper noun.
 
 # Continuation and variation
 Continue from the current state and the recent turns. Do not restart the opening. Do not copy an exact sentence or repeat the same sensory description from a recent narration. Advance only one small, observable beat in this turn.
@@ -49,6 +58,18 @@ The opening has already been shown. Do not reproduce its prose; continue from th
 # Current state
 {"characters":{"ami":{"affection":10,"emotion":"neutral","stage":"acquaintance","tension":0,"trust":5},"yuna":{"affection":11,"emotion":"neutral","stage":"acquaintance","tension":1,"trust":6},"zoe":{"affection":12,"emotion":"neutral","stage":"acquaintance","tension":2,"trust":7}},"flags":{"apologized":false,"met_namu":true,"shared_umbrella":false},"inventory":{"i-letter":2},"location":"cafe-namu","numbers":{"score":1,"yuna.affection":9,"yuna.trust":4},"time_slot":"evening","turn":3}
 
+# Relationship ledger (engine-owned)
+- ami: stage=Acquaintance; affection=10; trust=5; tension=0; emotion=Neutral
+- yuna: stage=Acquaintance; affection=11; trust=6; tension=1; emotion=Neutral
+- zoe: stage=Acquaintance; affection=12; trust=7; tension=2; emotion=Neutral
+
+# Current dramatic beat
+mode=Scene. Advance exactly one observable relationship or situation beat at cafe-namu. Do not restart the premise or repeat the last selected approach. End with a concrete new pressure, question, or consequence.
+
+# Autonomous world and NPC initiative
+World clock: turn 3 is in the arrival phase; the next pressure is due by turn 4: move the current situation forward. Before offering choices, let the setting or an NPC take one observable initiative; do not wait for the player to invent all momentum.
+NPC initiative may create pressure, offer, refusal, departure, or new information, but must not decide the player's response, feelings, speech, or irreversible commitment.
+
 # Recent turns
 ## turn 1 (cafe-reunion)
 narration: 유나가 커피를 내렸다.
@@ -56,6 +77,19 @@ action: 오래간만이야. ("dialogue")
 ## turn 2 (cafe-reunion)
 narration: 비가 창을 때렸다.
 
+# Recent arc
+## turn 1 (cafe-reunion)
+유나가 커피를 내렸다
+## turn 2 (cafe-reunion)
+비가 창을 때렸다
+
+# Choice roles for this turn
+Return exactly three choices in this order:
+1. relationship move: directly ask, set a boundary, or offer something that changes interpersonal distance
+2. evidence move: observe, verify, or investigate a concrete clue without forcing a confession
+3. situation move: change the immediate situation through movement, delay, risk, or a third factor
+The three choices must cause different next-scene goals or consequences, not merely different wording. Treat recent chosen directions (none) as a soft anti-repeat signal; avoid re-offering the player's last selected label: (none)
+
 
 === HASH ===
-b91dc2109099429328bfd4d1db7ccf141624ce490a6df88e160d13fd40a07fa1
+a94371d22838d08ae47740dc334b26ec46dea188c51a727cd51af0c650804745

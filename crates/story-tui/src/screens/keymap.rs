@@ -42,6 +42,14 @@ pub const KEYMAP: &[KeymapRow] = &[
         action_ko: "생성 취소 (로딩 중)",
     },
     KeymapRow {
+        key: "o",
+        action_ko: "게임 중 설정 열기",
+    },
+    KeymapRow {
+        key: "Home",
+        action_ko: "시작 메뉴로 이동",
+    },
+    KeymapRow {
         key: "Esc",
         action_ko: "오류 닫기",
     },

@@ -9,7 +9,7 @@ pub mod event;
 pub mod input;
 pub mod screens;
 
-pub use app::{App, SaveLoadMode, SaveLoadRequest};
+pub use app::{App, HomeRequest, SaveLoadMode, SaveLoadRequest};
 pub use event::{KeyAction, SELECT_SENTINEL, map_key, parse_direct_select_index};
 pub use screens::save_load::{
     MIN_HEIGHT as SAVE_LOAD_MIN_HEIGHT, MIN_WIDTH as SAVE_LOAD_MIN_WIDTH, render_save_load,

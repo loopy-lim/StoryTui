@@ -269,6 +269,37 @@ fn malformed_single_quoted_object_is_rejected() {
 }
 
 #[test]
+fn truncated_json_is_classified_as_json_syntax() {
+    let raw = &VALID_BODY[..VALID_BODY.len() - 1];
+    let err = expect_err(raw);
+    assert!(
+        err.to_string().contains("json_syntax:"),
+        "truncated JSON must be distinguishable from a schema mismatch: {err}"
+    );
+}
+
+#[test]
+fn valid_json_with_non_uuid_history_id_is_discarded_as_advisory_metadata() {
+    let raw = VALID_BODY.replace(
+        "\"source_history_ids\": []",
+        "\"source_history_ids\": [\"turn-one\"]",
+    );
+    let outcome =
+        parse_generated_turn(&raw, GID).expect("advisory history ids must not reject a scene");
+    assert!(
+        outcome.draft.summary.source_history_ids.is_empty(),
+        "unknown aliases are dropped before UUID deserialization"
+    );
+    assert!(
+        outcome
+            .repairs
+            .iter()
+            .any(|repair| repair.contains("normalized compatible")),
+        "the tolerant normalization is observable for diagnostics"
+    );
+}
+
+#[test]
 fn bare_dialogue_quotes_are_repaired_without_weakening_the_contract() {
     let raw = VALID_BODY.replace(
         "비가 그쳤다.",
@@ -306,8 +337,88 @@ fn empty_and_null_responses_are_rejected_as_invalid_generation() {
 }
 
 // ---------------------------------------------------------------------------
+// reasoning / thinking blocks (Qwen3, DeepSeek-R1, …)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn qwen3_thinking_block_with_braces_is_stripped_before_locating_json() {
+    // A hybrid reasoning model reasons about the JSON shape *inside* `<think>`,
+    // embedding `{`/`}`. The old first-'{'..last-'}' locator captured from the
+    // brace inside the thinking, corrupting the slice. Stripping the block first
+    // must yield the clean JSON object.
+    let raw = format!(
+        "<think>장면을 구성한다. 출력은 {{\"narration\": \"...\", \"choices\": [...]}} 형태의 JSON 객체 하나다. \
+         선택지는 서로 다른 방향으로 3개. 감정 변화가 있으면 state_patch에 반영한다.</think>\n{VALID_BODY}"
+    );
+    let outcome = parse_generated_turn(&raw, GID).expect("thinking block must be stripped");
+    assert!(
+        outcome
+            .repairs
+            .iter()
+            .any(|r| r.contains("reasoning") || r.contains("thinking")),
+        "a repair must be recorded: {:?}",
+        outcome.repairs
+    );
+    assert_eq!(outcome.draft.narration, "비가 그쳤다.");
+}
+
+#[test]
+fn thinking_tag_is_stripped_case_insensitively() {
+    let raw = format!("<THINK>사고</THINK>{VALID_BODY}");
+    let outcome = parse_generated_turn(&raw, GID).expect("case-insensitive tag stripped");
+    assert_eq!(outcome.draft.narration, "비가 그쳤다.");
+}
+
+#[test]
+fn unclosed_thinking_block_is_rejected_cleanly_without_raw_leak() {
+    // Truncated generation: the model opened `<think>` and hit the token cap
+    // before closing it or emitting any JSON. The parser must fail cleanly
+    // (InvalidGeneration) rather than feed CoT prose to the JSON locator.
+    let raw = "<think>장면을 구상 중이다. 유나가 찻잔을 내려놓고";
+    let err = expect_err(raw);
+    assert!(matches!(err, ProviderError::InvalidGeneration(_)));
+}
+
+#[test]
+fn json_before_a_trailing_think_block_still_locates() {
+    // Some servers splice reasoning after the answer. The JSON must still be
+    // located even when thinking (with braces) trails it.
+    let raw = format!(
+        "{VALID_BODY}\n<think>사후 사고 {{\"x\":1}}</think>"
+    );
+    let outcome = parse_generated_turn(&raw, GID).expect("JSON before thinking must parse");
+    assert_eq!(outcome.draft.narration, "비가 그쳤다.");
+}
+
+#[test]
+fn non_uuid_history_ids_survive_a_thinking_corrupted_response() {
+    // Production log: "UUID parsing failed: invalid character: found `t` at 0"
+    // — a non-UUID provenance id (e.g. "turn-1") reached the Uuid deserializer,
+    // most likely via a JSON slice corrupted by a leading <think> block whose
+    // bare braces threw off the old first-'{'..last-'}' locator. After
+    // thinking-strip + balanced locate + the retain guard, bad ids must be
+    // discarded and the scene must parse.
+    let body = VALID_BODY.replace(
+        "\"source_history_ids\": []",
+        "\"source_history_ids\": [\"turn-1\", \"turn-2\", \"not-a-uuid\"]",
+    );
+    let raw = format!(
+        "<think>정리하자. 출력은 {{\"narration\":...}} 형태고 source_history_ids에 turn-N 값을 둔다.</think>\n{body}"
+    );
+    let outcome = parse_generated_turn(&raw, GID)
+        .expect("bad provenance ids must be discarded, not fatal");
+    assert!(
+        outcome.draft.summary.source_history_ids.is_empty(),
+        "non-UUID provenance ids must be dropped: {:?}",
+        outcome.draft.summary.source_history_ids
+    );
+}
+
+// ---------------------------------------------------------------------------
 // integration: MockProvider + recovery path (Draft is pre-parsed)
 // ---------------------------------------------------------------------------
+
+
 
 #[tokio::test]
 async fn mock_draft_round_trips_through_parser() {

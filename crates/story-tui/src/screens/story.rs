@@ -27,6 +27,7 @@ pub const MIN_HEIGHT: u16 = 16;
 pub enum ListMode {
     History,
     Memory,
+    ModelPicker,
 }
 
 /// One immutable block in the chronological story transcript.
@@ -34,6 +35,8 @@ pub enum ListMode {
 pub struct StoryStackEntry {
     pub turn: u32,
     pub scene_id: String,
+    /// Model used for this response when known in the current runtime.
+    pub model: Option<String>,
     pub player_action: Option<String>,
     pub narration: String,
 }
@@ -42,6 +45,7 @@ pub fn render_list(frame: &mut Frame, area: Rect, mode: ListMode, items: &[Strin
     let title = match mode {
         ListMode::History => "이전 생성 기록",
         ListMode::Memory => "기억 목록",
+        ListMode::ModelPicker => "모델 선택",
     };
     let rows: Vec<Line> = if items.is_empty() {
         vec![Line::from("아직 기록이 없습니다.")]
@@ -64,8 +68,44 @@ pub fn render_list(frame: &mut Frame, area: Rect, mode: ListMode, items: &[Strin
     frame.render_widget(paragraph, area);
 }
 
+pub fn render_model_picker(frame: &mut Frame, area: Rect, items: &[String], selected: usize) {
+    let rows: Vec<Line> = if items.is_empty() {
+        vec![Line::from("모델 목록을 불러오지 못했습니다.")]
+    } else {
+        items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let active = index == selected.min(items.len().saturating_sub(1));
+                Line::styled(
+                    format!("{} {}", if active { "▶" } else { " " }, item),
+                    if active {
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD)
+                            .add_modifier(Modifier::REVERSED)
+                    } else {
+                        Style::default().fg(Color::Gray)
+                    },
+                )
+            })
+            .collect()
+    };
+    let paragraph = Paragraph::new(rows)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::LightCyan))
+                .title("모델 선택 · R 새로고침 · ↑↓ 이동 · Enter 적용 · Esc 닫기"),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(Clear, area);
+    frame.render_widget(paragraph, area);
+}
+
 /// Render the Story screen for `view`, highlighting `selected` (clamped to the
 /// choice count). `selected` is an index into `view.choices`.
+#[allow(clippy::too_many_arguments)] // rendering inputs stay safe at the UI boundary
 pub fn render_story(
     frame: &mut Frame,
     area: Rect,
@@ -75,6 +115,7 @@ pub fn render_story(
     input_mode: bool,
     input: &InputBuffer,
     story_stack: &[StoryStackEntry],
+    streaming_narration: Option<&str>,
 ) -> u16 {
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         render_min_size_warning(frame, area);
@@ -130,7 +171,17 @@ pub fn render_story(
         ])
         .split(body)
     };
-    let narration_text = if story_stack.is_empty() {
+    let narration_text = if let Some(streaming) = streaming_narration {
+        let mut entries = story_stack.to_vec();
+        entries.push(StoryStackEntry {
+            turn: view.status.turn.saturating_add(1),
+            scene_id: "작성 중".to_string(),
+            model: None,
+            player_action: None,
+            narration: streaming.to_string(),
+        });
+        story_stack_text(&entries)
+    } else if story_stack.is_empty() {
         Text::from(markdown_lines(&view.narration))
     } else {
         story_stack_text(story_stack)
@@ -186,6 +237,97 @@ pub fn render_story(
     max_scroll
 }
 
+/// Return the choice under `row` using the same wrapped-line layout as the
+/// renderer. The host uses this to turn a left click into a choice command.
+pub fn choice_index_at(
+    area: Rect,
+    view: &AppViewModel,
+    input_mode: bool,
+    row: u16,
+) -> Option<usize> {
+    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT || view.loading.is_some() {
+        return None;
+    }
+    let frame_chunks = Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).split(area);
+    let body = frame_chunks[1];
+    let choice_height = choice_panel_height(view, body.width);
+    let chunks = if input_mode {
+        Layout::vertical([
+            Constraint::Fill(3),
+            Constraint::Length(choice_height),
+            Constraint::Length(3),
+            Constraint::Length(2),
+        ])
+        .split(body)
+    } else {
+        Layout::vertical([
+            Constraint::Fill(3),
+            Constraint::Length(choice_height),
+            Constraint::Length(2),
+        ])
+        .split(body)
+    };
+    let choice_area = chunks[1];
+    let content_start = choice_area.y.saturating_add(1);
+    let mut cursor = content_start;
+    let width = choice_area.width.saturating_sub(4).max(1) as usize;
+    for (index, choice) in view.choices.iter().enumerate() {
+        let line_count = choice_lines(index, &choice.label, choice.risk, width).len() as u16;
+        if row >= cursor && row < cursor.saturating_add(line_count) {
+            return Some(index);
+        }
+        cursor = cursor.saturating_add(line_count);
+    }
+    None
+}
+
+/// Whether a click lands on the visible `[Home] 홈` shortcut in the status
+/// panel. Keeping the hit test beside the renderer prevents the label from
+/// becoming a keyboard-only affordance.
+pub fn home_shortcut_at(
+    area: Rect,
+    view: &AppViewModel,
+    input_mode: bool,
+    column: u16,
+    row: u16,
+) -> bool {
+    if area.width < MIN_WIDTH
+        || area.height < MIN_HEIGHT
+        || view.status.turn == 0
+        || view.loading.is_some()
+        || view.error.is_some()
+    {
+        return false;
+    }
+    let frame_chunks = Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).split(area);
+    let body = frame_chunks[1];
+    let choice_height = choice_panel_height(view, body.width);
+    let status_area = if input_mode {
+        Layout::vertical([
+            Constraint::Fill(3),
+            Constraint::Length(choice_height),
+            Constraint::Length(3),
+            Constraint::Length(2),
+        ])
+        .split(body)[3]
+    } else {
+        Layout::vertical([
+            Constraint::Fill(3),
+            Constraint::Length(choice_height),
+            Constraint::Length(2),
+        ])
+        .split(body)[2]
+    };
+    let shortcut = "[Home] 홈";
+    let start = area
+        .x
+        .saturating_add(status_values_prefix(view).width() as u16)
+        .saturating_add(4);
+    row == status_area.y.saturating_add(1)
+        && column >= start
+        && column < start.saturating_add(shortcut.width() as u16)
+}
+
 fn wrapped_line_count(text: &Text<'_>, width: u16) -> usize {
     let width = width.max(1) as usize;
     text.lines
@@ -211,6 +353,12 @@ fn story_stack_text(entries: &[StoryStackEntry]) -> Text<'static> {
                 .fg(Color::LightCyan)
                 .add_modifier(Modifier::BOLD),
         )));
+        if let Some(model) = &entry.model {
+            lines.push(Line::from(Span::styled(
+                format!("모델 · {model}"),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
         if let Some(action) = &entry.player_action {
             lines.push(Line::from(Span::styled(
                 "당신의 선택",
@@ -233,6 +381,21 @@ fn markdown_lines(input: &str) -> Vec<Line<'static>> {
     input
         .lines()
         .map(|raw| {
+            if let Some((speaker, dialogue)) = speaker_dialogue_line(raw) {
+                let speaker_style = if matches!(speaker, "당신" | "플레이어") {
+                    Style::default()
+                        .fg(Color::LightCyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                        .fg(Color::LightMagenta)
+                        .add_modifier(Modifier::BOLD)
+                };
+                let dialogue_style = Style::default().fg(Color::LightYellow);
+                let mut spans = vec![Span::styled(format!("{speaker}: "), speaker_style)];
+                spans.extend(inline_markdown(dialogue, dialogue_style));
+                return Line::from(spans);
+            }
             let dialogue = raw
                 .trim_start()
                 .chars()
@@ -282,6 +445,29 @@ fn markdown_lines(input: &str) -> Vec<Line<'static>> {
             Line::from(spans)
         })
         .collect()
+}
+
+/// Recognize only the safe dialogue contract used in generated narration.
+///
+/// Keeping this presentation-only and conservative avoids treating ordinary
+/// prose such as URLs or explanations with a colon as a speaker label.
+fn speaker_dialogue_line(raw: &str) -> Option<(&str, &str)> {
+    let trimmed = raw.trim();
+    let separator = trimmed.find([':', '：'])?;
+    let (speaker, rest) = trimmed.split_at(separator);
+    let speaker = speaker.trim();
+    let separator_len = rest.chars().next()?.len_utf8();
+    let dialogue = rest[separator_len..].trim_start();
+    let begins_with_quote = dialogue
+        .chars()
+        .next()
+        .is_some_and(|c| matches!(c, '"' | '“' | '「' | '『'));
+
+    (begins_with_quote
+        && !speaker.is_empty()
+        && speaker.chars().count() <= 24
+        && !speaker.chars().any(char::is_whitespace))
+    .then_some((speaker, dialogue))
 }
 
 fn inline_markdown(input: &str, base: Style) -> Vec<Span<'static>> {
@@ -361,7 +547,7 @@ fn render_choice_panel(frame: &mut Frame, area: Rect, view: &AppViewModel, selec
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Span::styled(
-            "선택지",
+            format!("선택지 · 현재 시간: {}", time_slot_label(view.time_slot)),
             Style::default().add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
@@ -510,22 +696,8 @@ fn append_wrapped_word(
 }
 
 fn status_line(view: &AppViewModel) -> Line<'static> {
-    let stat = |label: &str, v: Option<i16>| match v {
-        Some(n) => format!("{label}:{n}"),
-        None => format!("{label}:—"),
-    };
-    let mut spans = vec![
-        Span::raw(stat("애정", view.status.affection)),
-        Span::raw("  "),
-        Span::raw(stat("신뢰", view.status.trust)),
-        Span::raw("  "),
-        Span::raw(stat("긴장", view.status.tension)),
-        Span::raw("  "),
-        Span::styled(
-            format!("턴: {}", view.status.turn),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-    ];
+    let values = status_values_prefix(view);
+    let mut spans = vec![Span::raw(values)];
     if view.status.turn == 0 && view.choices.is_empty() && view.loading.is_none() {
         spans.extend([
             Span::raw("    "),
@@ -540,12 +712,26 @@ fn status_line(view: &AppViewModel) -> Line<'static> {
         spans.extend([
             Span::raw("    "),
             Span::styled(
-                "[S] 저장  [L] 불러오기",
+                "[Home] 홈  [O] 설정  [S] 저장  [L] 불러오기",
                 Style::default().fg(Color::DarkGray),
             ),
         ]);
     }
     Line::from(spans)
+}
+
+fn status_values_prefix(view: &AppViewModel) -> String {
+    let stat = |label: &str, v: Option<i16>| match v {
+        Some(n) => format!("{label}:{n}"),
+        None => format!("{label}:—"),
+    };
+    format!(
+        "{}  {}  {}  턴: {}",
+        stat("애정", view.status.affection),
+        stat("신뢰", view.status.trust),
+        stat("긴장", view.status.tension),
+        view.status.turn
+    )
 }
 
 fn render_error_overlay(frame: &mut Frame, area: Rect, err: &story_model::DomainErrorView) {
@@ -561,7 +747,13 @@ fn render_error_overlay(frame: &mut Frame, area: Rect, err: &story_model::Domain
     let w = (err.message_ko.width() as u16 + 4)
         .max(title.width() as u16 + 4)
         .min(area.width);
-    let h = 5u16;
+    // Server/protocol details can be much wider than a terminal. Paragraph
+    // does not wrap by default, so calculate the wrapped body height before
+    // centering the overlay; the message then remains inside its border.
+    let inner_width = w.saturating_sub(2).max(1);
+    let h = (wrapped_line_count(&body, inner_width) as u16 + 2)
+        .max(5)
+        .min(area.height);
     let centered = centered_rect(area, w, h);
     frame.render_widget(Clear, centered);
     let block = Block::default()
@@ -571,7 +763,7 @@ fn render_error_overlay(frame: &mut Frame, area: Rect, err: &story_model::Domain
             title,
             Style::default().add_modifier(Modifier::BOLD),
         ));
-    let para = Paragraph::new(body).block(block);
+    let para = Paragraph::new(body).block(block).wrap(Wrap { trim: false });
     frame.render_widget(para, centered);
 }
 
@@ -631,5 +823,35 @@ fn risk_color(r: RiskLevel) -> Color {
         RiskLevel::Medium => Color::Yellow,
         RiskLevel::High => Color::LightRed,
         RiskLevel::Severe => Color::Red,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::speaker_dialogue_line;
+
+    #[test]
+    fn recognizes_explicit_npc_speaker_line() {
+        assert_eq!(
+            speaker_dialogue_line("유나: “정말 오랜만이네요.”"),
+            Some(("유나", "“정말 오랜만이네요.”"))
+        );
+        assert_eq!(
+            speaker_dialogue_line("유나： \"기다렸어요.\""),
+            Some(("유나", "\"기다렸어요.\""))
+        );
+    }
+
+    #[test]
+    fn does_not_misclassify_regular_colon_prose_as_dialogue() {
+        assert_eq!(speaker_dialogue_line("주소: https://example.test"), None);
+        assert_eq!(
+            speaker_dialogue_line("\"누구지?\" 하고 당신은 생각했다."),
+            None
+        );
+        assert_eq!(
+            speaker_dialogue_line("긴 설명 문장: \"따옴표가 있어도 화자명은 아니다\""),
+            None
+        );
     }
 }

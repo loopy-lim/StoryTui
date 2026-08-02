@@ -46,6 +46,16 @@ pub struct ProviderConfig {
     /// Model id to target. Defaults to empty — the operator must set this.
     #[serde(default)]
     pub model: String,
+    /// Optional environment variable whose value is sent as a Bearer token.
+    /// The secret itself is never serialized or stored in diagnostics.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    /// Optional file containing the Bearer token. The loaded secret is kept
+    /// only in memory and is skipped by serde/diagnostic projections.
+    #[serde(default)]
+    pub api_key_file: Option<String>,
+    #[serde(skip)]
+    pub api_key: Option<String>,
     /// Sampling temperature.
     #[serde(default = "default_temperature")]
     pub temperature: f32,
@@ -58,6 +68,11 @@ pub struct ProviderConfig {
     /// Maximum output tokens per turn.
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
+    /// Soft lower target for narration length. `0` disables the optional
+    /// quality retry; a short but valid response is never rejected solely for
+    /// this setting.
+    #[serde(default)]
+    pub min_narration_chars: usize,
     /// Per-request deadline in milliseconds.
     #[serde(default = "default_request_timeout_ms")]
     pub request_timeout_ms: u64,
@@ -86,16 +101,26 @@ impl ProviderConfig {
             chat_path: default_chat_path(),
             health_path: default_health_path(),
             model: String::new(),
+            api_key_env: None,
+            api_key_file: None,
+            api_key: None,
             temperature: default_temperature(),
             top_p: default_top_p(),
             top_k: default_top_k(),
             max_tokens: default_max_tokens(),
+            min_narration_chars: 0,
             request_timeout_ms: default_request_timeout_ms(),
             connect_timeout_ms: default_connect_timeout_ms(),
             max_retries: default_max_retries(),
             context_budget_tokens: default_context_budget_tokens(),
             structured_output: default_structured_output(),
         }
+    }
+}
+
+impl Default for ProviderConfig {
+    fn default() -> Self {
+        Self::defaults()
     }
 }
 

@@ -145,6 +145,11 @@ pub struct ChatCompletionResponse {
 struct Choice {
     #[serde(default)]
     message: Option<ResponseMessage>,
+    /// OpenAI-compatible servers use this to distinguish a normal completion
+    /// (`stop`) from an output cap (`length`). It is diagnostic metadata only;
+    /// the game contract still validates the assistant content independently.
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -188,6 +193,13 @@ impl ChatCompletionResponse {
             completion_tokens,
             total_tokens,
         })
+    }
+
+    /// The first choice's server-reported termination reason, when present.
+    pub fn finish_reason(&self) -> Option<&str> {
+        self.choices
+            .first()
+            .and_then(|c| c.finish_reason.as_deref())
     }
 }
 

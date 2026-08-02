@@ -4,12 +4,13 @@ A frank list of what StoryTUI does **not** do as of W11. Read this alongside
 [RELEASE-RUNTIME-GATE.md](./RELEASE-RUNTIME-GATE.md) (the open runtime
 items) and [INSTALL.md](./INSTALL.md).
 
-## Interactive host loop is library-tested only
+## Interactive host loop is connected
 
-The binary `apps/storytui` currently prints a banner only. The interactive
-event pump — `crossterm` event stream → `App::handle_key` →
-`EngineCommand` → `reduce` → `provider.generate_turn` → `AcceptGeneration`
-→ publish view — is **not wired in `main.rs`**. What IS tested:
+The binary `apps/storytui` now runs the interactive event pump:
+`crossterm` event stream → `App::handle_key` → `EngineCommand` → `reduce` →
+`provider.generate_turn` → `AcceptGeneration` → publish view. Provider
+failures restore the last stable checkpoint and render a recoverable error.
+What remains to prove with runtime evidence:
 
 - The full engine flow against a `MockProvider` over a 100-turn synthetic
   soak (`crates/story-core/tests/soak.rs`).
@@ -21,8 +22,9 @@ event pump — `crossterm` event stream → `App::handle_key` →
 - The deterministic benchmark runner
   (`apps/storytui/tests/bench.rs`).
 
-Wiring the host loop is the next code-side milestone after W11. Until then,
-the project is a library, not a playable game.
+The host loop is playable with a reachable, authenticated OpenAI-compatible
+server. A real 100-turn session is still an open release gate because the
+automated long-run suite uses MockProvider.
 
 ## MVP quality metrics are pending a real model
 
@@ -77,8 +79,10 @@ proprietary auth flows, SDKs, or non-OpenAI wire shapes are intentionally
 out of scope. A cloud provider that speaks the OpenAI shape (e.g.
 `openrouter`) will work; one that does not, will not.
 
-## No settings persistence
+## Settings are profile-based
 
-The Settings screen renders the current provider config + sampling
-parameters; it does not yet write changes back to a TOML profile. A future
-host loop wires the writer.
+The current Settings contract is a TOML profile plus CLI overrides. The
+renderer is still read-only, but `config/storytui.toml` supplies the provider
+URL, selected model, authentication file/environment variable, sampling,
+timeouts, retry budget, context budget, and save directory. In-app editing and
+writing a profile remain a future UX improvement.

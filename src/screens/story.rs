@@ -46,14 +46,22 @@ pub fn render_story(frame: &mut Frame, area: Rect, view: &AppViewModel, selected
     let title_line = Line::from(vec![
         Span::styled(
             view.story_title.clone(),
-            Style::default().add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" · "),
-        Span::raw(view.chapter.clone()),
-        Span::raw(" · "),
-        Span::raw(view.location_display.clone()),
-        Span::raw(" · "),
-        Span::raw(time_slot_label(view.time_slot)),
+        Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+        Span::styled(view.chapter.clone(), Style::default().fg(Color::Gray)),
+        Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            view.location_display.clone(),
+            Style::default().fg(Color::Gray),
+        ),
+        Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            time_slot_label(view.time_slot),
+            Style::default().fg(Color::LightCyan),
+        ),
     ]);
     let title_block = Block::default()
         .borders(Borders::TOP)
@@ -77,8 +85,8 @@ pub fn render_story(frame: &mut Frame, area: Rect, view: &AppViewModel, selected
     .split(body);
 
     // Narration.
-    let narration_style = Style::default().fg(Color::Gray);
-    let narration = Paragraph::new(Text::from(view.narration.clone()))
+    let narration_style = Style::default().fg(Color::Reset);
+    let narration = Paragraph::new(markdown_text(&view.narration))
         .wrap(Wrap { trim: false })
         .style(narration_style);
     frame.render_widget(narration, chunks[0]);
@@ -95,6 +103,117 @@ pub fn render_story(frame: &mut Frame, area: Rect, view: &AppViewModel, selected
     } else if let Some(ref loading) = view.loading {
         render_loading_overlay(frame, area, &loading.message_ko);
     }
+}
+
+/// Render the small Markdown subset used by Story Packs at the TUI boundary.
+fn markdown_text(input: &str) -> Text<'static> {
+    let lines = input
+        .lines()
+        .map(|raw| {
+            let dialogue = raw
+                .trim_start()
+                .chars()
+                .next()
+                .is_some_and(|c| matches!(c, '"' | '“' | '「' | '『'));
+            let (prefix, body, style) = if let Some(rest) = raw.strip_prefix("### ") {
+                (
+                    "",
+                    rest,
+                    Style::default()
+                        .fg(Color::LightCyan)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else if let Some(rest) = raw.strip_prefix("## ") {
+                (
+                    "",
+                    rest,
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else if let Some(rest) = raw.strip_prefix("# ") {
+                (
+                    "",
+                    rest,
+                    Style::default()
+                        .fg(Color::LightCyan)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else if let Some(rest) = raw.strip_prefix("- ").or_else(|| raw.strip_prefix("* ")) {
+                ("• ", rest, Style::default().fg(Color::Gray))
+            } else if let Some(rest) = raw.strip_prefix("> ") {
+                ("│ ", rest, Style::default().fg(Color::LightYellow))
+            } else {
+                (
+                    "",
+                    raw,
+                    if dialogue {
+                        Style::default().fg(Color::LightYellow)
+                    } else {
+                        Style::default().fg(Color::Reset)
+                    },
+                )
+            };
+            let mut spans = vec![Span::styled(prefix.to_string(), style)];
+            spans.extend(inline_markdown(body, style));
+            Line::from(spans)
+        })
+        .collect();
+    Text::from(lines)
+}
+
+fn inline_markdown(input: &str, base: Style) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut rest = input;
+    while let Some((start, marker)) = next_markdown_marker(rest) {
+        if start > 0 {
+            spans.push(Span::styled(rest[..start].to_string(), base));
+        }
+        let after = &rest[start + marker.len()..];
+
+        if marker == "[" {
+            let Some(label_end) = after.find("](") else {
+                spans.push(Span::styled(rest[start..].to_string(), base));
+                return spans;
+            };
+            let Some(url_end) = after[label_end + 2..].find(')') else {
+                spans.push(Span::styled(rest[start..].to_string(), base));
+                return spans;
+            };
+            spans.push(Span::styled(
+                after[..label_end].to_string(),
+                base.fg(Color::LightBlue).add_modifier(Modifier::UNDERLINED),
+            ));
+            rest = &after[label_end + 2 + url_end + 1..];
+            continue;
+        }
+
+        let Some(end) = after.find(marker) else {
+            spans.push(Span::styled(rest[start..].to_string(), base));
+            return spans;
+        };
+        let style = match marker {
+            "~~" => base.add_modifier(Modifier::CROSSED_OUT),
+            "`" => base
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
+            "*" | "_" => base.add_modifier(Modifier::ITALIC),
+            _ => base.add_modifier(Modifier::BOLD),
+        };
+        spans.push(Span::styled(after[..end].to_string(), style));
+        rest = &after[end + marker.len()..];
+    }
+    if !rest.is_empty() {
+        spans.push(Span::styled(rest.to_string(), base));
+    }
+    spans
+}
+
+fn next_markdown_marker(input: &str) -> Option<(usize, &'static str)> {
+    ["**", "__", "~~", "`", "*", "_", "["]
+        .into_iter()
+        .filter_map(|marker| input.find(marker).map(|index| (index, marker)))
+        .min_by_key(|(index, marker)| (*index, std::cmp::Reverse(marker.len())))
 }
 
 fn render_choices(frame: &mut Frame, area: Rect, view: &AppViewModel, selected: usize) {

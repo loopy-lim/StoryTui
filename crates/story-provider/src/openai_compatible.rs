@@ -28,7 +28,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{ProviderConfig, StructuredOutputMode};
 use crate::envelope::ChatCompletionRequest;
-use crate::recovery::parse_generated_turn;
+use crate::recovery::{parse_generated_turn, strip_reasoning};
 use crate::sse::{SseEvent, SseParser};
 
 /// Maximum backoff cap. The exponential backoff starts at `BASE_BACKOFF_MS`.
@@ -197,6 +197,11 @@ impl OpenAiCompatibleProvider {
         self.loopback
     }
 
+    /// Model id pinned into requests created by this provider instance.
+    pub fn model_name(&self) -> &str {
+        &self.config.model
+    }
+
     fn structured_enabled(&self) -> bool {
         self.structured_supported.load(Ordering::Relaxed)
     }
@@ -290,17 +295,66 @@ impl OpenAiCompatibleProvider {
                 return Err(ProviderError::Protocol(format!("HTTP {}", status.as_u16())));
             }
 
-            // 2xx: decode the envelope (serde-tolerant).
-            let parsed: crate::envelope::ChatCompletionResponse = match resp.json().await {
-                Ok(p) => p,
+            // A 2xx status does not guarantee that a local server completed
+            // its body. Read it explicitly so a truncated/malformed envelope
+            // is diagnosed without logging raw model output, then treat it as
+            // a transient server response and use the configured retry budget.
+            let envelope_body = match resp.text().await {
+                Ok(body) => body,
                 Err(e) => {
-                    return Err(ProviderError::Protocol(format!(
-                        "response decode failed: {e}"
-                    )));
+                    // A large/slow local model can blow the request deadline
+                    // while the body is still streaming. reqwest marks that as a
+                    // timeout: surface it as `Timeout` (player sees "시간 초과"
+                    // and knows to raise `request_timeout_ms` or lower
+                    // `max_tokens`) rather than a generic protocol error.
+                    let timed_out = e.is_timeout();
+                    tracing::warn!(
+                        target: "story_provider::openai_compatible",
+                        generation_id = %request.generation_id,
+                        model = %self.config.model,
+                        http_status = %status,
+                        timed_out,
+                        error = %e,
+                        "chat-completion response body read failed"
+                    );
+                    if attempt + 1 < max_attempts {
+                        Self::sleep_or_cancel(attempt, cancel).await?;
+                        continue;
+                    }
+                    return Err(if timed_out {
+                        ProviderError::Timeout {
+                            ms: self.config.request_timeout_ms,
+                        }
+                    } else {
+                        ProviderError::Protocol(format!("response body read failed: {e}"))
+                    });
                 }
             };
+            let parsed: crate::envelope::ChatCompletionResponse =
+                match story_model::serde_json::from_str(&envelope_body) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "story_provider::openai_compatible",
+                            generation_id = %request.generation_id,
+                            model = %self.config.model,
+                            http_status = %status,
+                            response_chars = envelope_body.chars().count(),
+                            error = %e,
+                            "chat-completion envelope decode failed; retrying if budget remains"
+                        );
+                        if attempt + 1 < max_attempts {
+                            Self::sleep_or_cancel(attempt, cancel).await?;
+                            continue;
+                        }
+                        return Err(ProviderError::Protocol(format!(
+                            "response decode failed: {e}"
+                        )));
+                    }
+                };
             let content = parsed.content();
             let usage = parsed.usage();
+            let finish_reason = parsed.finish_reason().unwrap_or("missing").to_string();
             return match parse_generated_turn(&content, request.generation_id) {
                 Ok(outcome) => {
                     let mut draft = outcome.draft;
@@ -311,7 +365,18 @@ impl OpenAiCompatibleProvider {
                     }
                     Ok(draft)
                 }
-                Err(e) => Err(e),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "story_provider::openai_compatible",
+                        generation_id = %request.generation_id,
+                        model = %self.config.model,
+                        finish_reason,
+                        assistant_content_chars = content.chars().count(),
+                        error = %e,
+                        "assistant content rejected by game response contract"
+                    );
+                    Err(e)
+                }
             };
         }
         // Defensive: all attempts hit the transient-retry path without returning.
@@ -319,6 +384,48 @@ impl OpenAiCompatibleProvider {
             "retry budget exhausted".to_string(),
         ))
     }
+}
+
+/// Only envelope-level failures indicate that the server ignored constrained
+/// decoding. Contract-level failures should retain `response_format` for the
+/// bounded repair retry.
+fn is_json_envelope_failure(detail: &str) -> bool {
+    detail.starts_with("json_extract:") || detail.starts_with("json_syntax:")
+}
+
+fn narration_char_count(draft: &GeneratedTurnDraft) -> usize {
+    draft.narration.chars().count()
+}
+
+fn length_repair_request(
+    request: &TurnRequest,
+    first: &GeneratedTurnDraft,
+    min_chars: usize,
+) -> TurnRequest {
+    let mut retry = request.clone();
+    // Anchor the rewrite on the model's own first answer so the expansion
+    // deepens the SAME scene — same events, choices, and state_patch — instead
+    // of regenerating a fresh, possibly earlier or divergent, scene. Without
+    // this assistant turn, a weaker model sees only two consecutive user
+    // messages and tends to drift or repeat a prior beat.
+    let anchor = story_model::serde_json::json!({
+        "narration": first.narration,
+        "choices": first.choices,
+        "state_patch": first.proposed_patch,
+        "summary": first.summary,
+    });
+    retry.messages.push(story_model::ChatMessage {
+        role: "assistant".to_string(),
+        content: story_model::serde_json::to_string(&anchor)
+            .unwrap_or_else(|_| first.narration.clone()),
+    });
+    retry.messages.push(story_model::ChatMessage {
+        role: "user".to_string(),
+        content: format!(
+            "위 응답은 JSON 계약을 지켰지만 장면 본문(narration)이 짧습니다. 같은 사건과 같은 choices·state_patch를 유지하면서 narration만 최소 {min_chars}자의 풍부한 한국어 본문으로 다시 씁니다. 감각 묘사·대화·행동·감정 변화를 여러 문단으로 포함하고, 동일한 구조의 JSON 객체 하나만 반환하세요."
+        ),
+    });
+    retry
 }
 
 #[derive(serde::Deserialize)]
@@ -444,15 +551,48 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
         cancel: CancellationToken,
     ) -> Result<GeneratedTurnDraft, ProviderError> {
         match self.do_generate(&request, false, &cancel, None).await {
+            Ok(draft)
+                if self.config.min_narration_chars > 0
+                    && narration_char_count(&draft) < self.config.min_narration_chars =>
+            {
+                let first_len = narration_char_count(&draft);
+                tracing::info!(
+                    target: "story_provider::openai_compatible",
+                    generation_id = %request.generation_id,
+                    model = %self.config.model,
+                    first_narration_chars = first_len,
+                    min_narration_chars = self.config.min_narration_chars,
+                    "short valid scene; requesting one best-effort expansion"
+                );
+                let retry = length_repair_request(&request, &draft, self.config.min_narration_chars);
+                match self
+                    .do_generate(&retry, false, &cancel, Some(self.config.temperature))
+                    .await
+                {
+                    Ok(expanded) if narration_char_count(&expanded) >= first_len => Ok(expanded),
+                    Ok(_) => Ok(draft),
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "story_provider::openai_compatible",
+                            generation_id = %request.generation_id,
+                            error = %error,
+                            "length expansion failed; keeping the first valid scene"
+                        );
+                        Ok(draft)
+                    }
+                }
+            }
             Ok(draft) => Ok(draft),
-            // Auto-fallback: if structured output was on and the body still
-            // failed to parse, disable the capability for the session and retry
-            // once WITHOUT response_format. The store(false) makes future turns
-            // skip response_format too.
-            Err(ProviderError::InvalidGeneration(_detail))
+            // Auto-fallback is only for a server that ignored or could not
+            // produce the JSON envelope at all. A `schema:`/`validation:`
+            // failure means structured output did run, but the model produced
+            // a value that violates the game contract; dropping the schema for
+            // that retry makes the next answer less reliable.
+            Err(ProviderError::InvalidGeneration(detail))
                 if self.config.structured_output == StructuredOutputMode::Auto
                     && request.json_schema.is_some()
-                    && self.structured_enabled() =>
+                    && self.structured_enabled()
+                    && is_json_envelope_failure(&detail) =>
             {
                 tracing::warn!(
                     target: "story_provider::openai_compatible",
@@ -460,6 +600,21 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
                 );
                 self.disable_structured();
                 self.do_generate(&request, true, &cancel, Some(0.2)).await
+            }
+            // Keep constrained decoding for a contract-level retry. The
+            // bounded retry runs at the deterministic lower temperature and
+            // cannot recurse through this outer `generate_turn` match.
+            Err(ProviderError::InvalidGeneration(detail))
+                if self.config.structured_output == StructuredOutputMode::Auto
+                    && request.json_schema.is_some()
+                    && self.structured_enabled() =>
+            {
+                tracing::warn!(
+                    target: "story_provider::openai_compatible",
+                    error = %detail,
+                    "structured-output contract failure; retrying with response_format"
+                );
+                self.do_generate(&request, false, &cancel, Some(0.2)).await
             }
             Err(ProviderError::InvalidGeneration(_))
                 if self.config.structured_output == StructuredOutputMode::On =>
@@ -552,8 +707,11 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
             // Strict parse into DirectorPlan. The model is contractually
             // expected to emit exactly this shape; any drift ⇒ InvalidGeneration
             // (sanitized detail via the serde error, which never embeds the
-            // raw body).
-            let plan: DirectorPlan = serde_json::from_str(&content).map_err(|e| {
+            // raw body). Strip a leading `<think>` block first so a hybrid
+            // reasoning model cannot corrupt the JSON the same way it can on the
+            // single-call path.
+            let cleaned = strip_reasoning(&content);
+            let plan: DirectorPlan = serde_json::from_str(&cleaned).map_err(|e| {
                 ProviderError::InvalidGeneration(format!("director plan strict parse failed: {e}"))
             })?;
             return Ok(plan);

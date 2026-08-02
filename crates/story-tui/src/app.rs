@@ -10,25 +10,50 @@
 //! storytui`) owns the event loop and the `EngineState`.
 
 use std::cell::Cell;
+use std::collections::BTreeMap;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use story_core::engine_cmd::EngineCommand;
 use story_model::uuid::Uuid;
 use story_model::{ActionType, AppViewModel, ParsedAction};
+use story_model::{ProviderConfigSafe, ProviderHealth};
 use story_persistence::SlotMeta;
 
 use crate::event::{KeyAction, SELECT_SENTINEL, map_key, parse_direct_select_index};
 use crate::input::InputBuffer;
+use crate::screens::home::{menu_selection_at, render_home};
 use crate::screens::save_load::render_save_load;
-use crate::screens::story::{ListMode, StoryStackEntry, render_list, render_story};
+use crate::screens::settings::{SettingsView, render_settings};
+use crate::screens::story::{
+    ListMode, StoryStackEntry, choice_index_at, home_shortcut_at, render_list, render_model_picker,
+    render_story,
+};
 
 /// Which manual save manager the host should open.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SaveLoadMode {
     Save,
     Load,
+}
+
+/// A launcher action that requires host-owned state or I/O.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HomeRequest {
+    StartNew,
+    Continue,
+    ReturnToGame,
+}
+
+#[derive(Clone, Debug)]
+struct SettingsState {
+    provider: ProviderConfigSafe,
+    health: ProviderHealth,
+    temperature: f32,
+    top_p: f32,
+    top_k: u32,
+    max_tokens: u32,
 }
 
 /// Filesystem work requested by the UI. The host owns all actual save I/O.
@@ -62,6 +87,7 @@ pub struct App {
     /// Latest layout-derived maximum narration offset. This lets input clamp
     /// a follow-end sentinel before moving upward.
     narration_max_scroll: Cell<u16>,
+    last_render_area: Cell<Rect>,
     /// Whether custom free-text input is active.
     pub input_mode: bool,
     /// Grapheme-safe custom input buffer.
@@ -71,11 +97,30 @@ pub struct App {
     /// Display-ready history and memory rows supplied by the host.
     pub history_items: Vec<String>,
     pub memory_items: Vec<String>,
+    /// Models advertised by the active OpenAI-compatible provider.
+    pub model_items: Vec<String>,
+    pub model_selected: usize,
+    selected_model: Option<String>,
+    model_reload_requested: bool,
+    mouse_command: Option<EngineCommand>,
     /// Chronological narration stack shown in the main story pane.
     pub story_stack: Vec<StoryStackEntry>,
+    /// Ephemeral Writer text while the internal Director → Writer path is
+    /// streaming. It is never saved and is replaced by the accepted turn.
+    streaming_narration: Option<String>,
     pub list_scroll: u16,
     save_load: Option<SaveLoadState>,
     save_load_request: Option<SaveLoadRequest>,
+    home_visible: bool,
+    home_selected: usize,
+    can_continue: bool,
+    home_continue_returns_to_game: bool,
+    home_request: Option<HomeRequest>,
+    settings: Option<SettingsState>,
+    settings_visible: bool,
+    settings_opened: bool,
+    settings_returns_home: bool,
+    generation_models: BTreeMap<Uuid, String>,
 }
 
 impl App {
@@ -87,16 +132,137 @@ impl App {
             should_quit: false,
             narration_scroll: 0,
             narration_max_scroll: Cell::new(0),
+            last_render_area: Cell::new(Rect::default()),
             input_mode: false,
             input: InputBuffer::new(500),
             list_mode: None,
             history_items: Vec::new(),
             memory_items: Vec::new(),
+            model_items: Vec::new(),
+            model_selected: 0,
+            selected_model: None,
+            model_reload_requested: false,
+            mouse_command: None,
             story_stack: Vec::new(),
+            streaming_narration: None,
             list_scroll: 0,
             save_load: None,
             save_load_request: None,
+            home_visible: false,
+            home_selected: 0,
+            can_continue: false,
+            home_continue_returns_to_game: false,
+            home_request: None,
+            settings: None,
+            settings_visible: false,
+            settings_opened: false,
+            settings_returns_home: false,
+            generation_models: BTreeMap::new(),
         }
+    }
+
+    pub fn set_models(&mut self, models: Vec<String>, current_model: &str) {
+        self.model_items = models;
+        self.model_selected = self
+            .model_items
+            .iter()
+            .position(|id| id == current_model)
+            .unwrap_or(0);
+    }
+
+    /// Replace the advertised models after a manual reload without needlessly
+    /// moving the highlighted row when that model remains available.
+    pub fn refresh_models(&mut self, models: Vec<String>, current_model: &str) {
+        let highlighted = self.model_items.get(self.model_selected).cloned();
+        self.model_items = models;
+        self.model_selected = highlighted
+            .as_deref()
+            .and_then(|id| {
+                self.model_items
+                    .iter()
+                    .position(|candidate| candidate == id)
+            })
+            .or_else(|| self.model_items.iter().position(|id| id == current_model))
+            .unwrap_or(0);
+    }
+
+    pub fn take_selected_model(&mut self) -> Option<String> {
+        self.selected_model.take()
+    }
+
+    /// Consume a model-picker request to refresh the server list.
+    pub fn take_model_reload_requested(&mut self) -> bool {
+        std::mem::take(&mut self.model_reload_requested)
+    }
+
+    /// Consume an engine command requested through a mouse click.
+    pub fn take_mouse_command(&mut self) -> Option<EngineCommand> {
+        self.mouse_command.take()
+    }
+
+    /// Supply the redacted configuration and health details for the Settings
+    /// screen. Secrets never enter this UI state.
+    pub fn set_settings(
+        &mut self,
+        provider: ProviderConfigSafe,
+        health: ProviderHealth,
+        temperature: f32,
+        top_p: f32,
+        top_k: u32,
+        max_tokens: u32,
+    ) {
+        self.settings = Some(SettingsState {
+            provider,
+            health,
+            temperature,
+            top_p,
+            top_k,
+            max_tokens,
+        });
+    }
+
+    pub fn set_can_continue(&mut self, can_continue: bool) {
+        self.can_continue = can_continue;
+        if !can_continue && self.home_selected == 1 {
+            self.home_selected = 0;
+        }
+    }
+
+    /// Show the launcher. Kept safe so headless Story-screen consumers
+    /// can still construct an `App` directly without a launcher transition.
+    pub fn show_home(&mut self) {
+        self.home_visible = true;
+        self.home_continue_returns_to_game = false;
+    }
+
+    /// Return to the launcher without discarding the current in-memory game.
+    pub fn open_home_from_game(&mut self) {
+        self.home_visible = true;
+        self.can_continue = true;
+        self.home_continue_returns_to_game = true;
+        self.home_selected = 1;
+    }
+
+    /// Leave the launcher and reveal the already-published story view.
+    pub fn close_home(&mut self) {
+        self.home_visible = false;
+    }
+
+    /// Consume the pending launcher action for the host to fulfill.
+    pub fn take_home_request(&mut self) -> Option<HomeRequest> {
+        self.home_request.take()
+    }
+
+    /// Returns true once for each entry into Settings, so the host can refresh
+    /// the provider's model list without putting HTTP in the UI crate.
+    pub fn take_settings_opened(&mut self) -> bool {
+        std::mem::take(&mut self.settings_opened)
+    }
+
+    /// Associate a completed response with the provider model that produced it.
+    /// Existing saves lack this runtime-only provenance and remain unlabeled.
+    pub fn record_generation_model(&mut self, generation_id: Uuid, model: String) {
+        self.generation_models.insert(generation_id, model);
     }
 
     /// Replace the view (e.g. the host published a new one). Clamps the
@@ -110,6 +276,9 @@ impl App {
             self.selected = count - 1;
         }
         self.view = view;
+        if self.view.loading.is_none() {
+            self.streaming_narration = None;
+        }
         // Once a later turn is committed, follow the newest scene at the
         // bottom of the chronological stack. `u16::MAX` is intentionally a
         // sentinel: the renderer clamps it to the exact wrapped-line limit
@@ -119,6 +288,24 @@ impl App {
         } else if self.view.status.turn < previous_turn {
             self.narration_scroll = 0;
         }
+    }
+
+    /// Append an internal Writer stream fragment for the active generation.
+    /// Late chunks are ignored, preserving the generation-id safety boundary.
+    pub fn push_writer_chunk(&mut self, generation_id: Uuid, text: &str) {
+        if self
+            .view
+            .loading
+            .as_ref()
+            .map(|loading| loading.generation_id)
+            != Some(generation_id)
+        {
+            return;
+        }
+        self.streaming_narration
+            .get_or_insert_with(String::new)
+            .push_str(text);
+        self.follow_story_end();
     }
 
     /// Refresh the auxiliary list data from the host-owned engine state.
@@ -141,6 +328,7 @@ impl App {
             .map(|entry| StoryStackEntry {
                 turn: entry.turn,
                 scene_id: entry.scene_id.clone(),
+                model: self.generation_models.get(&entry.generation_id).cloned(),
                 player_action: entry
                     .player_action
                     .as_ref()
@@ -183,6 +371,13 @@ impl App {
             .collect();
     }
 
+    /// Move the narration viewport to the latest committed scene. The exact
+    /// offset depends on terminal width, so the renderer resolves this
+    /// sentinel against its wrapped-line count on the next draw.
+    pub fn follow_story_end(&mut self) {
+        self.narration_scroll = u16::MAX;
+    }
+
     /// Handle one key. `pending_generation_id` lets `c` resolve to the real
     /// pending id (the keymap emits `Uuid::nil()` and the App fills it in).
     /// Returns `Some(EngineCommand)` when the host should run one.
@@ -191,6 +386,10 @@ impl App {
         key: KeyEvent,
         pending_generation_id: Option<Uuid>,
     ) -> Option<EngineCommand> {
+        if self.home_visible {
+            self.handle_home_key(key);
+            return None;
+        }
         if self.save_load.is_some() {
             self.handle_save_load_key(key);
             return None;
@@ -216,8 +415,53 @@ impl App {
                 }
                 KeyCode::PageUp => self.list_scroll = self.list_scroll.saturating_sub(5),
                 KeyCode::PageDown => self.list_scroll = self.list_scroll.saturating_add(5),
+                KeyCode::Char('r' | 'ㄱ') if self.list_mode == Some(ListMode::ModelPicker) => {
+                    self.model_reload_requested = true;
+                }
+                KeyCode::Up | KeyCode::Char('k' | 'ㅏ')
+                    if self.list_mode == Some(ListMode::ModelPicker) =>
+                {
+                    self.model_selected = self.model_selected.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j' | 'ㅓ')
+                    if self.list_mode == Some(ListMode::ModelPicker) =>
+                {
+                    self.model_selected =
+                        (self.model_selected + 1).min(self.model_items.len().saturating_sub(1));
+                }
+                KeyCode::Enter if self.list_mode == Some(ListMode::ModelPicker) => {
+                    self.selected_model = self.model_items.get(self.model_selected).cloned();
+                    self.list_mode = None;
+                }
                 _ => {}
             }
+            return None;
+        }
+        if self.settings_visible {
+            match key.code {
+                KeyCode::Esc => {
+                    // Keep the last safe settings projection. Esc only changes
+                    // navigation; dropping this data made the next Settings
+                    // entry fall through to the Story screen.
+                    self.settings_visible = false;
+                    self.home_visible = self.settings_returns_home;
+                }
+                KeyCode::Char('p' | 'ㅔ') => {
+                    self.list_mode = Some(ListMode::ModelPicker);
+                }
+                KeyCode::Char('q' | 'ㅂ') => self.should_quit = true,
+                _ => {}
+            }
+            return None;
+        }
+        if matches!(key.code, KeyCode::Char('o' | 'ㅐ')) {
+            self.settings_visible = true;
+            self.settings_opened = true;
+            self.settings_returns_home = false;
+            return None;
+        }
+        if key.code == KeyCode::Home && self.view.loading.is_none() {
+            self.open_home_from_game();
             return None;
         }
         // While a turn is being generated, choices must stay visually and
@@ -295,17 +539,45 @@ impl App {
 
     /// Render the Story screen for the current view.
     pub fn render(&self, frame: &mut Frame, area: Rect) {
+        self.last_render_area.set(area);
+        if self.home_visible {
+            render_home(frame, area, self.home_selected, self.can_continue);
+            return;
+        }
         if let Some(state) = &self.save_load {
             let (title, footer) = save_load_copy(state);
             render_save_load(frame, area, title, &state.slots, state.selected, footer);
             return;
         }
         if let Some(mode) = self.list_mode {
+            if mode == ListMode::ModelPicker {
+                render_model_picker(frame, area, &self.model_items, self.model_selected);
+                return;
+            }
             let items = match mode {
                 ListMode::History => &self.history_items,
                 ListMode::Memory => &self.memory_items,
+                ListMode::ModelPicker => unreachable!("rendered above"),
             };
             render_list(frame, area, mode, items, self.list_scroll);
+            return;
+        }
+        if self.settings_visible
+            && let Some(settings) = &self.settings
+        {
+            render_settings(
+                frame,
+                area,
+                &SettingsView {
+                    provider: &settings.provider,
+                    health: settings.health,
+                    temperature: settings.temperature,
+                    top_p: settings.top_p,
+                    top_k: settings.top_k,
+                    max_tokens: settings.max_tokens,
+                    theme_name: "default",
+                },
+            );
             return;
         }
         let max_scroll = render_story(
@@ -317,6 +589,7 @@ impl App {
             self.input_mode,
             &self.input,
             &self.story_stack,
+            self.streaming_narration.as_deref(),
         );
         self.narration_max_scroll.set(max_scroll);
     }
@@ -346,12 +619,51 @@ impl App {
         if self.save_load.is_some() {
             return;
         }
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            let area = self.last_render_area.get();
+            if self.home_visible {
+                if let Some(selection) = menu_selection_at(area, mouse.row) {
+                    self.home_selected = selection;
+                    self.choose_home(selection);
+                }
+                return;
+            }
+            if self.list_mode == Some(ListMode::ModelPicker) {
+                let index = mouse.row.saturating_sub(area.y.saturating_add(1)) as usize;
+                if let Some(model) = self.model_items.get(index).cloned() {
+                    self.model_selected = index;
+                    self.selected_model = Some(model);
+                    self.list_mode = None;
+                }
+                return;
+            }
+            if self.settings_visible && mouse.row == area.y.saturating_add(4) {
+                // The model row is the second line in the provider block.
+                self.list_mode = Some(ListMode::ModelPicker);
+                return;
+            }
+            if home_shortcut_at(area, &self.view, self.input_mode, mouse.column, mouse.row) {
+                self.open_home_from_game();
+                return;
+            }
+            if self.view.error.is_none()
+                && let Some(index) = choice_index_at(area, &self.view, self.input_mode, mouse.row)
+                && let Some(choice) = self.view.choices.get(index)
+            {
+                self.selected = index;
+                self.mouse_command = Some(EngineCommand::SubmitChoice {
+                    choice_id: choice.id.clone(),
+                });
+                return;
+            }
+        }
         let delta: i32 = match mouse.kind {
-            // Terminals deliver trackpad movement as a series of wheel
-            // events. One wrapped line per event feels continuous and avoids
-            // jumping past prose while reading upward.
-            MouseEventKind::ScrollUp => -1,
-            MouseEventKind::ScrollDown => 1,
+            // Trackpads can emit wheel events much faster than a terminal can
+            // repaint. Moving only one wrapped line per event makes a fast
+            // flick feel as though input was dropped. Three lines retains
+            // reading precision while keeping up with a quick wheel gesture.
+            MouseEventKind::ScrollUp => -3,
+            MouseEventKind::ScrollDown => 3,
             _ => return,
         };
         if self.list_mode.is_some() {
@@ -374,7 +686,15 @@ impl App {
         self.narration_scroll = if delta < 0 {
             current.saturating_sub(delta.unsigned_abs() as u16)
         } else {
-            current.saturating_add(delta as u16).min(max_scroll)
+            // Reaching the known bottom restores the sentinel. This keeps the
+            // transcript pinned after a resize or a new render discovers more
+            // wrapped lines than the previous frame did.
+            let next = current.saturating_add(delta as u16);
+            if self.narration_scroll == u16::MAX || next >= max_scroll {
+                u16::MAX
+            } else {
+                next
+            }
         };
     }
 
@@ -423,6 +743,54 @@ impl App {
                     SaveLoadMode::Load => {}
                 }
             }
+            _ => {}
+        }
+    }
+
+    fn handle_home_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('q' | 'ㅂ') => self.should_quit = true,
+            KeyCode::Up | KeyCode::Char('k' | 'ㅏ') => {
+                self.home_selected = self.home_selected.saturating_sub(1);
+                if !self.can_continue && self.home_selected == 1 {
+                    self.home_selected = 0;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j' | 'ㅓ') => {
+                self.home_selected = (self.home_selected + 1).min(3);
+                if !self.can_continue && self.home_selected == 1 {
+                    self.home_selected = 2;
+                }
+            }
+            KeyCode::Char('n' | 'ㅜ') => self.choose_home(0),
+            KeyCode::Char('c' | 'ㅊ') if self.can_continue => self.choose_home(1),
+            KeyCode::Char('s' | 'ㄴ') => self.choose_home(2),
+            KeyCode::Enter => self.choose_home(self.home_selected),
+            _ => {}
+        }
+    }
+
+    fn choose_home(&mut self, selection: usize) {
+        match selection {
+            0 => {
+                self.home_visible = false;
+                self.home_request = Some(HomeRequest::StartNew);
+            }
+            1 if self.can_continue => {
+                self.home_visible = false;
+                self.home_request = Some(if self.home_continue_returns_to_game {
+                    HomeRequest::ReturnToGame
+                } else {
+                    HomeRequest::Continue
+                });
+            }
+            2 => {
+                self.home_visible = false;
+                self.settings_visible = true;
+                self.settings_opened = true;
+                self.settings_returns_home = true;
+            }
+            3 => self.should_quit = true,
             _ => {}
         }
     }
@@ -685,7 +1053,7 @@ mod tests {
         });
 
         assert_eq!(
-            app.narration_scroll, 19,
+            app.narration_scroll, 17,
             "the first upward wheel event must leave follow-end, not count down from u16::MAX"
         );
     }
@@ -777,5 +1145,181 @@ mod tests {
             u16::MAX,
             "new scene follows the bottom"
         );
+    }
+
+    #[test]
+    fn home_menu_emits_start_and_continue_requests() {
+        let mut app = App::new(sample_view(0));
+        app.set_can_continue(true);
+        app.show_home();
+
+        app.handle_key(key(KeyCode::Enter), None);
+        assert_eq!(app.take_home_request(), Some(HomeRequest::StartNew));
+
+        app.show_home();
+        app.handle_key(key(KeyCode::Down), None);
+        app.handle_key(key(KeyCode::Enter), None);
+        assert_eq!(app.take_home_request(), Some(HomeRequest::Continue));
+    }
+
+    #[test]
+    fn home_key_opens_launcher_and_continue_returns_to_current_game() {
+        let mut app = App::new(sample_view(1));
+        app.handle_key(key(KeyCode::Home), None);
+        assert!(app.home_visible);
+        app.handle_key(key(KeyCode::Enter), None);
+        assert_eq!(app.take_home_request(), Some(HomeRequest::ReturnToGame));
+    }
+
+    #[test]
+    fn settings_entry_requests_model_refresh_and_accepts_choice() {
+        let mut app = App::new(sample_view(0));
+        app.set_settings(
+            ProviderConfigSafe {
+                base_url: "http://127.0.0.1:8000".to_string(),
+                model: "a".to_string(),
+                structured_output: "auto".to_string(),
+                request_timeout_ms: 1_000,
+                connect_timeout_ms: 1_000,
+                max_retries: 0,
+                is_loopback: true,
+            },
+            ProviderHealth::Ready,
+            0.7,
+            0.9,
+            40,
+            1_200,
+        );
+        app.show_home();
+        app.handle_key(key(KeyCode::Down), None);
+        app.handle_key(key(KeyCode::Enter), None);
+        assert!(app.take_settings_opened());
+
+        app.set_models(vec!["a".to_string(), "b".to_string()], "a");
+        app.handle_key(key(KeyCode::Char('p')), None);
+        app.handle_key(key(KeyCode::Down), None);
+        app.handle_key(key(KeyCode::Char('r')), None);
+        assert!(app.take_model_reload_requested());
+        app.refresh_models(vec!["a".to_string(), "b".to_string(), "c".to_string()], "a");
+        app.handle_key(key(KeyCode::Enter), None);
+        assert_eq!(app.take_selected_model().as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn leaving_and_reentering_settings_keeps_model_picker_available() {
+        let mut app = App::new(sample_view(0));
+        app.set_settings(
+            ProviderConfigSafe {
+                base_url: "http://127.0.0.1:8000".to_string(),
+                model: "a".to_string(),
+                structured_output: "auto".to_string(),
+                request_timeout_ms: 1_000,
+                connect_timeout_ms: 1_000,
+                max_retries: 0,
+                is_loopback: true,
+            },
+            ProviderHealth::Ready,
+            0.7,
+            0.9,
+            40,
+            1_200,
+        );
+        app.show_home();
+        app.handle_key(key(KeyCode::Down), None);
+        app.handle_key(key(KeyCode::Enter), None);
+        app.handle_key(key(KeyCode::Esc), None);
+        app.handle_key(key(KeyCode::Enter), None);
+        assert!(app.take_settings_opened());
+
+        app.set_models(vec!["a".to_string(), "b".to_string()], "a");
+        app.handle_key(key(KeyCode::Char('p')), None);
+        app.handle_key(key(KeyCode::Down), None);
+        app.handle_key(key(KeyCode::Enter), None);
+        assert_eq!(app.take_selected_model().as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn mouse_click_selects_a_model_row() {
+        let mut app = App::new(sample_view(0));
+        app.set_models(vec!["a".to_string(), "b".to_string()], "a");
+        app.list_mode = Some(ListMode::ModelPicker);
+        app.last_render_area.set(Rect::new(0, 0, 80, 24));
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 8,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(app.take_selected_model().as_deref(), Some("b"));
+        assert_eq!(app.list_mode, None);
+    }
+
+    #[test]
+    fn mouse_click_submits_the_story_choice_under_the_cursor() {
+        let mut app = App::new(sample_view(3));
+        app.last_render_area.set(Rect::new(0, 0, 80, 24));
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 8,
+            row: 18,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(
+            app.take_mouse_command(),
+            Some(EngineCommand::SubmitChoice {
+                choice_id: "c-0".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn mouse_click_on_visible_home_shortcut_opens_launcher() {
+        let app = App::new(sample_view(1));
+        let mut clicked_home = false;
+        for column in 0..80 {
+            let mut candidate = app.clone();
+            candidate.last_render_area.set(Rect::new(0, 0, 80, 24));
+            candidate.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row: 23,
+                modifiers: KeyModifiers::NONE,
+            });
+            if candidate.home_visible {
+                clicked_home = true;
+                break;
+            }
+        }
+        assert!(
+            clicked_home,
+            "the rendered [Home] shortcut must be clickable"
+        );
+    }
+
+    #[test]
+    fn follow_story_end_uses_the_layout_resolved_bottom_sentinel() {
+        let mut app = App::new(sample_view(1));
+        app.follow_story_end();
+        assert_eq!(app.narration_scroll, u16::MAX);
+    }
+
+    #[test]
+    fn downward_scroll_restores_follow_end_sentinel_at_known_bottom() {
+        let mut app = App::new(sample_view(1));
+        app.narration_scroll = 17;
+        app.narration_max_scroll.set(20);
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(app.narration_scroll, u16::MAX);
     }
 }

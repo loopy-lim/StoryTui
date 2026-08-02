@@ -243,7 +243,7 @@ fn render_keymap_block(frame: &mut Frame, area: Rect) {
 
 fn render_footer(frame: &mut Frame, area: Rect) {
     let para = Paragraph::new(Line::from(Span::styled(
-        "Esc 닫기 · q 종료",
+        "P 모델 선택 · Esc 시작 메뉴 · q 종료",
         Style::default().fg(Color::DarkGray),
     )))
     .alignment(Alignment::Center);

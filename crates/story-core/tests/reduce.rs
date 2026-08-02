@@ -275,6 +275,49 @@ fn accepted_opening_generation_bumps_turn_and_offers_choices() {
     assert_eq!(view.screen, Screen::Story);
     assert_eq!(view.story_title, "데모 이야기");
     assert_eq!(view.location_display, "교실");
+    assert_eq!(
+        t.state.game.strings.get("__storytui.narrative.phase"),
+        Some(&"pressure".to_string()),
+        "accepted turns, not requests, advance the engine-owned story clock"
+    );
+    assert_eq!(
+        t.state.game.numbers.get("__storytui.narrative.due_turn"),
+        Some(&2),
+        "the next pressure is persisted for save/resume"
+    );
+}
+
+#[test]
+fn accepted_patch_updates_all_relationship_meters_and_published_status() {
+    let pack = sample_pack();
+    let (state, generation_id) = start_and_pending_id(&pack);
+    let mut draft = valid_draft(generation_id, 2);
+    draft.proposed_patch.trust_delta.insert(cid(), -1);
+    draft.proposed_patch.tension_delta.insert(cid(), 3);
+
+    let accepted = reduce(
+        &state,
+        EngineCommand::AcceptGeneration {
+            draft: Box::new(draft),
+        },
+        &pack,
+    )
+    .expect("accept relationship patch");
+
+    let character = accepted.state.game.characters.get(&cid()).unwrap();
+    assert_eq!(
+        (character.affection, character.trust, character.tension),
+        (2, -1, 3)
+    );
+    let view = published_view(&accepted);
+    assert_eq!(
+        (
+            view.status.affection,
+            view.status.trust,
+            view.status.tension
+        ),
+        (Some(2), Some(-1), Some(3))
+    );
 }
 
 #[test]
@@ -735,6 +778,81 @@ fn quit_returns_state_unchanged() {
     let after = serde_json::to_vec(&t.state.game).unwrap();
     assert_eq!(before, after);
     assert!(t.effects.is_empty());
+}
+
+#[test]
+fn repeated_choice_set_is_refreshed_without_rewriting_the_accepted_turn() {
+    let pack = sample_pack();
+    let (opening_pending, opening_id) = start_and_pending_id(&pack);
+    let mut opening = reduce(
+        &opening_pending,
+        EngineCommand::AcceptGeneration {
+            draft: Box::new(valid_draft(opening_id, 1)),
+        },
+        &pack,
+    )
+    .expect("accept opening");
+    for choice in &mut opening.state.game.history.last_mut().unwrap().choices {
+        choice.intent = "ask about the letter".to_string();
+    }
+
+    let submitted = reduce(
+        &opening.state,
+        EngineCommand::SubmitChoice {
+            choice_id: "choice-0".to_string(),
+        },
+        &pack,
+    )
+    .expect("submit choice");
+    let turn_id = submitted.state.pending.as_ref().unwrap().generation_id;
+    let mut second_draft = valid_draft(turn_id, 1);
+    for choice in &mut second_draft.choices {
+        choice.intent = "ask about the letter".to_string();
+    }
+    let refreshed = reduce(
+        &submitted.state,
+        EngineCommand::AcceptGeneration {
+            draft: Box::new(second_draft.clone()),
+        },
+        &pack,
+    )
+    .expect("accept repeated choices");
+
+    assert_eq!(refreshed.state.game.turn, 2, "scene is committed once");
+    assert!(refreshed.state.pending.as_ref().unwrap().choice_refresh);
+    assert_eq!(
+        refreshed.state.game.history.last().unwrap().narration,
+        second_draft.narration,
+        "choice repair must not rewrite accepted narration"
+    );
+
+    let refresh_id = refreshed.state.pending.as_ref().unwrap().generation_id;
+    let mut replacement = valid_draft(refresh_id, 0);
+    replacement.choices[0].label = "창가에서 잠시 거리를 둔다".to_string();
+    replacement.choices[1].label = "편지를 함께 확인한다".to_string();
+    replacement.choices[2].label = "밖으로 나가 우산을 찾는다".to_string();
+    let complete = reduce(
+        &refreshed.state,
+        EngineCommand::AcceptGeneration {
+            draft: Box::new(replacement),
+        },
+        &pack,
+    )
+    .expect("accept replacement choices");
+
+    assert!(complete.state.pending.is_none());
+    assert_eq!(
+        complete.state.game.turn, 2,
+        "choice refresh does not add a turn"
+    );
+    assert_eq!(
+        complete.state.game.history.last().unwrap().narration,
+        second_draft.narration
+    );
+    assert_eq!(
+        complete.state.game.history.last().unwrap().choices[1].label,
+        "편지를 함께 확인한다"
+    );
 }
 
 fn published_view(t: &Transition) -> AppViewModel {

@@ -1,4 +1,5 @@
 use std::io::{self, Stdout};
+use std::path::Path;
 use std::sync::Arc;
 
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyEventKind};
@@ -9,25 +10,41 @@ use crossterm::terminal::{
 use futures_util::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use story_core::engine::{AUTOSAVE_SLOT, EngineState, build_view, reduce};
+use story_core::engine::{EngineState, build_view, reduce};
 use story_core::engine_cmd::{EngineCommand, EngineEffect};
-use story_model::{
-    DomainErrorView, ProviderError, ProviderHealth, SAVE_SCHEMA_VERSION, SaveEnvelope, StoryPack,
-};
-use story_persistence::{CHECKSUM_ALGORITHM, PackLoader, SaveError, SaveStore, SlotMeta};
+use story_model::{DomainErrorView, ProviderError, ProviderHealth, StoryPack};
+use story_persistence::{PackLoader, SaveStore};
 use story_provider::{LlmProvider, OpenAiCompatibleProvider};
-use story_tui::{App, SaveLoadMode, SaveLoadRequest};
+use story_tui::{App, HomeRequest};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio_util::sync::CancellationToken;
 
-use storytui::config::RuntimeConfig;
+use storytui::config::{RuntimeConfig, UserSettings, load_user_settings};
+
+mod diagnostics;
+mod saves;
+mod settings;
 
 type UiTerminal = Terminal<CrosstermBackend<Stdout>>;
 
 enum HostMessage {
     Generation {
         generation_id: story_model::uuid::Uuid,
+        model: String,
         result: Result<story_model::GeneratedTurnDraft, ProviderError>,
+    },
+    Director {
+        generation_id: story_model::uuid::Uuid,
+        result: Result<story_model::DirectorPlan, ProviderError>,
+    },
+    Writer {
+        generation_id: story_model::uuid::Uuid,
+        model: String,
+        result: Result<story_model::WriterFinish, ProviderError>,
+    },
+    WriterChunk {
+        generation_id: story_model::uuid::Uuid,
+        text: String,
     },
 }
 
@@ -68,8 +85,9 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
     let mut pack = PackLoader::load(&config.pack_dir)
         .map_err(|e| format!("Story Pack을 불러오지 못했습니다: {e}"))?;
     apply_player_profile(&mut pack, &config.player);
-    let provider = Arc::new(
-        OpenAiCompatibleProvider::new(config.provider.clone())
+    let mut provider_config = config.provider.clone();
+    let mut provider = Arc::new(
+        OpenAiCompatibleProvider::new(provider_config.clone())
             .map_err(|e| format!("provider를 만들지 못했습니다: {e}"))?,
     );
     let save_store = SaveStore::open(&config.save_dir)
@@ -81,29 +99,40 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
         .unwrap_or(ProviderHealth::Unavailable);
     tracing::info!(
         provider = %provider.id(),
-        model = %config.provider.model,
-        base_url = %config.provider.base_url,
+        model = %provider_config.model,
+        base_url = %provider_config.base_url,
         ?health,
         "provider health probe"
     );
 
     let (_guard, mut terminal) =
         TerminalGuard::enter().map_err(|e| format!("터미널을 초기화하지 못했습니다: {e}"))?;
-    let mut engine =
-        restore_autosave(&save_store, &pack).unwrap_or_else(|| EngineState::initial(&pack));
+    let mut resume_engine = saves::restore_autosave(&save_store, &pack);
+    let mut engine = EngineState::initial(&pack);
+    engine.use_director_writer = config.use_director_writer;
+    if let Some(restored) = resume_engine.as_mut() {
+        restored.use_director_writer = config.use_director_writer;
+    }
     let mut app = App::new(build_view(&engine, &pack, None, None));
     app.set_lists(&engine.game.history, &engine.game.memories);
+    app.set_can_continue(resume_engine.is_some());
+    settings::refresh_view(&mut app, &provider_config, health);
+    app.show_home();
+    let mut user_settings = load_user_settings(&config.save_dir)?;
     let (tx, mut rx) = unbounded_channel();
     let mut cancellation: Option<(story_model::uuid::Uuid, CancellationToken)> = None;
 
     let mut events = EventStream::new();
-    let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+    // A wheel/trackpad can produce many events before the terminal has
+    // finished a repaint. Keep the newest scroll position and render at most
+    // once per 1/120s; `Skip` deliberately drops stale render ticks instead
+    // of trying to catch up frame-by-frame after a fast gesture.
+    let mut frame_tick =
+        tokio::time::interval(std::time::Duration::from_nanos(1_000_000_000 / 120));
+    frame_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut needs_redraw = true;
 
     loop {
-        terminal
-            .draw(|frame| app.render(frame, frame.area()))
-            .map_err(|e| format!("화면을 그리지 못했습니다: {e}"))?;
-
         tokio::select! {
             maybe_event = events.next() => {
                 let Some(Ok(event)) = maybe_event else { break };
@@ -113,33 +142,60 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                         if let Some(command) = app.handle_key(key, pending) {
                             dispatch(command, &mut engine, &mut app, &pack, &provider, &save_store, &tx, &mut cancellation).await?;
                         }
-                        if let Some(request) = app.take_save_load_request() {
-                            handle_save_load_request(
-                                request,
+                        handle_ui_requests(
+                            &mut app, &mut engine, &pack, &mut provider_config,
+                            &mut provider, &mut user_settings, &config.save_dir,
+                            &save_store, &tx, &mut cancellation, &mut resume_engine,
+                        ).await?;
+                        needs_redraw = true;
+                    }
+                    Event::Mouse(mouse) => {
+                        app.handle_mouse(mouse);
+                        if let Some(command) = app.take_mouse_command() {
+                            dispatch(
+                                command,
                                 &mut engine,
                                 &mut app,
                                 &pack,
+                                &provider,
                                 &save_store,
+                                &tx,
                                 &mut cancellation,
-                            );
+                            )
+                            .await?;
                         }
+                        handle_ui_requests(
+                            &mut app, &mut engine, &pack, &mut provider_config,
+                            &mut provider, &mut user_settings, &config.save_dir,
+                            &save_store, &tx, &mut cancellation, &mut resume_engine,
+                        ).await?;
+                        needs_redraw = true;
                     }
-                    Event::Mouse(mouse) => app.handle_mouse(mouse),
+                    Event::Resize(..) => needs_redraw = true,
                     _ => {}
                     }
                 if app.should_quit { break; }
             }
             Some(message) = rx.recv() => {
                 match message {
-                    HostMessage::Generation { generation_id, result } => {
+                    HostMessage::Generation { generation_id, model, result } => {
                         let command = match result {
-                            Ok(draft) => EngineCommand::AcceptGeneration { draft: Box::new(draft) },
+                            Ok(draft) => {
+                                app.record_generation_model(generation_id, model);
+                                EngineCommand::AcceptGeneration { draft: Box::new(draft) }
+                            }
                             Err(error) => {
+                                diagnostics::record_provider_failure(&config.save_dir, generation_id, &error);
                                 // `ProviderError::InvalidGeneration` contains only a
                                 // sanitized parser detail (never the raw model body).
                                 // Keep it in the terminal log for diagnosis while the
                                 // player-facing overlay stays concise.
-                                tracing::warn!(%generation_id, %error, "turn generation rejected");
+                                tracing::warn!(
+                                    %generation_id,
+                                    stage = provider_failure_stage(&error),
+                                    %error,
+                                    "turn generation rejected"
+                                );
                                 EngineCommand::ProviderFailed {
                                     generation_id,
                                     error: provider_error_view(error),
@@ -147,10 +203,45 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                             }
                         };
                         dispatch(command, &mut engine, &mut app, &pack, &provider, &save_store, &tx, &mut cancellation).await?;
+                        needs_redraw = true;
+                    }
+                    HostMessage::Director { generation_id, result } => {
+                        let command = match result {
+                            Ok(plan) => EngineCommand::AcceptDirectorPlan { generation_id, plan: Box::new(plan) },
+                            Err(error) => {
+                                diagnostics::record_provider_failure(&config.save_dir, generation_id, &error);
+                                EngineCommand::ProviderFailed { generation_id, error: provider_error_view(error) }
+                            }
+                        };
+                        dispatch(command, &mut engine, &mut app, &pack, &provider, &save_store, &tx, &mut cancellation).await?;
+                        needs_redraw = true;
+                    }
+                    HostMessage::Writer { generation_id, model, result } => {
+                        let command = match result {
+                            Ok(finish) => {
+                                app.record_generation_model(generation_id, model);
+                                EngineCommand::AcceptWriterFinish { finish: Box::new(finish) }
+                            }
+                            Err(error) => {
+                                diagnostics::record_provider_failure(&config.save_dir, generation_id, &error);
+                                EngineCommand::ProviderFailed { generation_id, error: provider_error_view(error) }
+                            }
+                        };
+                        dispatch(command, &mut engine, &mut app, &pack, &provider, &save_store, &tx, &mut cancellation).await?;
+                        needs_redraw = true;
+                    }
+                    HostMessage::WriterChunk { generation_id, text } => {
+                        app.push_writer_chunk(generation_id, &text);
+                        needs_redraw = true;
                     }
                 }
             }
-            _ = tick.tick() => {}
+            _ = frame_tick.tick(), if needs_redraw => {
+                terminal
+                    .draw(|frame| app.render(frame, frame.area()))
+                    .map_err(|e| format!("화면을 그리지 못했습니다: {e}"))?;
+                needs_redraw = false;
+            }
         }
     }
 
@@ -160,157 +251,82 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
     Ok(())
 }
 
-/// Resume only the verified autosave belonging to the currently loaded Pack.
-/// A missing, corrupt, or different-Pack save never prevents the player from
-/// opening a new session; diagnostics stay in the terminal log.
-fn restore_autosave(save_store: &SaveStore, pack: &StoryPack) -> Option<EngineState> {
-    let envelope = match save_store.load(AUTOSAVE_SLOT) {
-        Ok(envelope) => envelope,
-        Err(SaveError::MissingSlot(_)) => return None,
-        Err(error) => {
-            tracing::warn!(%error, "autosave was not resumed");
-            return None;
-        }
-    };
-    match engine_from_envelope(pack, envelope) {
-        Ok(engine) => {
-            tracing::info!(
-                turn = engine.game.turn,
-                history_count = engine.game.history.len(),
-                "autosave restored"
-            );
-            Some(engine)
-        }
-        Err(error) => {
-            tracing::warn!(%error, "autosave was not resumed");
-            None
-        }
-    }
-}
-
-fn engine_from_envelope(pack: &StoryPack, envelope: SaveEnvelope) -> Result<EngineState, String> {
-    let metadata = &pack.metadata;
-    if envelope.story_id != metadata.story_id
-        || envelope.story_version != metadata.story_version
-        || envelope.pack_schema_version != metadata.schema_version
-    {
-        return Err("현재 Story Pack과 다른 버전의 저장입니다".to_string());
-    }
-    Ok(EngineState::from_snapshot_payload(pack, envelope.payload))
-}
-
-const MANUAL_SAVE_SLOTS: [&str; 3] = ["slot-1", "slot-2", "slot-3"];
-
-fn selectable_slots(save_store: &SaveStore, pack: &StoryPack, mode: SaveLoadMode) -> Vec<SlotMeta> {
-    let mut existing = save_store
-        .list_slots()
-        .into_iter()
-        .filter(|slot| slot.story_id == pack.metadata.story_id)
-        .collect::<Vec<_>>();
-    existing.sort_by(|a, b| a.slot_id.cmp(&b.slot_id));
-    if mode == SaveLoadMode::Load {
-        return existing;
-    }
-    MANUAL_SAVE_SLOTS
-        .iter()
-        .map(|id| {
-            existing
-                .iter()
-                .find(|slot| slot.slot_id == *id)
-                .cloned()
-                .unwrap_or_else(|| SlotMeta {
-                    slot_id: (*id).to_string(),
-                    story_id: String::new(),
-                    saved_at: story_model::chrono::Utc::now(),
-                    chapter_label: String::new(),
-                    scene_label: String::new(),
-                    description: None,
-                })
-        })
-        .collect()
-}
-
-fn handle_save_load_request(
-    request: SaveLoadRequest,
-    engine: &mut EngineState,
+#[allow(clippy::too_many_arguments)] // consumes all host-owned UI requests in one place
+async fn handle_ui_requests(
     app: &mut App,
+    engine: &mut EngineState,
     pack: &StoryPack,
+    provider_config: &mut story_provider::ProviderConfig,
+    provider: &mut Arc<OpenAiCompatibleProvider>,
+    user_settings: &mut UserSettings,
+    save_dir: &Path,
     save_store: &SaveStore,
+    tx: &UnboundedSender<HostMessage>,
     cancellation: &mut Option<(story_model::uuid::Uuid, CancellationToken)>,
-) {
-    match request {
-        SaveLoadRequest::Open(mode) => {
-            app.open_save_load(mode, selectable_slots(save_store, pack, mode))
-        }
-        SaveLoadRequest::Save { slot_id } => {
-            let description = Some(format!(
-                "턴 {} — {}",
-                engine.game.turn, engine.game.current_scene_id
-            ));
-            match save_engine_snapshot(save_store, engine, slot_id, description) {
-                Ok(()) => app.close_save_load(),
-                Err(error) => {
-                    app.close_save_load();
-                    app.view.error = Some(save_error_view("수동 저장 실패", error));
-                }
-            }
-        }
-        SaveLoadRequest::Load { slot_id } => {
-            let restored = save_store
-                .load(&slot_id)
-                .map_err(|error| error.to_string())
-                .and_then(|envelope| engine_from_envelope(pack, envelope));
-            match restored {
-                Ok(restored) => {
-                    if let Some((_, token)) = cancellation.take() {
-                        token.cancel();
-                    }
-                    *engine = restored;
-                    app.close_save_load();
-                    app.set_lists(&engine.game.history, &engine.game.memories);
-                    app.set_view(build_view(engine, pack, None, None));
-                }
-                Err(error) => {
-                    app.close_save_load();
-                    app.view.error = Some(save_error_view("저장 불러오기 실패", error));
-                }
-            }
-        }
-    }
-}
-
-fn save_error_view(title: &str, message: String) -> DomainErrorView {
-    DomainErrorView {
-        code: "save_failed".to_string(),
-        title_ko: title.to_string(),
-        message_ko: message,
-        recoverable: true,
-    }
-}
-
-fn save_engine_snapshot(
-    save_store: &SaveStore,
-    engine: &EngineState,
-    slot_id: String,
-    description: Option<String>,
+    resume_engine: &mut Option<EngineState>,
 ) -> Result<(), String> {
-    let game = &engine.game;
-    let envelope = SaveEnvelope {
-        save_schema_version: SAVE_SCHEMA_VERSION,
-        engine_version: env!("CARGO_PKG_VERSION").to_string(),
-        story_id: game.story_id.clone(),
-        story_version: game.story_version.clone(),
-        pack_schema_version: game.pack_schema_version.clone(),
-        slot_id,
-        description,
-        saved_at: story_model::chrono::Utc::now(),
-        chapter_label: game.current_chapter.clone(),
-        scene_label: game.current_scene_id.clone(),
-        checksum_algorithm: CHECKSUM_ALGORITHM.to_string(),
-        payload_checksum: String::new(),
-        payload: engine.snapshot_payload(),
-    };
-    save_store.save(envelope).map_err(|error| error.to_string())
+    if app.take_settings_opened() {
+        if let Some((generation_id, token)) = cancellation.take() {
+            token.cancel();
+            dispatch(
+                EngineCommand::CancelGeneration { generation_id },
+                engine,
+                app,
+                pack,
+                provider,
+                save_store,
+                tx,
+                cancellation,
+            )
+            .await?;
+        }
+        settings::refresh_model_list(app, provider, provider_config, false).await;
+    }
+    if app.take_model_reload_requested() {
+        settings::refresh_model_list(app, provider, provider_config, true).await;
+    }
+    if let Some(model) = app.take_selected_model() {
+        settings::apply_model(
+            app,
+            model,
+            provider_config,
+            provider,
+            user_settings,
+            save_dir,
+        )
+        .await?;
+    }
+    if let Some(request) = app.take_home_request() {
+        match request {
+            HomeRequest::StartNew => {
+                dispatch(
+                    EngineCommand::StartNewGame,
+                    engine,
+                    app,
+                    pack,
+                    provider,
+                    save_store,
+                    tx,
+                    cancellation,
+                )
+                .await?;
+            }
+            HomeRequest::Continue => {
+                if let Some(restored) = resume_engine.take() {
+                    *engine = restored;
+                    app.set_view(build_view(engine, pack, None, None));
+                    app.set_lists(&engine.game.history, &engine.game.memories);
+                    app.follow_story_end();
+                    app.set_can_continue(false);
+                }
+            }
+            HomeRequest::ReturnToGame => app.close_home(),
+        }
+    }
+    if let Some(request) = app.take_save_load_request() {
+        saves::handle_request(request, engine, app, pack, save_store, cancellation);
+    }
+    Ok(())
 }
 
 fn apply_player_profile(pack: &mut StoryPack, profile: &storytui::config::PlayerProfile) {
@@ -384,10 +400,12 @@ async fn dispatch(
                 *cancellation = Some((generation_id, token.clone()));
                 let tx = tx.clone();
                 let provider = Arc::clone(provider);
+                let model = provider.model_name().to_string();
                 tokio::spawn(async move {
                     let result = provider.generate_turn(request, token).await;
                     let _ = tx.send(HostMessage::Generation {
                         generation_id,
+                        model,
                         result,
                     });
                 });
@@ -396,17 +414,66 @@ async fn dispatch(
                 slot_id,
                 description,
             } => {
-                if let Err(error) = save_engine_snapshot(save_store, engine, slot_id, description) {
+                if let Err(error) =
+                    saves::save_engine_snapshot(save_store, engine, slot_id, description)
+                {
                     tracing::error!(%error, "stable state autosave failed");
-                    app.view.error = Some(save_error_view("자동 저장 실패", error));
+                    app.view.error = Some(saves::save_error_view("자동 저장 실패", error));
                 }
             }
-            EngineEffect::RequestDirector { .. } | EngineEffect::RequestWriter { .. } => {
-                app.view.error = Some(DomainErrorView {
-                    code: "unsupported_runtime_path".to_string(),
-                    title_ko: "지원하지 않는 실행 경로".to_string(),
-                    message_ko: "현재 호스트는 MVP 단일 호출 경로만 실행합니다.".to_string(),
-                    recoverable: true,
+            EngineEffect::RequestDirector {
+                generation_id,
+                request,
+            } => {
+                if let Some((_, token)) = cancellation.take() {
+                    token.cancel();
+                }
+                let token = CancellationToken::new();
+                *cancellation = Some((generation_id, token.clone()));
+                let tx = tx.clone();
+                let provider = Arc::clone(provider);
+                tokio::spawn(async move {
+                    let result = provider.direct(request, token).await;
+                    let _ = tx.send(HostMessage::Director {
+                        generation_id,
+                        result,
+                    });
+                });
+            }
+            EngineEffect::RequestWriter {
+                generation_id,
+                request,
+            } => {
+                let token = cancellation
+                    .as_ref()
+                    .map(|(_, token)| token.clone())
+                    .unwrap_or_default();
+                let tx = tx.clone();
+                let provider = Arc::clone(provider);
+                let model = provider.model_name().to_string();
+                tokio::spawn(async move {
+                    let (writer_events, mut writer_events_rx) = tokio::sync::mpsc::channel(32);
+                    let write = provider.write_stream(request, writer_events, token);
+                    tokio::pin!(write);
+                    let result = loop {
+                        tokio::select! {
+                            event = writer_events_rx.recv() => match event {
+                                Some(story_model::WriterEvent::Chunk { text }) => {
+                                    let _ = tx.send(HostMessage::WriterChunk { generation_id, text });
+                                }
+                                Some(story_model::WriterEvent::Error { detail }) => {
+                                    tracing::warn!(%generation_id, %detail, "writer stream soft error");
+                                }
+                                Some(story_model::WriterEvent::Done { .. }) | None => {}
+                            },
+                            result = &mut write => break result,
+                        }
+                    };
+                    let _ = tx.send(HostMessage::Writer {
+                        generation_id,
+                        model,
+                        result,
+                    });
                 });
             }
         }
@@ -415,10 +482,15 @@ async fn dispatch(
 }
 
 fn provider_error_view(error: ProviderError) -> DomainErrorView {
-    let player_message = if matches!(&error, ProviderError::InvalidGeneration(_)) {
-        "모델 응답 형식을 이해하지 못했습니다.".to_string()
-    } else {
-        error.to_string()
+    let player_message = match &error {
+        ProviderError::InvalidGeneration(_) => "모델 응답 형식을 이해하지 못했습니다.".to_string(),
+        ProviderError::Protocol(detail)
+            if detail.starts_with("response decode failed:")
+                || detail.starts_with("response body read failed:") =>
+        {
+            "모델 서버의 응답이 중간에 끊겼습니다. 잠시 후 다시 시도해 주세요.".to_string()
+        }
+        _ => error.to_string(),
     };
     let (code, title) = match error {
         ProviderError::Unavailable(_) => ("provider_unavailable", "모델 서버에 연결할 수 없습니다"),
@@ -442,9 +514,38 @@ fn provider_error_view(error: ProviderError) -> DomainErrorView {
     }
 }
 
+/// Classify the boundary that rejected a generation without exposing the
+/// model's raw output to the player-facing error overlay. The provider emits
+/// the same label with completion metadata (model, finish reason and size).
+fn provider_failure_stage(error: &ProviderError) -> &'static str {
+    match error {
+        ProviderError::Protocol(detail) if detail.starts_with("response decode failed:") => {
+            "http_envelope_decode"
+        }
+        ProviderError::InvalidGeneration(detail) if detail.starts_with("json_extract:") => {
+            "assistant_json_extract"
+        }
+        ProviderError::InvalidGeneration(detail) if detail.starts_with("json_syntax:") => {
+            "assistant_json_syntax"
+        }
+        ProviderError::InvalidGeneration(detail) if detail.starts_with("schema:") => {
+            "assistant_schema"
+        }
+        ProviderError::InvalidGeneration(detail) if detail.starts_with("validation:") => {
+            "assistant_validation"
+        }
+        ProviderError::InvalidGeneration(_) => "assistant_contract_unknown",
+        ProviderError::Timeout { .. } => "request_timeout",
+        ProviderError::Unavailable(_) | ProviderError::Loading(_) => "provider_unavailable",
+        ProviderError::Cancelled => "cancelled",
+        ProviderError::Protocol(_) => "http_protocol",
+        ProviderError::UnsupportedCapability(_) => "unsupported_capability",
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::provider_error_view;
+    use super::{provider_error_view, provider_failure_stage};
     use story_model::ProviderError;
 
     #[test]
@@ -456,5 +557,41 @@ mod tests {
         assert!(!view.message_ko.contains("key must be a string"));
         assert_eq!(view.title_ko, "응답 형식 오류");
         assert_eq!(view.message_ko, "모델 응답 형식을 이해하지 못했습니다.");
+    }
+
+    #[test]
+    fn incomplete_http_body_hides_decoder_detail_from_player() {
+        let view = provider_error_view(ProviderError::Protocol(
+            "response decode failed: expected value at line 1 column 1".to_string(),
+        ));
+        assert_eq!(view.code, "provider_protocol");
+        assert_eq!(view.title_ko, "모델 서버 응답 오류");
+        assert!(!view.message_ko.contains("response decode failed"));
+        assert_eq!(
+            view.message_ko,
+            "모델 서버의 응답이 중간에 끊겼습니다. 잠시 후 다시 시도해 주세요."
+        );
+    }
+
+    #[test]
+    fn failure_stage_keeps_json_schema_and_envelope_failures_separate() {
+        assert_eq!(
+            provider_failure_stage(&ProviderError::Protocol(
+                "response decode failed: expected value".to_string()
+            )),
+            "http_envelope_decode"
+        );
+        assert_eq!(
+            provider_failure_stage(&ProviderError::InvalidGeneration(
+                "json_syntax: EOF while parsing an object".to_string()
+            )),
+            "assistant_json_syntax"
+        );
+        assert_eq!(
+            provider_failure_stage(&ProviderError::InvalidGeneration(
+                "schema: UUID parsing failed".to_string()
+            )),
+            "assistant_schema"
+        );
     }
 }

@@ -2397,6 +2397,10 @@ dependencies = [
 name = "storytui"
 version = "0.1.0"
 dependencies = [
+ "crossterm",
+ "futures-util",
+ "ratatui",
+ "serde",
  "serde_json",
  "sha2 0.11.0",
  "story-core",
@@ -2406,6 +2410,7 @@ dependencies = [
  "story-tui",
  "tokio",
  "tokio-util",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]

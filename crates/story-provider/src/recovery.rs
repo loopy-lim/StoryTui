@@ -68,21 +68,38 @@ pub fn parse_generated_turn(raw: &str, generation_id: Uuid) -> Result<ParseOutco
         }
     };
 
+    // (1b) Strip hybrid-reasoning chain-of-thought that local LLMs (Qwen3,
+    //      DeepSeek-R1, …) prepend: `<think>…</think>` / `<thinking>…</thinking>`.
+    //      These blocks routinely discuss the JSON shape and contain bare
+    //      braces, which would otherwise corrupt [`locate_json`] (the first `{`
+    //      would land inside the reasoning). Removed before extraction; the CoT
+    //      is never parsed or stored. Trailing reasoning is handled later by the
+    //      brace-balanced locator, which stops at the answer's closing `}`.
+    let stripped = strip_reasoning(&work);
+    if stripped != work {
+        repairs.push("stripped reasoning/thinking block".to_string());
+    }
+    let work = stripped;
+
     // (2) Locate the JSON object: first '{' .. last '}'. Strips markdown fences
     //     and leading/trailing prose. Records a repair only if it trimmed
     //     something.
     let trimmed = work.trim();
-    let located =
-        locate_json(trimmed).ok_or_else(|| InvalidGeneration(detail("no JSON object found")))?;
+    let located = locate_json(trimmed)
+        .ok_or_else(|| InvalidGeneration(detail("json_extract: no JSON object found")))?;
     if located != trimmed {
         repairs.push("located JSON object (stripped prose/markdown fence)".to_string());
     }
 
     // (3) First strict parse. Migrate only the known Director-era top-level
     // alias; all other unknown fields remain hard errors.
-    let aliased = normalize_common_wire_aliases(&rename_legacy_patches(located));
-    if aliased != located {
+    let renamed = rename_legacy_patches(located);
+    if renamed != located {
         repairs.push("renamed legacy top-level patches to state_patch".to_string());
+    }
+    let aliased = normalize_common_wire_aliases(&renamed);
+    if aliased != renamed {
+        repairs.push("normalized compatible response fields".to_string());
     }
     let parsed = match serde_json::from_str::<RawGeneratedTurn>(&aliased) {
         Ok(p) => p,
@@ -106,7 +123,16 @@ pub fn parse_generated_turn(raw: &str, generation_id: Uuid) -> Result<ParseOutco
                     // based and do not echo the raw body; we cap the length as
                     // a defensive measure. The raw response is never embedded.
                     let _ = first_err;
-                    return Err(InvalidGeneration(detail(&second_err.to_string())));
+                    // Keep the two failure classes distinct. A syntactically
+                    // valid JSON value can still fail the game DTO contract
+                    // (for example a non-UUID `source_history_ids` value).
+                    // That must not be reported as a generic JSON error.
+                    let stage = if serde_json::from_str::<Value>(&repaired).is_ok() {
+                        "schema"
+                    } else {
+                        "json_syntax"
+                    };
+                    return Err(InvalidGeneration(detail(&format!("{stage}: {second_err}"))));
                 }
             }
         }
@@ -116,7 +142,7 @@ pub fn parse_generated_turn(raw: &str, generation_id: Uuid) -> Result<ParseOutco
     let n = parsed.choices.len();
     if !(1..=6).contains(&n) {
         return Err(InvalidGeneration(detail(&format!(
-            "choice count out of range [1, 6]: got {n}"
+            "validation: choice count out of range [1, 6]: got {n}"
         ))));
     }
     let unique_labels = parsed
@@ -132,11 +158,14 @@ pub fn parse_generated_turn(raw: &str, generation_id: Uuid) -> Result<ParseOutco
         .collect::<std::collections::BTreeSet<_>>();
     if unique_labels.len() != n {
         return Err(InvalidGeneration(
-            "duplicate choice labels; choices must offer different directions".to_string(),
+            "validation: duplicate choice labels; choices must offer different directions"
+                .to_string(),
         ));
     }
     if parsed.narration.trim().is_empty() {
-        return Err(InvalidGeneration(detail("narration must be non-empty")));
+        return Err(InvalidGeneration(detail(
+            "validation: narration must be non-empty",
+        )));
     }
 
     // (6) Map to draft, stamping the request generation_id (the model's echo
@@ -310,6 +339,13 @@ fn normalize_common_wire_aliases(input: &str) -> String {
                 .join(" ");
             *summary.get_mut("interpretation").expect("checked above") = Value::String(text);
         }
+        // History provenance helps later recall, but it cannot affect the
+        // current scene. Local models sometimes emit aliases such as
+        // `turn-1`; remove those instead of rejecting otherwise valid prose
+        // and state proposals because the DTO stores only UUIDs.
+        if let Some(Value::Array(ids)) = summary.get_mut("source_history_ids") {
+            ids.retain(|id| id.as_str().is_some_and(|id| Uuid::parse_str(id).is_ok()));
+        }
     }
     if root == original {
         input.to_string()
@@ -318,15 +354,89 @@ fn normalize_common_wire_aliases(input: &str) -> String {
     }
 }
 
-/// Locate the JSON object in `s` as the slice from the first `{` to the last
-/// `}`. Returns `None` when no object can be located.
+/// Remove a leading hybrid-reasoning block (`<think>…</think>` /
+/// `<thinking>…</thinking>`, case-insensitive, attrs tolerated) that some local
+/// LLMs emit before the answer. Multiple leading blocks are stripped in turn.
+/// A leading block with no closer means the model hit the token cap mid-thought
+/// and never produced JSON — the remainder is dropped so its CoT prose (which
+/// often contains bare braces) never reaches [`locate_json`]. Trailing reasoning
+/// is intentionally NOT stripped here: the brace-balanced locator stops at the
+/// answer's closing brace and ignores anything after it.
+pub fn strip_reasoning(input: &str) -> String {
+    let mut work = input.to_string();
+    loop {
+        let trimmed = work.trim_start();
+        let lower = trimmed.to_ascii_lowercase();
+        if !lower.starts_with("<think") {
+            return work;
+        }
+        // Find the FIRST matching closer (the block is leading).
+        let close = ["</thinking>", "</think>"]
+            .iter()
+            .filter_map(|tag| lower.find(tag))
+            .min();
+        match close {
+            Some(start) => {
+                let len = ["</thinking>", "</think>"]
+                    .iter()
+                    .find_map(|tag| lower[start..].starts_with(tag).then_some(tag.len()))
+                    .unwrap_or(0);
+                work = trimmed[start + len..].to_string();
+                // Loop: a second leading block may follow before the JSON.
+            }
+            None => {
+                // Truncated CoT, no JSON follows.
+                return String::new();
+            }
+        }
+    }
+}
+
+/// Locate the first balanced JSON object in `s`, starting at the first `{`.
+/// Scans brace/bracket depth with string-literal awareness and stops at the
+/// matching `}`, so braces inside trailing prose or surviving reasoning text
+/// cannot extend the slice past the real object. Returns `None` when no
+/// balanced object is found (truncated body, top-level array, or no object).
 fn locate_json(s: &str) -> Option<&str> {
     let start = s.find('{')?;
-    let end = s.rfind('}')?;
-    if end < start {
-        return None;
+    let mut depth: usize = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (idx, ch) in s.char_indices() {
+        if idx < start {
+            continue;
+        }
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' | '[' => depth = depth.saturating_add(1),
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(&s[start..idx + ch.len_utf8()]);
+                }
+            }
+            ']' => {
+                depth = depth.saturating_sub(1);
+            }
+            _ => {}
+        }
     }
-    Some(&s[start..=end])
+    // No balanced object — typically a truncated body missing its final `}`.
+    // Fall back to the outermost brace span so serde reports a `json_syntax`
+    // error (a real truncation) rather than a generic "no object found". This
+    // only fires when a `}` actually follows the opening `{`.
+    let end = s.rfind('}')?;
+    (end >= start).then(|| &s[start..=end])
 }
 
 /// Escape bare `"` characters a model placed inside a JSON string, such as

@@ -34,10 +34,10 @@ by code) — see [`docs/RELEASE-RUNTIME-GATE.md`](./docs/RELEASE-RUNTIME-GATE.md
 - G4 — Apple-Silicon binary + checksum.
 - G5 — second-Pack swap.
 
-**Interactive host loop**: the binary prints a banner today; the event
-pump + provider polling is library-tested via integration tests but not
-yet wired into `main.rs`. See
-[`docs/KNOWN-LIMITATIONS.md`](./docs/KNOWN-LIMITATIONS.md).
+**Interactive host loop**: wired into `main.rs`. It loads the provider
+profile and Story Pack, starts the opening generation, polls the provider,
+renders the TUI, handles cancellation, and autosaves stable turns. The
+remaining open items are live-model quality and release gates.
 
 For build / run / test instructions, see
 [`docs/INSTALL.md`](./docs/INSTALL.md).

@@ -45,6 +45,10 @@ pub enum EngineCommand {
     /// `generation_id` (recorded in the turn's lineage). The previously
     /// committed turn is NOT touched. No-op when no generation is pending.
     RegenerateCurrentTurn,
+    /// Internal automatic repair: regenerate only the currently offered
+    /// choices. The accepted narration and state patch remain unchanged.
+    /// This is not a player-facing control.
+    RegenerateChoices,
     /// Restore a prior committed-state checkpoint (kept in the engine's
     /// in-memory checkpoint ring). Clears any pending generation. No-op when
     /// `checkpoint_id` does not match a stored checkpoint.
@@ -59,6 +63,13 @@ pub enum EngineCommand {
         /// The draft returned by the provider (boxed to keep the enum cheap;
         /// `GeneratedTurnDraft` carries narration + choices + a patch).
         draft: Box<GeneratedTurnDraft>,
+    },
+    /// A provider request failed after the engine emitted a generation effect.
+    /// The host supplies a sanitized, player-facing error; the engine restores
+    /// the pre-generation checkpoint and publishes it without mutating history.
+    ProviderFailed {
+        generation_id: Uuid,
+        error: DomainErrorView,
     },
     /// (W10 2-stage path, ST-033) Director generation completed. The engine
     /// validates + dry-runs `plan`; on rejection the Writer is NEVER called

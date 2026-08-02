@@ -152,6 +152,9 @@ pub struct PendingGeneration {
     /// [`EngineCommand::SubmitChoice`] and `AcceptDirectorPlan` on the 2-stage
     /// path.
     pub validated_plan: Option<Box<ValidatedPlan>>,
+    /// `true` only for an internal choice refresh after an already accepted
+    /// turn. Its response replaces choices but never applies narration/patch.
+    pub choice_refresh: bool,
 }
 
 /// The result of [`reduce`]: a new state, the effects the host should perform,
@@ -279,6 +282,7 @@ pub fn reduce(
             reduce_accept_writer_finish(state, pack, *finish)
         }
         EngineCommand::RegenerateCurrentTurn => Ok(reduce_regenerate(state, pack)),
+        EngineCommand::RegenerateChoices => Ok(reduce_choice_refresh(state, pack)),
         EngineCommand::RestoreCheckpoint { checkpoint_id } => {
             Ok(reduce_restore_checkpoint(state, pack, checkpoint_id))
         }
@@ -301,6 +305,7 @@ fn reduce_start_new_game(state: &EngineState, pack: &StoryPack) -> Result<Transi
         requested_at_turn: game.turn,
         player_action: None,
         validated_plan: None,
+        choice_refresh: false,
     };
     let request = build_turn_request(generation_id, pack, &game, None, None);
     let mut next = clone_state(state);
@@ -356,6 +361,7 @@ fn reduce_submit_choice(
         requested_at_turn: state.game.turn,
         player_action: None,
         validated_plan: None,
+        choice_refresh: false,
     };
     let request = build_turn_request(
         generation_id,
@@ -408,6 +414,7 @@ fn reduce_submit_free_action(
         requested_at_turn: state.game.turn,
         player_action: Some(action.clone()),
         validated_plan: None,
+        choice_refresh: false,
     };
     let request = build_turn_request(generation_id, pack, &state.game, Some(&action), None);
 
@@ -450,6 +457,7 @@ fn reduce_regenerate(state: &EngineState, pack: &StoryPack) -> Transition {
         // generation id is for the MVP single-call path, and even on the
         // 2-stage path the host will re-issue a new Director request.
         validated_plan: None,
+        choice_refresh: pending.choice_refresh,
     };
     let selected_choice = pending.checkpoint.history.last().and_then(|entry| {
         entry
@@ -457,13 +465,17 @@ fn reduce_regenerate(state: &EngineState, pack: &StoryPack) -> Transition {
             .iter()
             .find(|choice| choice.id == pending.player_choice_id)
     });
-    let request = build_turn_request(
-        generation_id,
-        pack,
-        &pending.checkpoint,
-        pending.player_action.as_ref(),
-        selected_choice,
-    );
+    let request = if pending.choice_refresh {
+        build_choice_refresh_request(generation_id, pack, &pending.checkpoint)
+    } else {
+        build_turn_request(
+            generation_id,
+            pack,
+            &pending.checkpoint,
+            pending.player_action.as_ref(),
+            selected_choice,
+        )
+    };
 
     let mut next = clone_state(state);
     next.pending = Some(new_pending.clone());
@@ -527,6 +539,10 @@ fn reduce_accept(
         return Ok(Transition::identity(clone_state(state)));
     }
 
+    if pending.choice_refresh {
+        return Ok(reduce_accept_choice_refresh(state, pack, pending, draft));
+    }
+
     // Matching generation: apply the proposed patch against the checkpoint.
     match apply_patch(
         &pending.checkpoint,
@@ -536,6 +552,14 @@ fn reduce_accept(
     ) {
         Ok(result) => {
             let (next, audit) = assemble_accepted_turn(state, pack, pending, draft.clone(), result);
+            if pending.player_choice_id != OPENING_CHOICE_ID
+                && pending.player_choice_id != FREE_ACTION_CHOICE_ID
+                && choice_set_repeats(pending.checkpoint.history.last(), &draft.choices)
+            {
+                // Do not discard the accepted scene or ask the player to
+                // intervene. One fresh request replaces choices only.
+                return Ok(reduce_choice_refresh(&next, pack));
+            }
             let view = build_view(&next, pack, None, None);
             let mut effects = vec![EngineEffect::PublishView(Box::new(view))];
             // Autosave-on-accept (configurable; default on for MVP). The host
@@ -571,6 +595,87 @@ fn reduce_accept(
                 audit: Vec::new(),
             })
         }
+    }
+}
+
+/// Begin a choice-only refresh from the already committed current turn. The
+/// checkpoint is the stable state itself, so cancellation/failure cannot undo
+/// the narration or the validated state patch that led here.
+fn reduce_choice_refresh(state: &EngineState, pack: &StoryPack) -> Transition {
+    if state.pending.is_some() || state.game.history.last().is_none() {
+        return Transition::identity(clone_state(state));
+    }
+    let generation_id = Uuid::new_v4();
+    let pending = PendingGeneration {
+        generation_id,
+        checkpoint: state.game.clone(),
+        player_choice_id: "__choice_refresh__".to_string(),
+        requested_at_turn: state.game.turn,
+        player_action: None,
+        validated_plan: None,
+        choice_refresh: true,
+    };
+    let request = build_choice_refresh_request(generation_id, pack, &state.game);
+    let mut next = clone_state(state);
+    next.pending = Some(pending.clone());
+    next.retry_pending = None;
+    next.lineage = vec![generation_id];
+    let view = build_view(&next, pack, Some(&pending), None);
+    Transition {
+        state: next,
+        effects: vec![
+            EngineEffect::RequestGeneration {
+                generation_id,
+                request,
+            },
+            EngineEffect::PublishView(Box::new(view)),
+        ],
+        audit: Vec::new(),
+    }
+}
+
+fn reduce_accept_choice_refresh(
+    state: &EngineState,
+    pack: &StoryPack,
+    pending: &PendingGeneration,
+    draft: story_model::GeneratedTurnDraft,
+) -> Transition {
+    // Provider recovery already verifies the basic output contract. The
+    // engine additionally refuses an empty replacement so the playable turn
+    // never loses its choices on a malformed late response.
+    if draft.choices.is_empty() {
+        return reduce_provider_failed(
+            state,
+            pack,
+            pending.generation_id,
+            DomainErrorView {
+                code: "choice_refresh_empty".to_string(),
+                title_ko: "선택지 갱신 실패".to_string(),
+                message_ko: "새 선택지를 만들지 못했습니다. 기존 선택지를 유지합니다.".to_string(),
+                recoverable: true,
+            },
+        );
+    }
+    let mut next = clone_state(state);
+    if let Some(entry) = next.game.history.last_mut() {
+        entry.choices = draft.choices;
+    }
+    next.game.revision = next.game.revision.saturating_add(1);
+    next.pending = None;
+    next.retry_pending = None;
+    next.lineage.clear();
+    let view = build_view(&next, pack, None, None);
+    let mut effects = vec![EngineEffect::PublishView(Box::new(view))];
+    if next.autosave_on_accept {
+        effects.push(EngineEffect::PersistStableState {
+            slot_id: AUTOSAVE_SLOT.to_string(),
+            description: Some(format!("턴 {} · 선택지 갱신", next.game.turn)),
+        });
+    }
+    Transition {
+        state: next,
+        effects,
+        audit: Vec::new(),
     }
 }
 
@@ -671,6 +776,7 @@ fn reduce_submit_choice_director(
         requested_at_turn: state.game.turn,
         player_action: None,
         validated_plan: None,
+        choice_refresh: false,
     };
     let request = build_director_request(generation_id, pack, &state.game, None);
 
@@ -715,6 +821,7 @@ fn reduce_submit_free_action_director(
         requested_at_turn: state.game.turn,
         player_action: Some(action.clone()),
         validated_plan: None,
+        choice_refresh: false,
     };
     let request = build_director_request(generation_id, pack, &state.game, Some(&action));
 
@@ -845,6 +952,30 @@ fn reduce_accept_writer_finish(
     })
 }
 
+/// Recent-arc storage cap (FIFO). Keeps the prompt digest bounded; older
+/// consequences persist via the engine state snapshot.
+const RECENT_SUMMARY_CAP: usize = 12;
+
+/// One-line semantic digest of an accepted turn, stored for the prompt's
+/// `# Recent arc` block. Prefers the model's own `interpretation`; falls back
+/// to the narration's first clause when the model omitted one.
+pub fn turn_digest(narration: &str, interpretation: Option<&str>) -> String {
+    if let Some(interp) = interpretation.map(str::trim).filter(|s| !s.is_empty()) {
+        return interp.to_string();
+    }
+    crate::prompt_context::first_clause(narration, 120)
+}
+
+/// Push `digest` onto `game.recent_summaries`, keeping the most recent
+/// [`RECENT_SUMMARY_CAP`] entries in 1:1 alignment with `game.history`.
+fn push_recent_summary(game: &mut story_model::GameState, digest: String) {
+    let queue = &mut game.recent_summaries;
+    queue.push_back(digest);
+    while queue.len() > RECENT_SUMMARY_CAP {
+        queue.pop_front();
+    }
+}
+
 /// Build the post-accept `EngineState` for the 2-stage path. Mirrors
 /// [`assemble_accepted_turn`] but the narration comes from the Writer while
 /// the patch + choices come from the Director's validated plan.
@@ -866,6 +997,7 @@ fn assemble_accepted_2stage_turn(
 
     let mut game = validated.dry_run.state.clone();
     game.turn = pending.requested_at_turn + 1;
+    let selected_choice = selected_choice_from_pending(pending);
 
     if pending.player_choice_id != OPENING_CHOICE_ID
         && pending.player_choice_id != FREE_ACTION_CHOICE_ID
@@ -899,6 +1031,9 @@ fn assemble_accepted_2stage_turn(
         generation_id: pending.generation_id,
     };
     game.history.push(entry);
+    push_recent_summary(&mut game, turn_digest(&writer.narration, None));
+    crate::narrative::advance_after_accept(&mut game, pack, selected_choice.as_ref());
+    crate::narrative::mark_recalled(&mut game, pack);
     game.stable_generation_id = Some(pending.generation_id);
 
     let mut checkpoints = state.checkpoints.clone();
@@ -962,6 +1097,7 @@ fn assemble_accepted_turn(
 
     let mut game = result.state;
     game.turn = pending.requested_at_turn + 1;
+    let selected_choice = selected_choice_from_pending(pending);
 
     // Record the player's choice (skip for the opening and free-action
     // sentinels — neither corresponds to a prepared choice).
@@ -1000,6 +1136,12 @@ fn assemble_accepted_turn(
         generation_id: draft.generation_id,
     };
     game.history.push(entry);
+    push_recent_summary(
+        &mut game,
+        turn_digest(&draft.narration, draft.summary.interpretation.as_deref()),
+    );
+    crate::narrative::advance_after_accept(&mut game, pack, selected_choice.as_ref());
+    crate::narrative::mark_recalled(&mut game, pack);
     game.stable_generation_id = Some(draft.generation_id);
 
     // Push the just-committed state onto the checkpoint ring (cap keeps the
@@ -1031,6 +1173,25 @@ fn assemble_accepted_turn(
 /// Persist the action that led into a generated scene. Numbered choices are
 /// represented like free input so history and the stacked TUI transcript can
 /// show the player's actual direction.
+fn selected_choice_from_pending(pending: &PendingGeneration) -> Option<story_model::Choice> {
+    if pending.player_choice_id == OPENING_CHOICE_ID
+        || pending.player_choice_id == FREE_ACTION_CHOICE_ID
+    {
+        return None;
+    }
+    pending
+        .checkpoint
+        .history
+        .last()
+        .and_then(|entry| {
+            entry
+                .choices
+                .iter()
+                .find(|choice| choice.id == pending.player_choice_id)
+        })
+        .cloned()
+}
+
 fn recorded_player_action(pending: &PendingGeneration) -> Option<ParsedAction> {
     if let Some(action) = &pending.player_action {
         return Some(action.clone());
@@ -1202,6 +1363,99 @@ pub fn build_view(
 // request construction
 // ---------------------------------------------------------------------------
 
+/// Build a compatibility-safe choice-only repair request. Local providers
+/// currently share the full turn JSON contract, so the wire response still
+/// contains narration and a patch; `reduce_accept_choice_refresh` deliberately
+/// ignores them and commits only `choices`.
+fn build_choice_refresh_request(
+    generation_id: Uuid,
+    pack: &StoryPack,
+    game: &GameState,
+) -> TurnRequest {
+    let mut request = build_turn_request(generation_id, pack, game, None, None);
+    let previous = game
+        .history
+        .last()
+        .map(|entry| {
+            entry
+                .choices
+                .iter()
+                .map(|choice| format!("- {} | {}", choice.label, choice.intent))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    request.messages.push(story_model::ChatMessage {
+        role: "user".to_string(),
+        content: format!(
+            "# Choice-only refresh\nThe narration and state are already committed. Return a full valid JSON envelope for compatibility, but only the `choices` array will be used. Give exactly three materially different next actions. Do not repeat these previous offers or paraphrase them:\n{previous}\nUse relationship, evidence, and situation directions where the current story allows; preserve player agency."
+        ),
+    });
+    // A refresh needs only the envelope plus three concise choices, not a
+    // second long scene. This reduces latency on local models.
+    request.max_tokens = request.max_tokens.min(900);
+    request
+}
+
+/// True only when at least two newly offered choices repeat a prior offer's
+/// direction. It compares a compact semantic signature (role, target, and
+/// intent-word overlap), never a regex over rendered prose.
+fn choice_set_repeats(previous: Option<&HistoryEntry>, candidate: &[story_model::Choice]) -> bool {
+    let Some(previous) = previous else {
+        return false;
+    };
+    let matches = candidate
+        .iter()
+        .filter(|choice| {
+            previous
+                .choices
+                .iter()
+                .any(|old| choices_match(old, choice))
+        })
+        .count();
+    matches >= 2
+}
+
+fn choices_match(left: &story_model::Choice, right: &story_model::Choice) -> bool {
+    let left_label = normalized_choice_text(&left.label);
+    let right_label = normalized_choice_text(&right.label);
+    if !left.intent.trim().is_empty()
+        && !right.intent.trim().is_empty()
+        && !left_label.is_empty()
+        && (left_label == right_label
+            || left_label.contains(&right_label)
+            || right_label.contains(&left_label))
+    {
+        return true;
+    }
+    if crate::narrative::classify_choice(left) != crate::narrative::classify_choice(right)
+        || left.target != right.target
+    {
+        return false;
+    }
+    let left_words = choice_words(&left.intent);
+    let right_words = choice_words(&right.intent);
+    if left_words.is_empty() || right_words.is_empty() {
+        return false;
+    }
+    let shared = left_words.intersection(&right_words).count();
+    shared * 2 >= left_words.len().min(right_words.len())
+}
+
+fn normalized_choice_text(text: &str) -> String {
+    text.chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn choice_words(text: &str) -> std::collections::BTreeSet<String> {
+    text.split_whitespace()
+        .map(normalized_choice_text)
+        .filter(|word| word.chars().count() >= 2)
+        .collect()
+}
+
 /// Build a [`TurnRequest`] for one generation: deterministic system + user
 /// prompt via [`build_prompt`] and MVP sampling defaults. The provider decides
 /// whether to send the schema based on its structured-output mode. When
@@ -1298,6 +1552,10 @@ fn generated_turn_json_schema() -> story_model::serde_json::Value {
                     "interpretation": {"type": ["string", "null"]},
                     "address_form_changes": {"type": "array", "items": {"type": "string"}},
                     "important_player_actions": {"type": "array", "items": {"type": "string"}},
+                    // Provenance is advisory metadata. The recovery layer
+                    // discards non-UUID values instead of rejecting a usable
+                    // scene, so do not force every local server to implement
+                    // UUID-pattern constrained decoding.
                     "source_history_ids": {"type": "array", "items": {"type": "string"}}
                 }
             }
@@ -1413,5 +1671,28 @@ fn clone_state(state: &EngineState) -> EngineState {
         audit_tail: state.audit_tail.clone(),
         autosave_on_accept: state.autosave_on_accept,
         use_director_writer: state.use_director_writer,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::turn_digest;
+
+    #[test]
+    fn turn_digest_prefers_interpretation_then_falls_back_to_first_clause() {
+        assert_eq!(
+            turn_digest(
+                "비가 그쳤다. 유나가 찻잔을 내려놓는다.",
+                Some("유나가 거리를 둔 채 창 밖을 본다")
+            ),
+            "유나가 거리를 둔 채 창 밖을 본다"
+        );
+        // No interpretation → narration's first clause.
+        assert_eq!(
+            turn_digest("비가 그쳤다. 유나가 찻잔을 내려놓는다.", None),
+            "비가 그쳤다"
+        );
+        // Blank interpretation is treated as absent.
+        assert_eq!(turn_digest("비가 그쳤다.", Some("   ")), "비가 그쳤다");
     }
 }

@@ -5,12 +5,11 @@ OpenAI-compatible LLM server (the project targets an Apple-Silicon MLX
 server, but any OpenAI-compatible endpoint works). This document lists the
 prerequisites, how to build, and how to run.
 
-> **Status:** W0–W11 code-complete. The interactive host loop in
-> `apps/storytui` is **not yet wired** — the engine, providers, persistence,
-> TUI screens, and library surfaces (diagnostics, benchmark) are all
-> integrated-tested, but the binary itself only prints a banner. See
-> [RELEASE-RUNTIME-GATE.md](./RELEASE-RUNTIME-GATE.md) for the open runtime
-> items and [KNOWN-LIMITATIONS.md](./KNOWN-LIMITATIONS.md) for the principle.
+> **Status:** W0–W11 host loop is wired. The binary loads a provider profile
+> and Story Pack, starts the opening generation, renders the TUI, handles
+> provider results/errors, and autosaves committed turns. Live-model quality,
+> clean-machine, 100-turn, and release checks remain open; see
+> [RELEASE-RUNTIME-GATE.md](./RELEASE-RUNTIME-GATE.md).
 
 ## Prerequisites
 
@@ -19,7 +18,7 @@ prerequisites, how to build, and how to run.
 | macOS | 15+ | Apple Silicon recommended (MLX). The Settings screen targets 80×24 minimum. |
 | Rust toolchain | 1.88+ (project tracks 1.97.1 in `rust-toolchain.toml`) | `rustup show` auto-installs the pinned toolchain. |
 | Python | 3.11+ | Only if you intend to run the reference MLX server. |
-| MLX server | any OpenAI-compatible endpoint | Default `base_url` is the loopback `http://127.0.0.1:8080`. |
+| MLX server | any OpenAI-compatible endpoint | Checked-in OMLX profile uses `http://127.0.0.1:8000`. |
 
 ## Build
 
@@ -42,13 +41,25 @@ The workspace builds six crates:
 
 ## Run
 
-The binary prints a banner today; the host loop is the open runtime item
-(see [RELEASE-RUNTIME-GATE.md](./RELEASE-RUNTIME-GATE.md)). When wired, it
-will read a provider config from TOML and start the TUI against the loaded
-pack.
+The checked-in profile targets the local OMLX instance at `127.0.0.1:8000`
+and selects the configured model.
 
 ```sh
 cargo run -p storytui
+```
+
+The TUI starts in the Story screen. Use `1..9` or `Enter` to choose, `j/k` or
+arrow keys to move, `c` to cancel a generation, `Esc` to dismiss an error, and
+`q`/`Ctrl+C` to quit.
+
+CLI overrides are available for one-off runs:
+
+```sh
+cargo run -p storytui -- \
+  --provider-config ./config/storytui.toml \
+  --pack ./stories/rainy-reunion \
+  --model local-model-id \
+  --base-url http://127.0.0.1:8000
 ```
 
 ## Provider configuration
@@ -64,6 +75,7 @@ base_url    = "http://127.0.0.1:8080"   # loopback default
 chat_path   = "/v1/chat/completions"
 health_path = "/health"
 model       = "mlx-community/your-model"
+api_key_file = "omlx-api-key" # config/omlx-api-key, untracked secret file
 temperature = 0.85
 top_p       = 0.92
 top_k       = 40
@@ -82,6 +94,21 @@ allowed but:
 - The diagnostic bundle records `is_loopback: false` (see `ProviderConfigSafe`).
 
 Keep the default loopback URL unless you understand the exposure.
+
+OMLX may require authentication for chat completions. Keep the token out of
+TOML and put only the raw token in the ignored file referenced by
+`api_key_file`:
+
+```sh
+printf '%s\n' '<your-omlx-api-key>' > config/omlx-api-key
+chmod 600 config/omlx-api-key
+cargo run -p storytui
+```
+
+The path is relative to the provider TOML directory. The provider sends the
+token as `Authorization: Bearer ...`; diagnostics, saves, and the Settings
+renderer never include it. `api_key_env` remains available as an alternative
+for CI or shell-managed environments.
 
 ## Tests
 
