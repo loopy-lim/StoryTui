@@ -46,6 +46,10 @@ pub struct UserSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub director_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub writer_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_budget_tokens: Option<u32>,
@@ -262,6 +266,12 @@ pub fn load(cli: &CliOptions) -> Result<RuntimeConfig, String> {
 
     let settings = load_user_settings(&file.save_dir)?;
     settings.apply_to(&mut file.provider);
+    if let Some(dm) = &settings.director_model {
+        file.director_model = Some(dm.clone());
+    }
+    if let Some(wm) = &settings.writer_model {
+        file.writer_model = Some(wm.clone());
+    }
 
     if let Some(value) = &cli.model {
         file.provider.model = value.clone();
@@ -357,6 +367,8 @@ mod tests {
             &save_dir,
             &UserSettings {
                 model: Some("saved-model".to_string()),
+                director_model: None,
+                writer_model: None,
                 max_tokens: Some(300),
                 context_budget_tokens: Some(400),
                 temperature: Some(0.7),
@@ -384,6 +396,8 @@ mod tests {
         let dir = test_dir("save");
         let settings = UserSettings {
             model: Some("qwen-local".to_string()),
+            director_model: None,
+            writer_model: None,
             max_tokens: Some(1_800),
             context_budget_tokens: None,
             temperature: Some(0.2),
