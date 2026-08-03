@@ -101,12 +101,9 @@ pub fn parse_generated_turn(raw: &str, generation_id: Uuid) -> Result<ParseOutco
     if aliased != renamed {
         repairs.push("normalized compatible response fields".to_string());
     }
-    let parsed = match serde_json::from_str::<RawGeneratedTurn>(&aliased) {
+    let mut parsed = match serde_json::from_str::<RawGeneratedTurn>(&aliased) {
         Ok(p) => p,
         Err(first_err) => {
-            // (4) ONE repair pass: repair a common local-model JSON mistake
-            // (bare dialogue quotes inside a JSON string), then remove
-            // trailing commas. Both operations are string-aware.
             let quote_repaired = escape_unescaped_quotes(&aliased);
             if quote_repaired != aliased {
                 repairs.push("escaped bare quotes inside JSON strings".to_string());
@@ -119,14 +116,7 @@ pub fn parse_generated_turn(raw: &str, generation_id: Uuid) -> Result<ParseOutco
             match serde_json::from_str::<RawGeneratedTurn>(&repaired) {
                 Ok(p) => p,
                 Err(second_err) => {
-                    // Sanitized detail: serde errors are position/description
-                    // based and do not echo the raw body; we cap the length as
-                    // a defensive measure. The raw response is never embedded.
                     let _ = first_err;
-                    // Keep the two failure classes distinct. A syntactically
-                    // valid JSON value can still fail the game DTO contract
-                    // (for example a non-UUID `source_history_ids` value).
-                    // That must not be reported as a generic JSON error.
                     let stage = if serde_json::from_str::<Value>(&repaired).is_ok() {
                         "schema"
                     } else {
@@ -137,6 +127,16 @@ pub fn parse_generated_turn(raw: &str, generation_id: Uuid) -> Result<ParseOutco
             }
         }
     };
+
+    // Sanitize choice ids and intents.
+    for (i, choice) in parsed.choices.iter_mut().enumerate() {
+        if choice.id.trim().is_empty() {
+            choice.id = format!("next-{i}");
+        }
+        if choice.intent.trim().is_empty() {
+            choice.intent = choice.label.clone();
+        }
+    }
 
     // (5) Validate.
     let n = parsed.choices.len();
@@ -206,8 +206,8 @@ pub fn parse_director_plan(raw: &str) -> Result<DirectorPlan, ProviderError> {
 
     let aliased = normalize_director_aliases(located);
 
-    match serde_json::from_str::<DirectorPlan>(&aliased) {
-        Ok(plan) => Ok(plan),
+    let mut plan = match serde_json::from_str::<DirectorPlan>(&aliased) {
+        Ok(plan) => plan,
         Err(_) => {
             let quote_repaired = escape_unescaped_quotes(&aliased);
             let repaired = strip_trailing_commas(&quote_repaired);
@@ -219,8 +219,46 @@ pub fn parse_director_plan(raw: &str) -> Result<DirectorPlan, ProviderError> {
                     "json_syntax"
                 };
                 InvalidGeneration(detail(&format!("director plan {stage}: {e}")))
-            })
+            })?
         }
+    };
+
+    sanitize_choices(&mut plan.choices);
+    Ok(plan)
+}
+
+/// Auto-fill missing choice ids/intents and deduplicate duplicate choice labels.
+pub fn sanitize_choices(choices: &mut [Choice]) {
+    let mut seen_labels = std::collections::BTreeSet::new();
+    for (i, choice) in choices.iter_mut().enumerate() {
+        if choice.id.trim().is_empty() {
+            choice.id = format!("next-{i}");
+        }
+        if choice.label.trim().is_empty() {
+            choice.label = format!("선택지 {}", i + 1);
+        }
+        if choice.intent.trim().is_empty() {
+            choice.intent = choice.label.clone();
+        }
+
+        let normalized = choice
+            .label
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if seen_labels.contains(&normalized) {
+            choice.label = format!("{} ({})", choice.label.trim(), i + 1);
+            if choice.intent == normalized {
+                choice.intent = choice.label.clone();
+            }
+        }
+        seen_labels.insert(
+            choice
+                .label
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
     }
 }
 
