@@ -464,6 +464,12 @@ async fn dispatch(
                 if let Some(ref m) = config.director_model {
                     request.model = m.clone();
                 }
+                let director_model = if !request.model.is_empty() {
+                    request.model.clone()
+                } else {
+                    provider.model_name().to_string()
+                };
+                tracing::info!(%generation_id, model = %director_model, "invoking Director stage");
                 tokio::spawn(async move {
                     let result = provider.direct(request, token).await;
                     let _ = tx.send(HostMessage::Director {
@@ -490,6 +496,7 @@ async fn dispatch(
                 } else {
                     provider.model_name().to_string()
                 };
+                tracing::info!(%generation_id, model = %model, "invoking Writer stage");
                 tokio::spawn(async move {
                     let (writer_events, mut writer_events_rx) = tokio::sync::mpsc::channel(32);
                     let write = provider.write_stream(request, writer_events, token);
