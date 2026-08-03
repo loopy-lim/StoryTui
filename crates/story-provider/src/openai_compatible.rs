@@ -708,8 +708,21 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
                 }
             };
             let content = parsed.content();
-            let plan = crate::recovery::parse_director_plan(&content)?;
-            return Ok(plan);
+            match crate::recovery::parse_director_plan(&content) {
+                Ok(plan) => return Ok(plan),
+                Err(err) => {
+                    tracing::warn!(
+                        generation_id = %request.generation_id,
+                        error = %err,
+                        "director plan parse failed; attempting 1-pass repair retry"
+                    );
+                    if attempt + 1 < max_attempts {
+                        Self::sleep_or_cancel(attempt, &cancel).await?;
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
         }
         Err(ProviderError::Protocol(
             "retry budget exhausted".to_string(),

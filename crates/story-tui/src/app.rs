@@ -123,11 +123,13 @@ pub struct App {
     settings_opened: bool,
     settings_returns_home: bool,
     generation_models: BTreeMap<Uuid, String>,
+    pub generation_start_time: Option<std::time::Instant>,
 }
 
 impl App {
     /// Build an App from the first published view.
     pub fn new(view: AppViewModel) -> Self {
+        let loading = view.loading.is_some();
         Self {
             view,
             selected: 0,
@@ -162,6 +164,7 @@ impl App {
             settings_opened: false,
             settings_returns_home: false,
             generation_models: BTreeMap::new(),
+            generation_start_time: if loading { Some(std::time::Instant::now()) } else { None },
         }
     }
 
@@ -277,6 +280,10 @@ impl App {
         self.generation_models.insert(generation_id, model);
     }
 
+    pub fn generation_elapsed_seconds(&self) -> Option<u64> {
+        self.generation_start_time.map(|start| start.elapsed().as_secs())
+    }
+
     /// Replace the view (e.g. the host published a new one). Clamps the
     /// selection to the new choice count.
     pub fn set_view(&mut self, view: AppViewModel) {
@@ -288,7 +295,12 @@ impl App {
             self.selected = count - 1;
         }
         self.view = view;
-        if self.view.loading.is_none() {
+        if self.view.loading.is_some() {
+            if self.generation_start_time.is_none() {
+                self.generation_start_time = Some(std::time::Instant::now());
+            }
+        } else {
+            self.generation_start_time = None;
             self.streaming_narration = None;
         }
         // Once a later turn is committed, follow the newest scene at the
@@ -610,6 +622,7 @@ impl App {
             &self.input,
             &self.story_stack,
             self.streaming_narration.as_deref(),
+            self.generation_elapsed_seconds(),
         );
         self.narration_max_scroll.set(max_scroll);
     }

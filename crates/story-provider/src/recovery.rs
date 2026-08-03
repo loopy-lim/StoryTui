@@ -206,16 +206,18 @@ pub fn parse_director_plan(raw: &str) -> Result<DirectorPlan, ProviderError> {
         .ok_or_else(|| InvalidGeneration(detail("json_extract: no JSON object found in director plan")))?;
 
     let aliased = normalize_director_aliases(located);
+    let normalized = normalize_common_wire_aliases(&aliased);
 
-    let mut plan = match serde_json::from_str::<DirectorPlan>(&aliased) {
+    let mut plan = match serde_json::from_str::<DirectorPlan>(&normalized) {
         Ok(plan) => plan,
         Err(_) => {
-            let quote_repaired = escape_unescaped_quotes(&aliased);
+            let quote_repaired = escape_unescaped_quotes(&normalized);
             let ctrl_repaired = sanitize_json_control_characters(&quote_repaired);
             let repaired = strip_trailing_commas(&ctrl_repaired);
             let repaired_aliased = normalize_director_aliases(&repaired);
-            serde_json::from_str::<DirectorPlan>(&repaired_aliased).map_err(|e| {
-                let stage = if serde_json::from_str::<Value>(&repaired_aliased).is_ok() {
+            let repaired_normalized = normalize_common_wire_aliases(&repaired_aliased);
+            serde_json::from_str::<DirectorPlan>(&repaired_normalized).map_err(|e| {
+                let stage = if serde_json::from_str::<Value>(&repaired_normalized).is_ok() {
                     "schema"
                 } else {
                     "json_syntax"
@@ -224,6 +226,41 @@ pub fn parse_director_plan(raw: &str) -> Result<DirectorPlan, ProviderError> {
             })?
         }
     };
+
+    if plan.choices.is_empty() {
+        plan.choices = vec![
+            Choice {
+                id: "choice-1".to_string(),
+                label: "솔직하게 대화를 이어간다".to_string(),
+                intent: "솔직하게 대화를 이어간다".to_string(),
+                tone: None,
+                target: None,
+                risk: story_model::RiskLevel::Safe,
+                hidden_requirements: Vec::new(),
+                preview: None,
+            },
+            Choice {
+                id: "choice-2".to_string(),
+                label: "상대방의 표정을 살피며 거리를 둔다".to_string(),
+                intent: "상대방의 표정을 살피며 거리를 둔다".to_string(),
+                tone: None,
+                target: None,
+                risk: story_model::RiskLevel::Low,
+                hidden_requirements: Vec::new(),
+                preview: None,
+            },
+            Choice {
+                id: "choice-3".to_string(),
+                label: "대범하게 도발적인 질문을 던진다".to_string(),
+                intent: "대범하게 도발적인 질문을 던진다".to_string(),
+                tone: None,
+                target: None,
+                risk: story_model::RiskLevel::Medium,
+                hidden_requirements: Vec::new(),
+                preview: None,
+            },
+        ];
+    }
 
     sanitize_choices(&mut plan.choices);
     Ok(plan)

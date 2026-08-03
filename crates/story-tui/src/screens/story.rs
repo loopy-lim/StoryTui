@@ -116,6 +116,7 @@ pub fn render_story(
     input: &InputBuffer,
     story_stack: &[StoryStackEntry],
     streaming_narration: Option<&str>,
+    generation_elapsed_secs: Option<u64>,
 ) -> u16 {
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         render_min_size_warning(frame, area);
@@ -222,7 +223,7 @@ pub fn render_story(
             .viewport_content_length(narration_area.height as usize);
         frame.render_stateful_widget(scrollbar, narration_chunks[1], &mut scrollbar_state);
     }
-    render_choice_panel(frame, chunks[1], view, selected);
+    render_choice_panel(frame, chunks[1], view, selected, generation_elapsed_secs);
     if input_mode {
         render_input_panel(frame, chunks[2], input);
         render_status_panel(frame, chunks[3], view);
@@ -542,7 +543,13 @@ fn choice_panel_height(view: &AppViewModel, width: u16) -> u16 {
     (rows as u16).saturating_add(2)
 }
 
-fn render_choice_panel(frame: &mut Frame, area: Rect, view: &AppViewModel, selected: usize) {
+fn render_choice_panel(
+    frame: &mut Frame,
+    area: Rect,
+    view: &AppViewModel,
+    selected: usize,
+    elapsed_secs: Option<u64>,
+) {
     let turn = view.status.turn;
     let elapsed_mins = (turn as u32) * 30;
     let hours = elapsed_mins / 60;
@@ -574,13 +581,25 @@ fn render_choice_panel(frame: &mut Frame, area: Rect, view: &AppViewModel, selec
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let lines = if let Some(loading) = &view.loading {
+        let timer_subtext = match elapsed_secs {
+            Some(secs) => {
+                let m = secs / 60;
+                let s = secs % 60;
+                if m > 0 {
+                    format!("선택지 생성 중... ({m}분 {s}초 소요 중 / 최대 10분 대기)  [C] 취소")
+                } else {
+                    format!("선택지 생성 중... ({s}초 소요 중 / 최대 10분 대기)  [C] 취소")
+                }
+            }
+            None => "선택지는 생성이 끝나면 표시됩니다. [C] 취소 (최대 10분 대기)".to_string(),
+        };
         vec![
             Line::from(Span::styled(
                 loading.message_ko.clone(),
                 Style::default().fg(Color::LightYellow),
             )),
             Line::from(Span::styled(
-                "선택지는 생성이 끝나면 표시됩니다. [C] 취소 (최대 10분 대기)",
+                timer_subtext,
                 Style::default().fg(Color::DarkGray),
             )),
         ]
