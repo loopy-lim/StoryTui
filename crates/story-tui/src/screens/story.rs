@@ -96,7 +96,7 @@ pub fn render_model_picker(frame: &mut Frame, area: Rect, items: &[String], sele
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::LightCyan))
-                .title("모델 선택 · R 새로고침 · ↑↓ 이동 · Enter 적용 · Esc 닫기"),
+                .title("모델 선택 · ↑↓ 이동 · Enter 기본모델 · D 기획(Director) · W 서사(Writer) · R 새로고침 · Esc 닫기"),
         )
         .wrap(Wrap { trim: false });
     frame.render_widget(Clear, area);

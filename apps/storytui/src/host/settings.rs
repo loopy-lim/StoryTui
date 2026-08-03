@@ -89,3 +89,43 @@ pub async fn apply_model(
     );
     Ok(())
 }
+
+/// Persist and activate a newly selected Director model.
+pub fn apply_director_model(
+    app: &mut App,
+    model: String,
+    provider_config: &ProviderConfig,
+    user_settings: &mut UserSettings,
+    save_dir: &Path,
+) -> Result<(), String> {
+    user_settings.director_model = Some(model);
+    save_user_settings(save_dir, user_settings)?;
+    refresh_view(
+        app,
+        provider_config,
+        ProviderHealth::Ready,
+        user_settings.director_model.clone(),
+        user_settings.writer_model.clone(),
+    );
+    Ok(())
+}
+
+/// Persist and activate a newly selected Writer model.
+pub fn apply_writer_model(
+    app: &mut App,
+    model: String,
+    provider_config: &ProviderConfig,
+    user_settings: &mut UserSettings,
+    save_dir: &Path,
+) -> Result<(), String> {
+    user_settings.writer_model = Some(model);
+    save_user_settings(save_dir, user_settings)?;
+    refresh_view(
+        app,
+        provider_config,
+        ProviderHealth::Ready,
+        user_settings.director_model.clone(),
+        user_settings.writer_model.clone(),
+    );
+    Ok(())
+}

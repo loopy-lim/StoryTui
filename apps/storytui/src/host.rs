@@ -297,6 +297,24 @@ async fn handle_ui_requests(
         )
         .await?;
     }
+    if let Some(model) = app.take_selected_director_model() {
+        settings::apply_director_model(
+            app,
+            model,
+            provider_config,
+            user_settings,
+            &config.save_dir,
+        )?;
+    }
+    if let Some(model) = app.take_selected_writer_model() {
+        settings::apply_writer_model(
+            app,
+            model,
+            provider_config,
+            user_settings,
+            &config.save_dir,
+        )?;
+    }
     if let Some(request) = app.take_home_request() {
         match request {
             HomeRequest::StartNew => {

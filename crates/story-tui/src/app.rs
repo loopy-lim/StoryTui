@@ -101,6 +101,8 @@ pub struct App {
     pub model_items: Vec<String>,
     pub model_selected: usize,
     selected_model: Option<String>,
+    selected_director_model: Option<String>,
+    selected_writer_model: Option<String>,
     model_reload_requested: bool,
     mouse_command: Option<EngineCommand>,
     /// Chronological narration stack shown in the main story pane.
@@ -141,6 +143,8 @@ impl App {
             model_items: Vec::new(),
             model_selected: 0,
             selected_model: None,
+            selected_director_model: None,
+            selected_writer_model: None,
             model_reload_requested: false,
             mouse_command: None,
             story_stack: Vec::new(),
@@ -188,6 +192,14 @@ impl App {
 
     pub fn take_selected_model(&mut self) -> Option<String> {
         self.selected_model.take()
+    }
+
+    pub fn take_selected_director_model(&mut self) -> Option<String> {
+        self.selected_director_model.take()
+    }
+
+    pub fn take_selected_writer_model(&mut self) -> Option<String> {
+        self.selected_writer_model.take()
     }
 
     /// Consume a model-picker request to refresh the server list.
@@ -431,6 +443,14 @@ impl App {
                 }
                 KeyCode::Enter if self.list_mode == Some(ListMode::ModelPicker) => {
                     self.selected_model = self.model_items.get(self.model_selected).cloned();
+                    self.list_mode = None;
+                }
+                KeyCode::Char('d' | 'ㅇ') if self.list_mode == Some(ListMode::ModelPicker) => {
+                    self.selected_director_model = self.model_items.get(self.model_selected).cloned();
+                    self.list_mode = None;
+                }
+                KeyCode::Char('w' | 'ㅈ') if self.list_mode == Some(ListMode::ModelPicker) => {
+                    self.selected_writer_model = self.model_items.get(self.model_selected).cloned();
                     self.list_mode = None;
                 }
                 _ => {}
