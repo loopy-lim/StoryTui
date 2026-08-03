@@ -81,6 +81,7 @@ impl Drop for TerminalGuard {
 }
 
 pub async fn run(config: RuntimeConfig) -> Result<(), String> {
+    let mut config = config;
     let mut pack = PackLoader::load(&config.pack_dir)
         .map_err(|e| format!("Story Pack을 불러오지 못했습니다: {e}"))?;
     apply_player_profile(&mut pack, &config.player);
@@ -121,20 +122,15 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
     let (tx, mut rx) = unbounded_channel();
     let mut cancellation: Option<(story_model::uuid::Uuid, CancellationToken)> = None;
 
-    let mut events = EventStream::new();
-    // A wheel/trackpad can produce many events before the terminal has
-    // finished a repaint. Keep the newest scroll position and render at most
-    // once per 1/120s; `Skip` deliberately drops stale render ticks instead
-    // of trying to catch up frame-by-frame after a fast gesture.
-    let mut frame_tick =
-        tokio::time::interval(std::time::Duration::from_nanos(1_000_000_000 / 120));
+    let mut event_stream = EventStream::new();
+    let mut frame_tick = tokio::time::interval(std::time::Duration::from_millis(16));
     frame_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut needs_redraw = true;
 
     loop {
         tokio::select! {
-            maybe_event = events.next() => {
-                let Some(Ok(event)) = maybe_event else { break };
+            Some(event_res) = event_stream.next() => {
+                let event = event_res.map_err(|e| format!("입력 이벤트를 읽지 못했습니다: {e}"))?;
                 match event {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
                         let pending = app.view.loading.as_ref().map(|v| v.generation_id);
@@ -143,7 +139,7 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                         }
                         handle_ui_requests(
                             &mut app, &mut engine, &pack, &mut provider_config,
-                            &mut provider, &mut user_settings, &config,
+                            &mut provider, &mut user_settings, &mut config,
                             &save_store, &tx, &mut cancellation, &mut resume_engine,
                         ).await?;
                         needs_redraw = true;
@@ -166,7 +162,7 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                         }
                         handle_ui_requests(
                             &mut app, &mut engine, &pack, &mut provider_config,
-                            &mut provider, &mut user_settings, &config,
+                            &mut provider, &mut user_settings, &mut config,
                             &save_store, &tx, &mut cancellation, &mut resume_engine,
                         ).await?;
                         needs_redraw = true;
@@ -186,10 +182,6 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                             }
                             Err(error) => {
                                 diagnostics::record_provider_failure(&config.save_dir, generation_id, &error);
-                                // `ProviderError::InvalidGeneration` contains only a
-                                // sanitized parser detail (never the raw model body).
-                                // Keep it in the terminal log for diagnosis while the
-                                // player-facing overlay stays concise.
                                 tracing::warn!(
                                     %generation_id,
                                     stage = provider_failure_stage(&error),
@@ -259,7 +251,7 @@ async fn handle_ui_requests(
     provider_config: &mut story_provider::ProviderConfig,
     provider: &mut Arc<OpenAiCompatibleProvider>,
     user_settings: &mut UserSettings,
-    config: &RuntimeConfig,
+    config: &mut RuntimeConfig,
     save_store: &SaveStore,
     tx: &UnboundedSender<HostMessage>,
     cancellation: &mut Option<(story_model::uuid::Uuid, CancellationToken)>,
@@ -301,18 +293,18 @@ async fn handle_ui_requests(
         settings::apply_director_model(
             app,
             model,
+            config,
             provider_config,
             user_settings,
-            &config.save_dir,
         )?;
     }
     if let Some(model) = app.take_selected_writer_model() {
         settings::apply_writer_model(
             app,
             model,
+            config,
             provider_config,
             user_settings,
-            &config.save_dir,
         )?;
     }
     if let Some(request) = app.take_home_request() {

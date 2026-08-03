@@ -8,7 +8,7 @@ use story_model::ProviderHealth;
 use story_provider::{LlmProvider, OpenAiCompatibleProvider, ProviderConfig};
 use story_tui::App;
 
-use storytui::config::{UserSettings, save_user_settings};
+use storytui::config::{RuntimeConfig, UserSettings, save_user_settings};
 use storytui::diagnostic::provider_config_safe_with_models;
 
 pub fn refresh_view(
@@ -94,12 +94,13 @@ pub async fn apply_model(
 pub fn apply_director_model(
     app: &mut App,
     model: String,
+    config: &mut RuntimeConfig,
     provider_config: &ProviderConfig,
     user_settings: &mut UserSettings,
-    save_dir: &Path,
 ) -> Result<(), String> {
+    config.director_model = Some(model.clone());
     user_settings.director_model = Some(model);
-    save_user_settings(save_dir, user_settings)?;
+    save_user_settings(&config.save_dir, user_settings)?;
     refresh_view(
         app,
         provider_config,
@@ -114,12 +115,13 @@ pub fn apply_director_model(
 pub fn apply_writer_model(
     app: &mut App,
     model: String,
+    config: &mut RuntimeConfig,
     provider_config: &ProviderConfig,
     user_settings: &mut UserSettings,
-    save_dir: &Path,
 ) -> Result<(), String> {
+    config.writer_model = Some(model.clone());
     user_settings.writer_model = Some(model);
-    save_user_settings(save_dir, user_settings)?;
+    save_user_settings(&config.save_dir, user_settings)?;
     refresh_view(
         app,
         provider_config,
