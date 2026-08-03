@@ -105,11 +105,12 @@ pub fn parse_generated_turn(raw: &str, generation_id: Uuid) -> Result<ParseOutco
         Ok(p) => p,
         Err(first_err) => {
             let quote_repaired = escape_unescaped_quotes(&aliased);
-            if quote_repaired != aliased {
-                repairs.push("escaped bare quotes inside JSON strings".to_string());
+            let ctrl_repaired = sanitize_json_control_characters(&quote_repaired);
+            if quote_repaired != aliased || ctrl_repaired != quote_repaired {
+                repairs.push("escaped bare quotes and raw control chars inside JSON strings".to_string());
             }
-            let repaired = strip_trailing_commas(&quote_repaired);
-            if repaired != quote_repaired {
+            let repaired = strip_trailing_commas(&ctrl_repaired);
+            if repaired != ctrl_repaired {
                 repairs.push("stripped trailing commas".to_string());
             }
             let repaired = normalize_common_wire_aliases(&rename_legacy_patches(&repaired));
@@ -210,7 +211,8 @@ pub fn parse_director_plan(raw: &str) -> Result<DirectorPlan, ProviderError> {
         Ok(plan) => plan,
         Err(_) => {
             let quote_repaired = escape_unescaped_quotes(&aliased);
-            let repaired = strip_trailing_commas(&quote_repaired);
+            let ctrl_repaired = sanitize_json_control_characters(&quote_repaired);
+            let repaired = strip_trailing_commas(&ctrl_repaired);
             let repaired_aliased = normalize_director_aliases(&repaired);
             serde_json::from_str::<DirectorPlan>(&repaired_aliased).map_err(|e| {
                 let stage = if serde_json::from_str::<Value>(&repaired_aliased).is_ok() {
@@ -225,6 +227,42 @@ pub fn parse_director_plan(raw: &str) -> Result<DirectorPlan, ProviderError> {
 
     sanitize_choices(&mut plan.choices);
     Ok(plan)
+}
+
+/// Sanitize raw control characters (unescaped newlines/tabs) inside JSON string values.
+pub fn sanitize_json_control_characters(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for ch in input.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                out.push(ch);
+            } else if ch == '\\' {
+                escaped = true;
+                out.push(ch);
+            } else if ch == '"' {
+                in_string = false;
+                out.push(ch);
+            } else if ch == '\n' {
+                out.push_str("\\n");
+            } else if ch == '\r' {
+                out.push_str("\\r");
+            } else if ch == '\t' {
+                out.push_str("\\t");
+            } else {
+                out.push(ch);
+            }
+        } else {
+            if ch == '"' {
+                in_string = true;
+            }
+            out.push(ch);
+        }
+    }
+    out
 }
 
 /// Auto-fill missing choice ids/intents and deduplicate duplicate choice labels.

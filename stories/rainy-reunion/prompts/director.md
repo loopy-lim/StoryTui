@@ -39,3 +39,45 @@
 - route와 ending을 확정하지 않는다.
 - 플레이어의 자유 입력에 없는 감정과 행동을 대신 확정하지 않는다.
 - must_not_reveal에 있는 정보는 Writer가 암시로도 확정하지 않게 한다.
+
+출력 형식 (반드시 부가 설명 없이 순수 JSON 객체 하나만 출력할 것):
+```json
+{
+  "scene_goal": "재회의 어색함을 깨고 상대방의 진심을 살핀다",
+  "required_beats": ["유나의 젖은 숄을 받아준다", "차 한 잔을 건넨다"],
+  "emotion_arcs": {
+    "yuna": { "character": "yuna", "from": "surprised", "to": "touched", "reason": "따뜻한 보살핌에 마음이 열림" }
+  },
+  "character_outfits": {
+    "yuna": "빗물에 약하게 젖은 베이지색 숄과 흰 셔츠, 촉촉이 젖은 머릿결"
+  },
+  "ambient_situation": "창밖으로 조용히 내리는 빗소리와 따스한 김이 오르는 홍차 향기",
+  "reveal_fact_ids": [],
+  "must_not_reveal_fact_ids": ["reason-left", "returned-letter"],
+  "proposed_patch": { "set_flags": {}, "stat_changes": {} },
+  "choices": [
+    {
+      "id": "c1",
+      "label": "유나의 손을 감싸쥐며 젖은 숄을 부드럽게 받아준다",
+      "intent": "서로의 온기를 나누며 정면으로 감정을 확인한다",
+      "tone": "애틋함",
+      "target": "yuna",
+      "risk": "safe",
+      "hidden_requirements": [],
+      "preview": "유나가 붉어진 얼굴로 손을 맡깁니다."
+    },
+    {
+      "id": "c2",
+      "label": "찻잔을 밀어주며 유나의 눈빛과 떨리는 입술을 살핀다",
+      "intent": "거리감을 유지하며 유나의 속마음을 탐색한다",
+      "tone": "신중함",
+      "target": "yuna",
+      "risk": "safe",
+      "hidden_requirements": [],
+      "preview": "유나가 조용히 찻잔을 들어 올립니다."
+    }
+  ],
+  "conflict_checks": [],
+  "end_condition": "유나가 찻잔을 쥐고 말을 꺼내는 순간"
+}
+```
