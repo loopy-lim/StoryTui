@@ -228,7 +228,7 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                     }
                 }
             }
-            _ = frame_tick.tick(), if needs_redraw => {
+            _ = frame_tick.tick(), if needs_redraw || app.view.loading.is_some() => {
                 terminal
                     .draw(|frame| app.render(frame, frame.area()))
                     .map_err(|e| format!("화면을 그리지 못했습니다: {e}"))?;

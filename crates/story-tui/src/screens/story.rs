@@ -564,12 +564,29 @@ fn render_choice_panel(
         format!("{mins}분 경과")
     };
 
-    let title_text = format!(
-        "선택지 · 시간대: {} · 누적 시간: {} (턴 {})",
+    let avail_width = area.width.saturating_sub(4) as usize;
+    let full_title = format!(
+        "선택지 · 시간대: {} · 누적: {} (턴 {})",
         time_slot_label(view.time_slot),
         elapsed_label,
         turn
     );
+    let med_title = format!(
+        "선택지 · 시간대: {} (턴 {})",
+        time_slot_label(view.time_slot),
+        turn
+    );
+    let short_title = format!("선택지 (턴 {})", turn);
+
+    let title_text = if full_title.width() <= avail_width {
+        full_title
+    } else if med_title.width() <= avail_width {
+        med_title
+    } else if short_title.width() <= avail_width {
+        short_title
+    } else {
+        "선택지".to_string()
+    };
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -586,12 +603,12 @@ fn render_choice_panel(
                 let m = secs / 60;
                 let s = secs % 60;
                 if m > 0 {
-                    format!("선택지 생성 중... ({m}분 {s}초 소요 중 / 최대 10분 대기)  [C] 취소")
+                    format!("생성 진행 중... ({m}분 {s}초 소요 중) [C] 취소")
                 } else {
-                    format!("선택지 생성 중... ({s}초 소요 중 / 최대 10분 대기)  [C] 취소")
+                    format!("생성 진행 중... ({s}초 소요 중) [C] 취소")
                 }
             }
-            None => "선택지는 생성이 끝나면 표시됩니다. [C] 취소 (최대 10분 대기)".to_string(),
+            None => "선택지 생성 대기 중... [C] 취소".to_string(),
         };
         vec![
             Line::from(Span::styled(
