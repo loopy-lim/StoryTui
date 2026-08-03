@@ -1,5 +1,4 @@
 use std::io::{self, Stdout};
-use std::path::Path;
 use std::sync::Arc;
 
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyEventKind};
@@ -140,11 +139,11 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
                         let pending = app.view.loading.as_ref().map(|v| v.generation_id);
                         if let Some(command) = app.handle_key(key, pending) {
-                            dispatch(command, &mut engine, &mut app, &pack, &provider, &save_store, &tx, &mut cancellation).await?;
+                            dispatch(command, &mut engine, &mut app, &pack, &provider, &config, &save_store, &tx, &mut cancellation).await?;
                         }
                         handle_ui_requests(
                             &mut app, &mut engine, &pack, &mut provider_config,
-                            &mut provider, &mut user_settings, &config.save_dir,
+                            &mut provider, &mut user_settings, &config,
                             &save_store, &tx, &mut cancellation, &mut resume_engine,
                         ).await?;
                         needs_redraw = true;
@@ -158,6 +157,7 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                                 &mut app,
                                 &pack,
                                 &provider,
+                                &config,
                                 &save_store,
                                 &tx,
                                 &mut cancellation,
@@ -166,7 +166,7 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                         }
                         handle_ui_requests(
                             &mut app, &mut engine, &pack, &mut provider_config,
-                            &mut provider, &mut user_settings, &config.save_dir,
+                            &mut provider, &mut user_settings, &config,
                             &save_store, &tx, &mut cancellation, &mut resume_engine,
                         ).await?;
                         needs_redraw = true;
@@ -202,7 +202,7 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                                 }
                             }
                         };
-                        dispatch(command, &mut engine, &mut app, &pack, &provider, &save_store, &tx, &mut cancellation).await?;
+                        dispatch(command, &mut engine, &mut app, &pack, &provider, &config, &save_store, &tx, &mut cancellation).await?;
                         needs_redraw = true;
                     }
                     HostMessage::Director { generation_id, result } => {
@@ -213,7 +213,7 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                                 EngineCommand::ProviderFailed { generation_id, error: provider_error_view(error) }
                             }
                         };
-                        dispatch(command, &mut engine, &mut app, &pack, &provider, &save_store, &tx, &mut cancellation).await?;
+                        dispatch(command, &mut engine, &mut app, &pack, &provider, &config, &save_store, &tx, &mut cancellation).await?;
                         needs_redraw = true;
                     }
                     HostMessage::Writer { generation_id, model, result } => {
@@ -227,7 +227,7 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                                 EngineCommand::ProviderFailed { generation_id, error: provider_error_view(error) }
                             }
                         };
-                        dispatch(command, &mut engine, &mut app, &pack, &provider, &save_store, &tx, &mut cancellation).await?;
+                        dispatch(command, &mut engine, &mut app, &pack, &provider, &config, &save_store, &tx, &mut cancellation).await?;
                         needs_redraw = true;
                     }
                     HostMessage::WriterChunk { generation_id, text } => {
@@ -259,7 +259,7 @@ async fn handle_ui_requests(
     provider_config: &mut story_provider::ProviderConfig,
     provider: &mut Arc<OpenAiCompatibleProvider>,
     user_settings: &mut UserSettings,
-    save_dir: &Path,
+    config: &RuntimeConfig,
     save_store: &SaveStore,
     tx: &UnboundedSender<HostMessage>,
     cancellation: &mut Option<(story_model::uuid::Uuid, CancellationToken)>,
@@ -274,6 +274,7 @@ async fn handle_ui_requests(
                 app,
                 pack,
                 provider,
+                config,
                 save_store,
                 tx,
                 cancellation,
@@ -292,7 +293,7 @@ async fn handle_ui_requests(
             provider_config,
             provider,
             user_settings,
-            save_dir,
+            &config.save_dir,
         )
         .await?;
     }
@@ -305,6 +306,7 @@ async fn handle_ui_requests(
                     app,
                     pack,
                     provider,
+                    config,
                     save_store,
                     tx,
                     cancellation,
@@ -363,6 +365,7 @@ async fn dispatch(
     app: &mut App,
     pack: &story_model::StoryPack,
     provider: &Arc<OpenAiCompatibleProvider>,
+    config: &RuntimeConfig,
     save_store: &SaveStore,
     tx: &UnboundedSender<HostMessage>,
     cancellation: &mut Option<(story_model::uuid::Uuid, CancellationToken)>,
@@ -423,7 +426,7 @@ async fn dispatch(
             }
             EngineEffect::RequestDirector {
                 generation_id,
-                request,
+                mut request,
             } => {
                 if let Some((_, token)) = cancellation.take() {
                     token.cancel();
@@ -432,6 +435,9 @@ async fn dispatch(
                 *cancellation = Some((generation_id, token.clone()));
                 let tx = tx.clone();
                 let provider = Arc::clone(provider);
+                if let Some(ref m) = config.director_model {
+                    request.model = m.clone();
+                }
                 tokio::spawn(async move {
                     let result = provider.direct(request, token).await;
                     let _ = tx.send(HostMessage::Director {
@@ -442,7 +448,7 @@ async fn dispatch(
             }
             EngineEffect::RequestWriter {
                 generation_id,
-                request,
+                mut request,
             } => {
                 let token = cancellation
                     .as_ref()
@@ -450,7 +456,14 @@ async fn dispatch(
                     .unwrap_or_default();
                 let tx = tx.clone();
                 let provider = Arc::clone(provider);
-                let model = provider.model_name().to_string();
+                if let Some(ref m) = config.writer_model {
+                    request.model = m.clone();
+                }
+                let model = if !request.model.is_empty() {
+                    request.model.clone()
+                } else {
+                    provider.model_name().to_string()
+                };
                 tokio::spawn(async move {
                     let (writer_events, mut writer_events_rx) = tokio::sync::mpsc::channel(32);
                     let write = provider.write_stream(request, writer_events, token);

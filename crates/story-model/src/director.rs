@@ -48,6 +48,12 @@ pub struct DirectorPlan {
     pub required_beats: Vec<String>,
     /// Per-character emotion arcs the Writer should voice.
     pub emotion_arcs: BTreeMap<CharacterId, EmotionArc>,
+    /// Per-character current clothing/outfit/visual design notes for this turn.
+    #[serde(default)]
+    pub character_outfits: BTreeMap<CharacterId, String>,
+    /// Detailed ambient situation / environment / weather / atmospheric notes for this turn.
+    #[serde(default)]
+    pub ambient_situation: Option<String>,
     /// Fact ids the Director authorizes revealing this turn.
     pub reveal_fact_ids: Vec<String>,
     /// Fact ids the Director forbids revealing this turn. Must be disjoint
@@ -236,6 +242,8 @@ mod tests {
             scene_goal: "나무와 카페에서 재회한다".to_string(),
             required_beats: vec!["비가 그친다".to_string(), "나무가 웃는다".to_string()],
             emotion_arcs,
+            character_outfits: Default::default(),
+            ambient_situation: None,
             reveal_fact_ids: vec!["fact-rain-stopped".to_string()],
             must_not_reveal_fact_ids: vec!["fact-namu-secret".to_string()],
             proposed_patch: patch,

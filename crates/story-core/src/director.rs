@@ -263,6 +263,8 @@ mod tests {
             scene_goal: "scene".to_string(),
             required_beats: vec!["beat".to_string()],
             emotion_arcs: arcs,
+            character_outfits: Default::default(),
+            ambient_situation: None,
             reveal_fact_ids: vec!["fact-a".to_string()],
             must_not_reveal_fact_ids: vec!["fact-b".to_string()],
             proposed_patch: patch,

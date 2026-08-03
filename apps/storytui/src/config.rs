@@ -9,6 +9,12 @@ use story_provider::ProviderConfig;
 pub struct FileConfig {
     #[serde(default)]
     pub provider: ProviderConfig,
+    /// Optional model override for the Director (planning & choice generation) step.
+    #[serde(default)]
+    pub director_model: Option<String>,
+    /// Optional model override for the Writer (narration & prose stream) step.
+    #[serde(default)]
+    pub writer_model: Option<String>,
     #[serde(default = "default_save_dir")]
     pub save_dir: PathBuf,
     #[serde(default)]
@@ -150,6 +156,8 @@ impl Default for FileConfig {
     fn default() -> Self {
         Self {
             provider: ProviderConfig::defaults(),
+            director_model: None,
+            writer_model: None,
             save_dir: default_save_dir(),
             player: PlayerProfile::default(),
             use_director_writer: false,
@@ -164,6 +172,8 @@ fn default_save_dir() -> PathBuf {
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
     pub provider: ProviderConfig,
+    pub director_model: Option<String>,
+    pub writer_model: Option<String>,
     pub save_dir: PathBuf,
     pub player: PlayerProfile,
     pub use_director_writer: bool,
@@ -284,6 +294,8 @@ pub fn load(cli: &CliOptions) -> Result<RuntimeConfig, String> {
 
     Ok(RuntimeConfig {
         provider: file.provider,
+        director_model: file.director_model,
+        writer_model: file.writer_model,
         save_dir: file.save_dir,
         player: file.player,
         use_director_writer: file.use_director_writer,

@@ -2,6 +2,7 @@
 
 반드시:
 - scene_goal과 required_beats를 순서에 얽매이지 않되 모두 실현한다.
+- DirectorPlan의 character_outfits(인물 복장/외형 상태)와 ambient_situation(주변 날씨/분위기/감각적 정황)을 감성적으로 본문에 녹여낸다.
 - reveal_fact_ids만 공개하고 must_not_reveal_fact_ids는 공개하지 않는다.
 - 현재 호칭·존댓말과 인물별 말투를 지킨다.
 - 감정을 행동과 대화로 보여 준다.

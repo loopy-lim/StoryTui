@@ -152,6 +152,8 @@ fn valid_plan() -> DirectorPlan {
         scene_goal: "scene".to_string(),
         required_beats: vec!["beat".to_string()],
         emotion_arcs: BTreeMap::new(),
+        character_outfits: Default::default(),
+        ambient_situation: None,
         reveal_fact_ids: vec!["f-rain".to_string()],
         must_not_reveal_fact_ids: vec![],
         proposed_patch: patch,

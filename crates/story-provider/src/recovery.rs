@@ -20,7 +20,7 @@
 
 use story_model::serde_json::Value;
 use story_model::uuid::Uuid;
-use story_model::{Choice, GeneratedTurnDraft, ProviderError, StatePatch, TokenUsage, TurnSummary};
+use story_model::{Choice, DirectorPlan, GeneratedTurnDraft, ProviderError, StatePatch, TokenUsage, TurnSummary};
 
 use ProviderError::InvalidGeneration;
 
@@ -179,6 +179,46 @@ pub fn parse_generated_turn(raw: &str, generation_id: Uuid) -> Result<ParseOutco
         usage: parsed.usage,
     };
     Ok(ParseOutcome { draft, repairs })
+}
+
+/// Strict Director plan JSON parser with resilience and single-pass recovery.
+///
+/// Strips CoT `<think>` blocks, extracts JSON objects from surrounding prose/markdown,
+/// unwraps double-encoded string literals, and repairs trailing commas before parsing
+/// into a [`DirectorPlan`].
+pub fn parse_director_plan(raw: &str) -> Result<DirectorPlan, ProviderError> {
+    let work = {
+        let lead = raw.trim_start();
+        if lead.starts_with('"') {
+            match serde_json::from_str::<String>(lead) {
+                Ok(inner) => inner,
+                Err(_) => raw.to_string(),
+            }
+        } else {
+            raw.to_string()
+        }
+    };
+
+    let stripped = strip_reasoning(&work);
+    let trimmed = stripped.trim();
+    let located = locate_json(trimmed)
+        .ok_or_else(|| InvalidGeneration(detail("json_extract: no JSON object found in director plan")))?;
+
+    match serde_json::from_str::<DirectorPlan>(located) {
+        Ok(plan) => Ok(plan),
+        Err(_) => {
+            let quote_repaired = escape_unescaped_quotes(located);
+            let repaired = strip_trailing_commas(&quote_repaired);
+            serde_json::from_str::<DirectorPlan>(&repaired).map_err(|e| {
+                let stage = if serde_json::from_str::<Value>(&repaired).is_ok() {
+                    "schema"
+                } else {
+                    "json_syntax"
+                };
+                InvalidGeneration(detail(&format!("director plan {stage}: {e}")))
+            })
+        }
+    }
 }
 
 /// Rename one known legacy top-level field without weakening strict parsing.

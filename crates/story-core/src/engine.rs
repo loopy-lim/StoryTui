@@ -1587,7 +1587,7 @@ fn build_director_request(
         generation_id,
         messages,
         model: "mock".to_string(),
-        temperature: 0.7,
+        temperature: 0.3,
         top_p: 0.9,
         top_k: 40,
         max_tokens: 1024,

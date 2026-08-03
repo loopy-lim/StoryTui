@@ -28,7 +28,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{ProviderConfig, StructuredOutputMode};
 use crate::envelope::ChatCompletionRequest;
-use crate::recovery::{parse_generated_turn, strip_reasoning};
+use crate::recovery::parse_generated_turn;
 use crate::sse::{SseEvent, SseParser};
 
 /// Maximum backoff cap. The exponential backoff starts at `BASE_BACKOFF_MS`.
@@ -653,7 +653,12 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
         request: DirectorRequest,
         cancel: CancellationToken,
     ) -> Result<DirectorPlan, ProviderError> {
-        let body = ChatCompletionRequest::from_director(&request, &self.config.model);
+        let model_name = if request.model.is_empty() || request.model == "mock" {
+            &self.config.model
+        } else {
+            &request.model
+        };
+        let body = ChatCompletionRequest::from_director(&request, model_name);
         let max_attempts = self.config.max_retries.saturating_add(1);
 
         for attempt in 0..max_attempts {
@@ -703,17 +708,7 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
                 }
             };
             let content = parsed.content();
-
-            // Strict parse into DirectorPlan. The model is contractually
-            // expected to emit exactly this shape; any drift ⇒ InvalidGeneration
-            // (sanitized detail via the serde error, which never embeds the
-            // raw body). Strip a leading `<think>` block first so a hybrid
-            // reasoning model cannot corrupt the JSON the same way it can on the
-            // single-call path.
-            let cleaned = strip_reasoning(&content);
-            let plan: DirectorPlan = serde_json::from_str(&cleaned).map_err(|e| {
-                ProviderError::InvalidGeneration(format!("director plan strict parse failed: {e}"))
-            })?;
+            let plan = crate::recovery::parse_director_plan(&content)?;
             return Ok(plan);
         }
         Err(ProviderError::Protocol(
@@ -733,7 +728,12 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
         sink: Sender<WriterEvent>,
         cancel: CancellationToken,
     ) -> Result<WriterFinish, ProviderError> {
-        let body = ChatCompletionRequest::from_writer(&request, &self.config.model);
+        let model_name = if request.model.is_empty() || request.model == "mock" {
+            &self.config.model
+        } else {
+            &request.model
+        };
+        let body = ChatCompletionRequest::from_writer(&request, model_name);
         let generation_id = request.generation_id;
 
         if cancel.is_cancelled() {
