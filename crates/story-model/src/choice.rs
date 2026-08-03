@@ -15,14 +15,17 @@ pub struct Choice {
     /// Short human-readable label shown in the choice list.
     pub label: String,
     /// Free-form description of the player's intent (drives generation).
+    #[serde(default)]
     pub intent: String,
     /// Optional tone hint (e.g. "playful", "cold").
     pub tone: Option<String>,
     /// Character this choice is directed at, if any.
     pub target: Option<CharacterId>,
     /// Risk classification surfaced to the player.
+    #[serde(default)]
     pub risk: RiskLevel,
     /// Conditions that must hold for the choice to be selectable.
+    #[serde(default)]
     pub hidden_requirements: Vec<ConditionExpr>,
     /// Optional spoiler-free preview text shown before selecting.
     pub preview: Option<String>,

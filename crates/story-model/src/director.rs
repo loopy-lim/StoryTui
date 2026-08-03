@@ -45,8 +45,10 @@ pub struct DirectorPlan {
     /// One-sentence scene-level goal the Writer must realize.
     pub scene_goal: String,
     /// Story beats the narration must hit (in order).
+    #[serde(default)]
     pub required_beats: Vec<String>,
     /// Per-character emotion arcs the Writer should voice.
+    #[serde(default)]
     pub emotion_arcs: BTreeMap<CharacterId, EmotionArc>,
     /// Per-character current clothing/outfit/visual design notes for this turn.
     #[serde(default)]
@@ -55,21 +57,26 @@ pub struct DirectorPlan {
     #[serde(default)]
     pub ambient_situation: Option<String>,
     /// Fact ids the Director authorizes revealing this turn.
+    #[serde(default)]
     pub reveal_fact_ids: Vec<String>,
     /// Fact ids the Director forbids revealing this turn. Must be disjoint
     /// from `reveal_fact_ids`; the validator rejects a plan that contradicts
     /// this.
+    #[serde(default)]
     pub must_not_reveal_fact_ids: Vec<String>,
     /// The proposed state mutation. Validated + dry-run before the Writer is
     /// called; the Writer can never change it.
+    #[serde(default)]
     pub proposed_patch: StatePatch,
     /// Player-facing choices offered this turn (shape-validated by the
     /// Director validator; final authority lives here, not in the Writer).
     pub choices: Vec<Choice>,
     /// Director-declared conflict checks the Writer should be mindful of.
+    #[serde(default)]
     pub conflict_checks: Vec<ConflictCheck>,
     /// Human-readable description of the end-condition this turn is steering
     /// toward (non-empty; surfaced to the engine for ending evaluation).
+    #[serde(default)]
     pub end_condition: String,
 }
 

@@ -204,13 +204,16 @@ pub fn parse_director_plan(raw: &str) -> Result<DirectorPlan, ProviderError> {
     let located = locate_json(trimmed)
         .ok_or_else(|| InvalidGeneration(detail("json_extract: no JSON object found in director plan")))?;
 
-    match serde_json::from_str::<DirectorPlan>(located) {
+    let aliased = normalize_director_aliases(located);
+
+    match serde_json::from_str::<DirectorPlan>(&aliased) {
         Ok(plan) => Ok(plan),
         Err(_) => {
-            let quote_repaired = escape_unescaped_quotes(located);
+            let quote_repaired = escape_unescaped_quotes(&aliased);
             let repaired = strip_trailing_commas(&quote_repaired);
-            serde_json::from_str::<DirectorPlan>(&repaired).map_err(|e| {
-                let stage = if serde_json::from_str::<Value>(&repaired).is_ok() {
+            let repaired_aliased = normalize_director_aliases(&repaired);
+            serde_json::from_str::<DirectorPlan>(&repaired_aliased).map_err(|e| {
+                let stage = if serde_json::from_str::<Value>(&repaired_aliased).is_ok() {
                     "schema"
                 } else {
                     "json_syntax"
@@ -219,6 +222,34 @@ pub fn parse_director_plan(raw: &str) -> Result<DirectorPlan, ProviderError> {
             })
         }
     }
+}
+
+fn normalize_director_aliases(input: &str) -> String {
+    let Ok(Value::Object(mut map)) = serde_json::from_str::<Value>(input) else {
+        return input.to_string();
+    };
+
+    if !map.contains_key("scene_goal") && map.contains_key("goal") {
+        if let Some(v) = map.remove("goal") {
+            map.insert("scene_goal".to_string(), v);
+        }
+    }
+    if !map.contains_key("proposed_patch") {
+        if let Some(v) = map
+            .remove("proposed_state_patch")
+            .or_else(|| map.remove("state_patch"))
+            .or_else(|| map.remove("patch"))
+        {
+            map.insert("proposed_patch".to_string(), v);
+        }
+    }
+    if !map.contains_key("choices") {
+        if let Some(v) = map.remove("options").or_else(|| map.remove("choice_list")) {
+            map.insert("choices".to_string(), v);
+        }
+    }
+
+    serde_json::to_string(&Value::Object(map)).unwrap_or_else(|_| input.to_string())
 }
 
 /// Rename one known legacy top-level field without weakening strict parsing.

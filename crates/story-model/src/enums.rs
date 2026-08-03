@@ -49,9 +49,10 @@ pub enum TimeSlot {
 }
 
 /// Risk classification attached to a [`crate::Choice`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RiskLevel {
+    #[default]
     Safe,
     Low,
     Medium,
