@@ -80,6 +80,7 @@ pub fn handle_request(
     app: &mut App,
     pack: &StoryPack,
     save_store: &SaveStore,
+    use_director_writer: bool,
     cancellation: &mut Option<(story_model::uuid::Uuid, CancellationToken)>,
 ) {
     match request {
@@ -105,10 +106,11 @@ pub fn handle_request(
                 .map_err(|error| error.to_string())
                 .and_then(|envelope| engine_from_envelope(pack, envelope));
             match restored {
-                Ok(restored) => {
+                Ok(mut restored) => {
                     if let Some((_, token)) = cancellation.take() {
                         token.cancel();
                     }
+                    restored.use_director_writer = use_director_writer;
                     *engine = restored;
                     app.close_save_load();
                     app.set_lists(&engine.game.history, &engine.game.memories);

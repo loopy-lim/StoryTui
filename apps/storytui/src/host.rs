@@ -310,6 +310,13 @@ async fn handle_ui_requests(
     if let Some(request) = app.take_home_request() {
         match request {
             HomeRequest::StartNew => {
+                let mut new_engine = EngineState::initial(pack);
+                new_engine.use_director_writer = config.use_director_writer;
+                *engine = new_engine;
+                app.set_view(build_view(engine, pack, None, None));
+                app.set_lists(&engine.game.history, &engine.game.memories);
+                app.follow_story_end();
+                app.close_home();
                 dispatch(
                     EngineCommand::StartNewGame,
                     engine,
@@ -324,7 +331,8 @@ async fn handle_ui_requests(
                 .await?;
             }
             HomeRequest::Continue => {
-                if let Some(restored) = resume_engine.take() {
+                if let Some(mut restored) = resume_engine.take() {
+                    restored.use_director_writer = config.use_director_writer;
                     *engine = restored;
                     app.set_view(build_view(engine, pack, None, None));
                     app.set_lists(&engine.game.history, &engine.game.memories);
@@ -336,7 +344,15 @@ async fn handle_ui_requests(
         }
     }
     if let Some(request) = app.take_save_load_request() {
-        saves::handle_request(request, engine, app, pack, save_store, cancellation);
+        saves::handle_request(
+            request,
+            engine,
+            app,
+            pack,
+            save_store,
+            config.use_director_writer,
+            cancellation,
+        );
     }
     Ok(())
 }
