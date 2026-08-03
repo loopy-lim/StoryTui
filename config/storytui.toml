@@ -31,8 +31,8 @@ max_tokens = 8192
 # A valid but short scene receives one best-effort rewrite request. If the
 # rewrite is still short or malformed, StoryTUI keeps the first valid scene.
 min_narration_chars = 1200
-request_timeout_ms = 300000
-connect_timeout_ms = 5000
+request_timeout_ms = 600000
+connect_timeout_ms = 10000
 max_retries = 2
 context_budget_tokens = 24576
 # Prefer constrained JSON Schema generation on the local oMLX endpoint. In

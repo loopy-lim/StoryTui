@@ -543,11 +543,32 @@ fn choice_panel_height(view: &AppViewModel, width: u16) -> u16 {
 }
 
 fn render_choice_panel(frame: &mut Frame, area: Rect, view: &AppViewModel, selected: usize) {
+    let turn = view.status.turn;
+    let elapsed_mins = (turn as u32) * 30;
+    let hours = elapsed_mins / 60;
+    let mins = elapsed_mins % 60;
+    let elapsed_label = if turn == 0 {
+        "시작 (0분)".to_string()
+    } else if hours > 0 && mins > 0 {
+        format!("{hours}시간 {mins}분 경과")
+    } else if hours > 0 {
+        format!("{hours}시간 경과")
+    } else {
+        format!("{mins}분 경과")
+    };
+
+    let title_text = format!(
+        "선택지 · 시간대: {} · 누적 시간: {} (턴 {})",
+        time_slot_label(view.time_slot),
+        elapsed_label,
+        turn
+    );
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Span::styled(
-            format!("선택지 · 현재 시간: {}", time_slot_label(view.time_slot)),
+            title_text,
             Style::default().add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
@@ -559,7 +580,7 @@ fn render_choice_panel(frame: &mut Frame, area: Rect, view: &AppViewModel, selec
                 Style::default().fg(Color::LightYellow),
             )),
             Line::from(Span::styled(
-                "선택지는 생성이 끝나면 표시됩니다. [C] 취소",
+                "선택지는 생성이 끝나면 표시됩니다. [C] 취소 (최대 10분 대기)",
                 Style::default().fg(Color::DarkGray),
             )),
         ]
