@@ -123,6 +123,10 @@ pub struct App {
     settings_opened: bool,
     settings_returns_home: bool,
     generation_models: BTreeMap<Uuid, String>,
+    /// Wall-clock seconds each completed generation took, keyed by
+    /// `generation_id`. Captured when a turn's loading indicator clears so the
+    /// per-turn header can show "몇 분 만에 생성되었는지" after the fact.
+    generation_durations: BTreeMap<Uuid, u64>,
     pub generation_start_time: Option<std::time::Instant>,
 }
 
@@ -164,6 +168,7 @@ impl App {
             settings_opened: false,
             settings_returns_home: false,
             generation_models: BTreeMap::new(),
+            generation_durations: BTreeMap::new(),
             generation_start_time: if loading { Some(std::time::Instant::now()) } else { None },
         }
     }
@@ -280,6 +285,18 @@ impl App {
         self.generation_models.insert(generation_id, model);
     }
 
+    /// Record how long a just-completed generation took, keyed by
+    /// `generation_id`. Called by the host on the success path BEFORE the
+    /// commit is dispatched, so the per-turn header (built in [`Self::set_lists`])
+    /// already sees the value. Reads the live stopwatch; safe to call once per
+    /// turn (the single-pass `Generation` and the 2-stage `Writer` finish).
+    pub fn record_generation_duration(&mut self, generation_id: Uuid) {
+        if let Some(start) = self.generation_start_time {
+            self.generation_durations
+                .insert(generation_id, start.elapsed().as_secs());
+        }
+    }
+
     pub fn generation_elapsed_seconds(&self) -> Option<u64> {
         self.generation_start_time.map(|start| start.elapsed().as_secs())
     }
@@ -353,6 +370,10 @@ impl App {
                 turn: entry.turn,
                 scene_id: entry.scene_id.clone(),
                 model: self.generation_models.get(&entry.generation_id).cloned(),
+                generation_secs: self
+                    .generation_durations
+                    .get(&entry.generation_id)
+                    .copied(),
                 player_action: entry
                     .player_action
                     .as_ref()
@@ -1178,6 +1199,50 @@ mod tests {
             u16::MAX,
             "new scene follows the bottom"
         );
+    }
+
+    #[test]
+    fn set_lists_attaches_generation_duration_per_turn() {
+        let mut app = App::new(sample_view(1));
+        let g1 = Uuid::new_v4();
+        let g2 = Uuid::new_v4();
+        let entries = vec![
+            story_model::HistoryEntry {
+                id: Uuid::new_v4(),
+                turn: 1,
+                scene_id: "station".to_string(),
+                created_at: chrono::Utc::now(),
+                narration: "첫 장면".to_string(),
+                player_action: None,
+                choices: Vec::new(),
+                applied_patch: story_model::StatePatch::default(),
+                generation_id: g1,
+            },
+            story_model::HistoryEntry {
+                id: Uuid::new_v4(),
+                turn: 2,
+                scene_id: "cafe".to_string(),
+                created_at: chrono::Utc::now(),
+                narration: "다음 장면".to_string(),
+                player_action: None,
+                choices: Vec::new(),
+                applied_patch: story_model::StatePatch::default(),
+                generation_id: g2,
+            },
+        ];
+
+        // No durations recorded yet → entries carry None.
+        app.set_lists(&entries, &[]);
+        assert_eq!(app.story_stack[0].generation_secs, None);
+        assert_eq!(app.story_stack[1].generation_secs, None);
+
+        // Record durations keyed by generation_id (as the host does on the
+        // completion path, before the committing dispatch).
+        app.generation_durations.insert(g1, 47);
+        app.generation_durations.insert(g2, 133);
+        app.set_lists(&entries, &[]);
+        assert_eq!(app.story_stack[0].generation_secs, Some(47));
+        assert_eq!(app.story_stack[1].generation_secs, Some(133));
     }
 
     #[test]

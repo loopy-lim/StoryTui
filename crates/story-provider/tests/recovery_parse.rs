@@ -182,13 +182,21 @@ fn korean_enum_labels_from_local_model_are_normalized() {
 }
 
 #[test]
-fn duplicate_choice_labels_are_rejected_for_variation_retry() {
+fn duplicate_choice_labels_are_deduplicated() {
     let raw = VALID_BODY.replace(
         r#"{"id":"c1","label":"a","intent":"i","tone":null,"target":null,"risk":"safe","hidden_requirements":[],"preview":null}"#,
         r#"{"id":"c1","label":"같은 선택","intent":"i","tone":null,"target":null,"risk":"safe","hidden_requirements":[],"preview":null},{"id":"c2","label":"같은 선택","intent":"i","tone":null,"target":null,"risk":"safe","hidden_requirements":[],"preview":null}"#,
     );
-    let err = expect_err(&raw);
-    assert!(err.to_string().contains("duplicate choice labels"));
+    let draft = parse_generated_turn(&raw, GID)
+        .expect("duplicate labels should be deduplicated, not rejected")
+        .draft;
+    assert_eq!(draft.choices.len(), 2);
+    assert_ne!(draft.choices[0].label, draft.choices[1].label);
+    assert!(
+        draft.choices[1].label.contains("(2)"),
+        "expected a (2) suffix on the colliding label: {}",
+        draft.choices[1].label
+    );
 }
 
 #[test]

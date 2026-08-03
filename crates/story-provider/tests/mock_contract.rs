@@ -233,6 +233,7 @@ async fn direct_and_write_stream_are_unsupported_in_mvp() {
         top_p: 0.9,
         top_k: 40,
         max_tokens: 1024,
+        json_schema: None,
     };
     let direct = p.direct(director_req, cancel.clone()).await;
     assert!(

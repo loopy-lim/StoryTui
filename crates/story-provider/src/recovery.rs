@@ -129,15 +129,12 @@ pub fn parse_generated_turn(raw: &str, generation_id: Uuid) -> Result<ParseOutco
         }
     };
 
-    // Sanitize choice ids and intents.
-    for (i, choice) in parsed.choices.iter_mut().enumerate() {
-        if choice.id.trim().is_empty() {
-            choice.id = format!("next-{i}");
-        }
-        if choice.intent.trim().is_empty() {
-            choice.intent = choice.label.clone();
-        }
-    }
+    // Sanitize choice ids/intents AND deduplicate colliding labels by appending
+    // an "(N)" suffix. A label collision is treated as a recoverable, cosmetic
+    // defect rather than a contract violation: rejecting here would roll the
+    // whole turn back and surface "모델 응답 형식을 이해하지 못했습니다". This
+    // mirrors what [`parse_director_plan`] does for the 2-stage path.
+    sanitize_choices(&mut parsed.choices);
 
     // (5) Validate.
     let n = parsed.choices.len();
@@ -145,23 +142,6 @@ pub fn parse_generated_turn(raw: &str, generation_id: Uuid) -> Result<ParseOutco
         return Err(InvalidGeneration(detail(&format!(
             "validation: choice count out of range [1, 6]: got {n}"
         ))));
-    }
-    let unique_labels = parsed
-        .choices
-        .iter()
-        .map(|choice| {
-            choice
-                .label
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .collect::<std::collections::BTreeSet<_>>();
-    if unique_labels.len() != n {
-        return Err(InvalidGeneration(
-            "validation: duplicate choice labels; choices must offer different directions"
-                .to_string(),
-        ));
     }
     if parsed.narration.trim().is_empty() {
         return Err(InvalidGeneration(detail(

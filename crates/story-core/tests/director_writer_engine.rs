@@ -217,6 +217,27 @@ fn use_director_writer_defaults_to_false() {
 }
 
 #[test]
+fn start_new_game_on_director_path_emits_request_director() {
+    let pack = sample_pack();
+    let mut init = EngineState::initial(&pack);
+    init.use_director_writer = true;
+    let t = reduce(&init, EngineCommand::StartNewGame, &pack).expect("start");
+    assert!(
+        t.effects
+            .iter()
+            .any(|e| matches!(e, EngineEffect::RequestDirector { .. })),
+        "StartNewGame on the 2-stage path MUST emit RequestDirector so the \
+         configured Writer model narrates the opening scene too"
+    );
+    assert!(
+        !t.effects
+            .iter()
+            .any(|e| matches!(e, EngineEffect::RequestGeneration { .. })),
+        "StartNewGame on the 2-stage path MUST NOT emit RequestGeneration"
+    );
+}
+
+#[test]
 fn submit_choice_on_mvp_path_emits_request_generation_not_director() {
     let pack = sample_pack();
     let init = EngineState::initial(&pack);

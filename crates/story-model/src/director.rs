@@ -132,6 +132,12 @@ pub struct DirectorRequest {
     pub top_k: u32,
     /// Maximum output tokens for this turn.
     pub max_tokens: u32,
+    /// Optional JSON Schema for the [`DirectorPlan`] shape, sent as
+    /// `response_format` to providers that support structured output. The
+    /// provider decides whether to attach it (mode + capability); Rust still
+    /// strict-parses + validates the plan afterward.
+    #[serde(default)]
+    pub json_schema: Option<crate::serde_json::Value>,
 }
 
 /// A streaming Writer generation request.
@@ -325,6 +331,7 @@ mod tests {
             top_p: 0.9,
             top_k: 40,
             max_tokens: 1024,
+            json_schema: None,
         };
         let json = serde_json::to_string(&director).expect("serialize");
         let back: DirectorRequest = serde_json::from_str(&json).expect("deserialize");

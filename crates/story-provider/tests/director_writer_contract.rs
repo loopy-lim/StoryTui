@@ -42,6 +42,7 @@ fn director_request() -> DirectorRequest {
         top_p: 0.9,
         top_k: 40,
         max_tokens: 1024,
+        json_schema: None,
     }
 }
 

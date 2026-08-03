@@ -94,10 +94,26 @@ impl ChatCompletionRequest {
     }
 
     /// Build a non-streaming envelope for a Director generation request (W10).
-    /// Mirrors [`Self::from_turn`] but takes the Director sampling fields and
-    /// forces `stream: false` and no `response_format` (the Director's JSON
-    /// shape is enforced by a strict client-side parse, not `response_format`).
-    pub fn from_director(req: &DirectorRequest, model: &str) -> Self {
+    /// Mirrors [`Self::from_turn`]: when `send_response_format` is true and the
+    /// request carries a schema, the [`DirectorPlan`] JSON shape is attached as
+    /// `response_format` so guided-decoding servers emit the required fields
+    /// under the canonical keys. Rust still strict-parses + validates after.
+    pub fn from_director(req: &DirectorRequest, model: &str, send_response_format: bool) -> Self {
+        let response_format = if send_response_format {
+            req.json_schema.as_ref().map(|schema| ResponseFormat {
+                kind: "json_schema".to_string(),
+                json_schema: Some(JsonSchemaSpec {
+                    name: "director_plan".to_string(),
+                    // Non-strict: the plan has dynamic-keyed maps and many
+                    // optional fields that do not fit OpenAI strict's
+                    // all-properties-required rule.
+                    strict: false,
+                    schema: schema.clone(),
+                }),
+            })
+        } else {
+            None
+        };
         Self {
             model: model.to_string(),
             messages: req.messages.clone(),
@@ -106,7 +122,7 @@ impl ChatCompletionRequest {
             top_k: req.top_k,
             max_tokens: req.max_tokens,
             stream: false,
-            response_format: None,
+            response_format,
         }
     }
 

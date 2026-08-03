@@ -26,15 +26,33 @@ top_p = 0.92
 top_k = 40
 # Narration, choices, state_patch and summary share one completion. Reserve
 # enough room for a full Korean scene rather than forcing the prose to end
-# early once its JSON metadata is emitted.
+# early once its JSON metadata is emitted. This output cap is also applied to
+# the Director plan (W10 2-stage path), which previously used a hardcoded 1024
+# and got truncated mid-JSON ("EOF while parsing").
+#
+# This is a CAP, not a target: the model stops at finish_reason=stop (a normal
+# scene is ~2-3k tokens, ~1-2 min at ~35 tok/s). Keep it low enough that a
+# repeating/looping model is cut well under the request timeout: at 35 tok/s,
+# 8192 tokens ≈ 3.8 min worst case. Raise only if real scenes get truncated.
 max_tokens = 8192
-# A valid but short scene receives one best-effort rewrite request. If the
-# rewrite is still short or malformed, StoryTUI keeps the first valid scene.
-min_narration_chars = 1200
+# Length floor for the best-effort rewrite. DISABLED (0): the model routinely
+# emitted ~900-1150-char scenes, so a 1200 floor triggered a full regeneration
+# almost every turn (~2x latency, then a marginally longer scene). Throwing a
+# valid scene away for length is the wrong fix — the right fix is rewriting the
+# Writer prompt so the model naturally writes longer scenes. Until then, keep
+# the first valid scene as-is. Set >0 to re-enable the rewrite.
+min_narration_chars = 0
 request_timeout_ms = 600000
 connect_timeout_ms = 10000
-max_retries = 2
-context_budget_tokens = 24576
+# One retry (2 attempts). Timeouts are never retried (a slow local model just
+# re-waits), and parse/contract retries are capped here too so a single click
+# cannot stack into a multi-minute blind wait.
+max_retries = 1
+# The model exposes a 131072-token context window. Budget most of it for the
+# input prompt (history + memory digest) so long sessions are not truncated,
+# while keeping `max_tokens` reserved for the completion. Char-based, which is
+# conservative for Korean.
+context_budget_tokens = 114688
 # Prefer constrained JSON Schema generation on the local oMLX endpoint. In
 # `auto` mode StoryTUI retries once without it only when the server cannot
 # satisfy the contract, then disables the capability for that session.

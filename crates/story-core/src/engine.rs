@@ -307,7 +307,6 @@ fn reduce_start_new_game(state: &EngineState, pack: &StoryPack) -> Result<Transi
         validated_plan: None,
         choice_refresh: false,
     };
-    let request = build_turn_request(generation_id, pack, &game, None, None);
     let mut next = clone_state(state);
     next.game = game;
     next.pack_metadata = pack.metadata.clone();
@@ -316,13 +315,22 @@ fn reduce_start_new_game(state: &EngineState, pack: &StoryPack) -> Result<Transi
     next.lineage = vec![generation_id];
 
     let loading_view = build_view(&next, pack, Some(&pending), None);
-    let effects = vec![
-        EngineEffect::RequestGeneration {
-            generation_id,
-            request,
-        },
-        EngineEffect::PublishView(Box::new(loading_view)),
-    ];
+    let effects = if state.use_director_writer {
+        // 2-stage path: plan the opening with the Director and narrate it with
+        // the Writer, so the configured Writer model renders the first scene
+        // too (consistent with every subsequent turn).
+        let request = build_director_request(generation_id, pack, &next.game, None);
+        vec![
+            EngineEffect::RequestDirector { generation_id, request },
+            EngineEffect::PublishView(Box::new(loading_view)),
+        ]
+    } else {
+        let request = build_turn_request(generation_id, pack, &next.game, None, None);
+        vec![
+            EngineEffect::RequestGeneration { generation_id, request },
+            EngineEffect::PublishView(Box::new(loading_view)),
+        ]
+    };
     Ok(Transition {
         state: next,
         effects,
@@ -1590,8 +1598,103 @@ fn build_director_request(
         temperature: 0.3,
         top_p: 0.9,
         top_k: 40,
-        max_tokens: 1024,
+        // The Director plan is a large Korean JSON object (scene_goal, beats,
+        // emotion_arcs, outfits, ambient_situation, reveal lists, a patch and
+        // 3–4 choices × 7 fields). 1024 tokens truncated it mid-object. The
+        // live provider overrides this with the operator's `max_tokens`; this
+        // default only binds callers that bypass that override (mock, tests).
+        max_tokens: 6144,
+        // Guide constrained decoding toward the DirectorPlan shape so the model
+        // emits required fields (scene_goal, choices, ...) under the canonical
+        // keys. Rust still strict-parses + validates afterward; the provider
+        // only attaches this when structured output is enabled.
+        json_schema: Some(director_plan_json_schema()),
     }
+}
+
+/// JSON Schema for [`story_model::DirectorPlan`], sent to OpenAI-compatible
+/// providers that support structured output. Unlike [`generated_turn_json_schema`]
+/// this is not declared `strict`: the plan's nested maps (emotion_arcs,
+/// character_outfits keyed by dynamic character ids) and many optional fields
+/// make full strict mode brittle on local guided-decoding servers. The required
+/// set is exactly what makes a plan pass [`crate::director::validate_plan`] —
+/// everything else is guidance the model may include.
+fn director_plan_json_schema() -> story_model::serde_json::Value {
+    story_model::serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["scene_goal", "proposed_patch", "choices", "end_condition"],
+        "properties": {
+            "scene_goal": {"type": "string"},
+            "required_beats": {"type": "array", "items": {"type": "string"}},
+            "emotion_arcs": {
+                "type": "object",
+                "additionalProperties": {
+                    "type": "object",
+                    "properties": {
+                        "character": {"type": "string"},
+                        "from": {"type": "string"},
+                        "to": {"type": "string"},
+                        "reason": {"type": ["string", "null"]}
+                    }
+                }
+            },
+            "character_outfits": {
+                "type": "object",
+                "additionalProperties": {"type": "string"}
+            },
+            "ambient_situation": {"type": ["string", "null"]},
+            "reveal_fact_ids": {"type": "array", "items": {"type": "string"}},
+            "must_not_reveal_fact_ids": {"type": "array", "items": {"type": "string"}},
+            "proposed_patch": {
+                "type": "object",
+                "properties": {
+                    "affection_delta": {"type": "object", "additionalProperties": {"type": "integer"}},
+                    "trust_delta": {"type": "object", "additionalProperties": {"type": "integer"}},
+                    "tension_delta": {"type": "object", "additionalProperties": {"type": "integer"}},
+                    "relationship_transitions": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "set_flags": {"type": "object", "additionalProperties": {"type": "boolean"}},
+                    "number_delta": {"type": "object", "additionalProperties": {"type": "integer"}},
+                    "set_strings": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "inventory_delta": {"type": "object", "additionalProperties": {"type": "integer"}},
+                    "add_events": {"type": "array", "items": {"type": "string"}},
+                    "next_location": {"type": ["string", "null"]},
+                    "next_time_slot": {"type": ["string", "null"]},
+                    "proposed_route": {"type": ["string", "null"]}
+                }
+            },
+            "choices": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 6,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "label": {"type": "string"},
+                        "intent": {"type": "string"},
+                        "tone": {"type": ["string", "null"]},
+                        "target": {"type": ["string", "null"]},
+                        "risk": {"type": "string"},
+                        "hidden_requirements": {"type": "array", "items": {"type": "string"}},
+                        "preview": {"type": ["string", "null"]}
+                    }
+                }
+            },
+            "conflict_checks": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "description": {"type": "string"},
+                        "resolved": {"type": "boolean"}
+                    }
+                }
+            },
+            "end_condition": {"type": "string"}
+        }
+    })
 }
 
 /// Build a [`WriterRequest`] for the 2-stage path. The Writer is given the
@@ -1621,7 +1724,11 @@ fn build_writer_request(
         temperature: 0.85,
         top_p: 0.92,
         top_k: 40,
-        max_tokens: 1800,
+        // Rich Korean narration (min_narration_chars is in the thousands) needs
+        // well over the old 1800-token cap. The live provider overrides this
+        // with the operator's `max_tokens`; this default only binds callers
+        // that bypass that override (mock, tests).
+        max_tokens: 8192,
         plan_digest,
     }
 }

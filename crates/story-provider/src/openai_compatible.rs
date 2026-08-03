@@ -272,8 +272,10 @@ impl OpenAiCompatibleProvider {
             let resp = match result {
                 Ok(r) => r,
                 Err(e) => {
-                    // Transient (connect / timeout / pool) -> retry, else fail.
-                    if attempt + 1 < max_attempts {
+                    // Retry transient connect/5xx/pool errors, but NOT timeouts:
+                    // a slow local model will not be faster on a fresh attempt,
+                    // so retrying just doubles the wait for the same outcome.
+                    if attempt + 1 < max_attempts && !e.is_timeout() {
                         Self::sleep_or_cancel(attempt, cancel).await?;
                         continue;
                     }
@@ -317,7 +319,9 @@ impl OpenAiCompatibleProvider {
                         error = %e,
                         "chat-completion response body read failed"
                     );
-                    if attempt + 1 < max_attempts {
+                    // Do not retry a timeout: the model is simply slow, and a
+                    // fresh attempt will time out again after another full wait.
+                    if attempt + 1 < max_attempts && !timed_out {
                         Self::sleep_or_cancel(attempt, cancel).await?;
                         continue;
                     }
@@ -354,6 +358,7 @@ impl OpenAiCompatibleProvider {
                 };
             let content = parsed.content();
             let usage = parsed.usage();
+            log_token_usage("turn", request.generation_id, &self.config.model, usage.clone());
             let finish_reason = parsed.finish_reason().unwrap_or("missing").to_string();
             return match parse_generated_turn(&content, request.generation_id) {
                 Ok(outcome) => {
@@ -505,6 +510,37 @@ fn map_send_error(e: reqwest::Error, request_timeout_ms: u64) -> ProviderError {
     }
 }
 
+/// Record a generation's token usage so an operator can analyze where time goes
+/// (e.g. `completion_tokens` far exceeding the visible prose implies hidden
+/// `<think>` reasoning or JSON metadata overhead). Logged on the success path
+/// of each stage; `stage` is "turn" | "director" | "writer".
+fn log_token_usage(
+    stage: &str,
+    generation_id: story_model::uuid::Uuid,
+    model: &str,
+    usage: Option<TokenUsage>,
+) {
+    match usage {
+        Some(u) => tracing::info!(
+            target: "story_provider::openai_compatible",
+            %generation_id,
+            model,
+            stage,
+            prompt_tokens = u.prompt_tokens,
+            completion_tokens = u.completion_tokens,
+            total_tokens = u.total_tokens,
+            "token usage"
+        ),
+        None => tracing::info!(
+            target: "story_provider::openai_compatible",
+            %generation_id,
+            model,
+            stage,
+            "token usage unavailable (server did not report usage)"
+        ),
+    }
+}
+
 #[async_trait]
 impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
     fn id(&self) -> &str {
@@ -624,21 +660,10 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
                 // surfacing a player-facing format error.
                 self.do_generate(&request, true, &cancel, Some(0.2)).await
             }
-            Err(ProviderError::InvalidGeneration(detail))
-                if detail.contains("duplicate choice labels") =>
-            {
-                tracing::warn!(
-                    target: "story_provider::openai_compatible",
-                    "duplicate choices; retrying once with an safe variation reminder"
-                );
-                let mut repair_request = request.clone();
-                repair_request.messages.push(story_model::ChatMessage {
-                    role: "user".to_string(),
-                    content: "중요: 선택지 3개는 문장과 전략이 서로 달라야 합니다. 같은 문장을 반복하지 말고, 정면 대응·신중한 탐색·유보 중 서로 다른 방향으로 다시 JSON만 반환하세요.".to_string(),
-                });
-                self.do_generate(&repair_request, true, &cancel, Some(0.3))
-                    .await
-            }
+            // NOTE: duplicate choice labels are deduplicated inside
+            // [`parse_generated_turn`] (via `sanitize_choices`) rather than
+            // rejected, so a collision never rolls the turn back. There is
+            // therefore no dedicated duplicate-label retry arm here.
             Err(other) => Err(other),
         }
     }
@@ -650,15 +675,24 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
     /// contract as [`Self::generate_turn`].
     async fn direct(
         &self,
-        request: DirectorRequest,
+        mut request: DirectorRequest,
         cancel: CancellationToken,
     ) -> Result<DirectorPlan, ProviderError> {
+        // Apply the operator's output budget. The Director plan JSON (Korean,
+        // many nested fields) needs far more than the request's low default;
+        // without this the plan is truncated mid-object and the parse fails
+        // with `EOF`, surfacing as "모델 응답 형식을 이해하지 못했습니다".
+        request.max_tokens = self.config.max_tokens;
         let model_name = if request.model.is_empty() || request.model == "mock" {
             &self.config.model
         } else {
             &request.model
         };
-        let body = ChatCompletionRequest::from_director(&request, model_name);
+        // Attach the DirectorPlan JSON schema when the server supports
+        // structured output, so the model emits required fields (scene_goal,
+        // choices, ...) under canonical keys instead of omitting them.
+        let send_rf = self.structured_enabled() && request.json_schema.is_some();
+        let body = ChatCompletionRequest::from_director(&request, model_name, send_rf);
         let max_attempts = self.config.max_retries.saturating_add(1);
 
         for attempt in 0..max_attempts {
@@ -678,7 +712,9 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
             let resp = match result {
                 Ok(r) => r,
                 Err(e) => {
-                    if attempt + 1 < max_attempts {
+                    // Retry transient errors but not timeouts (slow model → no
+                    // point re-waiting). See [`Self::do_generate`] for rationale.
+                    if attempt + 1 < max_attempts && !e.is_timeout() {
                         Self::sleep_or_cancel(attempt, &cancel).await?;
                         continue;
                     }
@@ -708,6 +744,12 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
                 }
             };
             let content = parsed.content();
+            log_token_usage(
+                "director",
+                request.generation_id,
+                model_name,
+                parsed.usage(),
+            );
             match crate::recovery::parse_director_plan(&content) {
                 Ok(plan) => return Ok(plan),
                 Err(err) => {
@@ -737,10 +779,13 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
     /// `Protocol`). `cancel` is honored via `tokio::select!`.
     async fn write_stream(
         &self,
-        request: WriterRequest,
+        mut request: WriterRequest,
         sink: Sender<WriterEvent>,
         cancel: CancellationToken,
     ) -> Result<WriterFinish, ProviderError> {
+        // Apply the operator's output budget so rich Korean narration is not
+        // truncated by the request's low default.
+        request.max_tokens = self.config.max_tokens;
         let model_name = if request.model.is_empty() || request.model == "mock" {
             &self.config.model
         } else {
@@ -842,6 +887,7 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
             usage: usage.clone(),
         });
 
+        log_token_usage("writer", generation_id, model_name, usage.clone());
         Ok(WriterFinish {
             generation_id,
             full_text,

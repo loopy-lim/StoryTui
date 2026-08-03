@@ -37,6 +37,8 @@ pub struct StoryStackEntry {
     pub scene_id: String,
     /// Model used for this response when known in the current runtime.
     pub model: Option<String>,
+    /// Wall-clock seconds this turn took to generate, when known.
+    pub generation_secs: Option<u64>,
     pub player_action: Option<String>,
     pub narration: String,
 }
@@ -178,6 +180,7 @@ pub fn render_story(
             turn: view.status.turn.saturating_add(1),
             scene_id: "작성 중".to_string(),
             model: None,
+            generation_secs: None,
             player_action: None,
             narration: streaming.to_string(),
         });
@@ -223,7 +226,14 @@ pub fn render_story(
             .viewport_content_length(narration_area.height as usize);
         frame.render_stateful_widget(scrollbar, narration_chunks[1], &mut scrollbar_state);
     }
-    render_choice_panel(frame, chunks[1], view, selected, generation_elapsed_secs);
+    render_choice_panel(
+        frame,
+        chunks[1],
+        view,
+        selected,
+        generation_elapsed_secs,
+        streaming_narration,
+    );
     if input_mode {
         render_input_panel(frame, chunks[2], input);
         render_status_panel(frame, chunks[3], view);
@@ -337,6 +347,18 @@ fn wrapped_line_count(text: &Text<'_>, width: u16) -> usize {
         .sum()
 }
 
+/// Render a wall-clock duration (seconds) as a compact Korean label:
+/// `47초`, `2분 13초`, `1시간 5분`.
+fn fmt_duration(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}초")
+    } else if secs < 3600 {
+        format!("{}분 {}초", secs / 60, secs % 60)
+    } else {
+        format!("{}시간 {}분", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
 fn story_stack_text(entries: &[StoryStackEntry]) -> Text<'static> {
     let mut lines = Vec::new();
     for (index, entry) in entries.iter().enumerate() {
@@ -354,9 +376,18 @@ fn story_stack_text(entries: &[StoryStackEntry]) -> Text<'static> {
                 .fg(Color::LightCyan)
                 .add_modifier(Modifier::BOLD),
         )));
+        // Per-turn metadata: the model and how long the generation took,
+        // joined by " · " on one subtle line.
+        let mut meta: Vec<String> = Vec::new();
         if let Some(model) = &entry.model {
+            meta.push(format!("모델 · {model}"));
+        }
+        if let Some(secs) = entry.generation_secs {
+            meta.push(format!("생성 {}", fmt_duration(secs)));
+        }
+        if !meta.is_empty() {
             lines.push(Line::from(Span::styled(
-                format!("모델 · {model}"),
+                meta.join(" · "),
                 Style::default().fg(Color::DarkGray),
             )));
         }
@@ -549,6 +580,7 @@ fn render_choice_panel(
     view: &AppViewModel,
     selected: usize,
     elapsed_secs: Option<u64>,
+    streaming_narration: Option<&str>,
 ) {
     let turn = view.status.turn;
     let elapsed_mins = (turn as u32) * 30;
@@ -597,7 +629,15 @@ fn render_choice_panel(
         ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let lines = if let Some(loading) = &view.loading {
+    let lines = if view.loading.is_some() {
+        // Infer the active stage from the Writer stream: once prose chunks
+        // arrive we are in the writing stage, otherwise the Director is still
+        // planning (or a single-pass generation is running).
+        let stage_label = if streaming_narration.is_some() {
+            "본문 작성 중..."
+        } else {
+            "장면 기획 중..."
+        };
         let timer_subtext = match elapsed_secs {
             Some(secs) => {
                 let m = secs / 60;
@@ -612,7 +652,7 @@ fn render_choice_panel(
         };
         vec![
             Line::from(Span::styled(
-                loading.message_ko.clone(),
+                stage_label.to_string(),
                 Style::default().fg(Color::LightYellow),
             )),
             Line::from(Span::styled(
@@ -885,7 +925,17 @@ fn risk_color(r: RiskLevel) -> Color {
 
 #[cfg(test)]
 mod tests {
-    use super::speaker_dialogue_line;
+    use super::{fmt_duration, speaker_dialogue_line};
+
+    #[test]
+    fn fmt_duration_renders_compact_korean_labels() {
+        assert_eq!(fmt_duration(0), "0초");
+        assert_eq!(fmt_duration(47), "47초");
+        assert_eq!(fmt_duration(60), "1분 0초");
+        assert_eq!(fmt_duration(133), "2분 13초");
+        assert_eq!(fmt_duration(3600), "1시간 0분");
+        assert_eq!(fmt_duration(3900), "1시간 5분");
+    }
 
     #[test]
     fn recognizes_explicit_npc_speaker_line() {

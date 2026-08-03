@@ -178,6 +178,7 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                         let command = match result {
                             Ok(draft) => {
                                 app.record_generation_model(generation_id, model);
+                                app.record_generation_duration(generation_id);
                                 EngineCommand::AcceptGeneration { draft: Box::new(draft) }
                             }
                             Err(error) => {
@@ -212,6 +213,7 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                         let command = match result {
                             Ok(finish) => {
                                 app.record_generation_model(generation_id, model);
+                                app.record_generation_duration(generation_id);
                                 EngineCommand::AcceptWriterFinish { finish: Box::new(finish) }
                             }
                             Err(error) => {
