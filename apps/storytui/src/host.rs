@@ -203,7 +203,19 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                             Ok(plan) => EngineCommand::AcceptDirectorPlan { generation_id, plan: Box::new(plan) },
                             Err(error) => {
                                 diagnostics::record_provider_failure(&config.save_dir, generation_id, &error);
-                                EngineCommand::ProviderFailed { generation_id, error: provider_error_view(error) }
+                                // A plan-shape failure (model could not emit valid
+                                // JSON) degrades gracefully to a single-pass turn
+                                // so a weak Director model never blocks the player.
+                                // Transport/timeout failures still surface an error.
+                                if matches!(error, ProviderError::InvalidGeneration(_)) {
+                                    tracing::warn!(
+                                        %generation_id,
+                                        "Director could not produce a plan; falling back to single-pass generation"
+                                    );
+                                    EngineCommand::FallbackToSinglePass { generation_id }
+                                } else {
+                                    EngineCommand::ProviderFailed { generation_id, error: provider_error_view(error) }
+                                }
                             }
                         };
                         dispatch(command, &mut engine, &mut app, &pack, &provider, &config, &save_store, &tx, &mut cancellation).await?;

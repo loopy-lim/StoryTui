@@ -289,6 +289,9 @@ pub fn reduce(
         EngineCommand::CancelGeneration { generation_id } => {
             Ok(reduce_cancel(state, pack, generation_id))
         }
+        EngineCommand::FallbackToSinglePass { generation_id } => {
+            Ok(reduce_fallback_to_single_pass(state, pack, generation_id))
+        }
         EngineCommand::DismissError => Ok(reduce_dismiss_error(state, pack)),
         EngineCommand::Quit => Ok(Transition::identity(clone_state(state))),
     }
@@ -732,6 +735,50 @@ fn reduce_cancel(state: &EngineState, pack: &StoryPack, generation_id: Uuid) -> 
     Transition {
         state: restored,
         effects: vec![EngineEffect::PublishView(Box::new(view))],
+        audit: Vec::new(),
+    }
+}
+
+/// Handle [`EngineCommand::FallbackToSinglePass`]: the Director stage could not
+/// produce a plan, so re-issue the SAME turn (same `generation_id`, same
+/// checkpoint) as a single-pass [`EngineEffect::RequestGeneration`]. This is the
+/// graceful-degradation path that keeps a weak Director model from blocking the
+/// player. The pending generation is left in place; the single-pass result is
+/// fed back as [`EngineCommand::AcceptGeneration`]. If that also fails the host
+/// surfaces a normal error (it only falls back on a Director failure, so there
+/// is no fallback loop).
+fn reduce_fallback_to_single_pass(
+    state: &EngineState,
+    pack: &StoryPack,
+    generation_id: Uuid,
+) -> Transition {
+    let Some(pending) = state.pending.as_ref() else {
+        return Transition::identity(clone_state(state));
+    };
+    if pending.generation_id != generation_id {
+        return Transition::identity(clone_state(state));
+    }
+    // Reuse the same generation_id so AcceptGeneration completes this turn.
+    let request = build_turn_request(
+        generation_id,
+        pack,
+        &pending.checkpoint,
+        pending.player_action.as_ref(),
+        None,
+    );
+    let next = clone_state(state);
+    // Keep pending (still in flight); the lineage already holds this id.
+    let loading = next.pending.clone();
+    let loading_view = build_view(&next, pack, loading.as_ref(), None);
+    Transition {
+        state: next,
+        effects: vec![
+            EngineEffect::RequestGeneration {
+                generation_id,
+                request,
+            },
+            EngineEffect::PublishView(Box::new(loading_view)),
+        ],
         audit: Vec::new(),
     }
 }

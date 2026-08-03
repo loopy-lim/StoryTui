@@ -99,6 +99,17 @@ pub enum EngineCommand {
         /// Id of the generation to cancel.
         generation_id: Uuid,
     },
+    /// The Director stage failed to produce a usable plan (e.g. the model could
+    /// not emit valid JSON). The engine re-issues the SAME turn as a single-pass
+    /// [`EngineEffect::RequestGeneration`] so the player is never blocked on a
+    /// weak Director model — graceful degradation to the MVP path. No-op when no
+    /// matching pending generation exists. The host only dispatches this on a
+    /// Director `InvalidGeneration`; a subsequent single-pass failure surfaces a
+    /// normal error (no fallback loop).
+    FallbackToSinglePass {
+        /// Id of the Director generation that failed (reused for the fallback).
+        generation_id: Uuid,
+    },
     /// Dismiss the current error overlay.
     DismissError,
     /// The host is quitting. The engine returns the current state unchanged;

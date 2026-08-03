@@ -238,6 +238,42 @@ fn start_new_game_on_director_path_emits_request_director() {
 }
 
 #[test]
+fn fallback_to_single_pass_reissues_turn_as_request_generation() {
+    let pack = sample_pack();
+    let mut init = EngineState::initial(&pack);
+    init.use_director_writer = true;
+    let t = reduce(&init, EngineCommand::StartNewGame, &pack).expect("start");
+    let gid = t
+        .effects
+        .iter()
+        .find_map(|e| match e {
+            EngineEffect::RequestDirector { generation_id, .. } => Some(*generation_id),
+            _ => None,
+        })
+        .expect("StartNewGame on the director path emits RequestDirector");
+    let state = t.state;
+
+    // The Director model failed to produce a plan → host dispatches fallback.
+    let t = reduce(
+        &state,
+        EngineCommand::FallbackToSinglePass { generation_id: gid },
+        &pack,
+    )
+    .expect("fallback");
+    assert!(
+        t.effects.iter().any(|e| matches!(
+            e,
+            EngineEffect::RequestGeneration { generation_id, .. } if *generation_id == gid
+        )),
+        "FallbackToSinglePass MUST re-issue the turn as RequestGeneration with the same id"
+    );
+    assert!(
+        t.state.pending.is_some(),
+        "the pending generation is retained for the fallback result"
+    );
+}
+
+#[test]
 fn submit_choice_on_mvp_path_emits_request_generation_not_director() {
     let pack = sample_pack();
     let init = EngineState::initial(&pack);
