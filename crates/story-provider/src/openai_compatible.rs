@@ -753,10 +753,31 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
             match crate::recovery::parse_director_plan(&content) {
                 Ok(plan) => return Ok(plan),
                 Err(err) => {
+                    // Diagnostic: capture WHY the Director output is not a plan.
+                    // - send_rf: was response_format (guided JSON) actually sent?
+                    // - finish_reason "length" => hit the token cap mid-generation;
+                    //   "stop" => the model finished on its own without JSON.
+                    // - has_think / has_brace / head => is it a <think> block, pure
+                    //   prose, or malformed JSON? This is operator-facing tracing,
+                    //   never shown to the player.
+                    let lower = content.to_ascii_lowercase();
+                    let head: String = content
+                        .chars()
+                        .take(160)
+                        .collect::<String>()
+                        .replace('\n', "\\n");
                     tracing::warn!(
+                        target: "story_provider::openai_compatible",
                         generation_id = %request.generation_id,
                         error = %err,
-                        "director plan parse failed; attempting 1-pass repair retry"
+                        attempt,
+                        send_rf,
+                        finish_reason = ?parsed.finish_reason(),
+                        content_chars = content.chars().count(),
+                        has_think = lower.contains("<think"),
+                        has_brace = content.contains('{'),
+                        head = %head,
+                        "director plan parse failed; raw head captured for diagnosis"
                     );
                     if attempt + 1 < max_attempts {
                         Self::sleep_or_cancel(attempt, &cancel).await?;
