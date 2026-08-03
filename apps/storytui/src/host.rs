@@ -115,7 +115,7 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
     let mut app = App::new(build_view(&engine, &pack, None, None));
     app.set_lists(&engine.game.history, &engine.game.memories);
     app.set_can_continue(resume_engine.is_some());
-    settings::refresh_view(&mut app, &provider_config, health);
+    settings::refresh_view(&mut app, &provider_config, health, config.director_model.clone(), config.writer_model.clone());
     app.show_home();
     let mut user_settings = load_user_settings(&config.save_dir)?;
     let (tx, mut rx) = unbounded_channel();

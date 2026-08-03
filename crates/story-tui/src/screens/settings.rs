@@ -131,6 +131,18 @@ fn render_provider_block(frame: &mut Frame, area: Rect, view: &SettingsView<'_>)
             view.provider.model.clone()
         }),
     ]));
+    if let Some(dm) = &view.provider.director_model {
+        lines.push(Line::from(vec![
+            Span::styled("director   : ", Style::default().fg(Color::Yellow)),
+            Span::raw(dm.clone()),
+        ]));
+    }
+    if let Some(wm) = &view.provider.writer_model {
+        lines.push(Line::from(vec![
+            Span::styled("writer     : ", Style::default().fg(Color::Green)),
+            Span::raw(wm.clone()),
+        ]));
+    }
     lines.push(Line::from(vec![
         Span::raw("structured : "),
         Span::raw(view.provider.structured_output.clone()),
@@ -269,6 +281,8 @@ mod tests {
         ProviderConfigSafe {
             base_url: "http://127.0.0.1:8080".to_string(),
             model: "m".to_string(),
+            director_model: None,
+            writer_model: None,
             structured_output: "auto".to_string(),
             request_timeout_ms: 180_000,
             connect_timeout_ms: 3_000,

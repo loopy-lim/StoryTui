@@ -9,11 +9,17 @@ use story_provider::{LlmProvider, OpenAiCompatibleProvider, ProviderConfig};
 use story_tui::App;
 
 use storytui::config::{UserSettings, save_user_settings};
-use storytui::diagnostic::provider_config_safe;
+use storytui::diagnostic::provider_config_safe_with_models;
 
-pub fn refresh_view(app: &mut App, provider_config: &ProviderConfig, health: ProviderHealth) {
+pub fn refresh_view(
+    app: &mut App,
+    provider_config: &ProviderConfig,
+    health: ProviderHealth,
+    director_model: Option<String>,
+    writer_model: Option<String>,
+) {
     app.set_settings(
-        provider_config_safe(provider_config),
+        provider_config_safe_with_models(provider_config, director_model, writer_model),
         health,
         provider_config.temperature,
         provider_config.top_p,
@@ -74,6 +80,12 @@ pub async fn apply_model(
         .health()
         .await
         .unwrap_or(ProviderHealth::Unavailable);
-    refresh_view(app, provider_config, health);
+    refresh_view(
+        app,
+        provider_config,
+        health,
+        user_settings.director_model.clone(),
+        user_settings.writer_model.clone(),
+    );
     Ok(())
 }

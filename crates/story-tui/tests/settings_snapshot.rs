@@ -16,6 +16,8 @@ fn safe_loopback() -> ProviderConfigSafe {
     ProviderConfigSafe {
         base_url: "http://127.0.0.1:8080".to_string(),
         model: "mlx-community/test-model".to_string(),
+        director_model: None,
+        writer_model: None,
         structured_output: "auto".to_string(),
         request_timeout_ms: 180_000,
         connect_timeout_ms: 3_000,
@@ -28,6 +30,8 @@ fn safe_non_loopback() -> ProviderConfigSafe {
     ProviderConfigSafe {
         base_url: "http://192.168.0.5:8080".to_string(),
         model: "mlx-community/test-model".to_string(),
+        director_model: None,
+        writer_model: None,
         structured_output: "off".to_string(),
         request_timeout_ms: 60_000,
         connect_timeout_ms: 3_000,

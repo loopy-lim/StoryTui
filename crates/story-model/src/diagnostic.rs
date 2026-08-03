@@ -26,6 +26,12 @@ pub struct ProviderConfigSafe {
     pub base_url: String,
     /// Resolved model id (never contains an API key).
     pub model: String,
+    /// Director model override if set.
+    #[serde(default)]
+    pub director_model: Option<String>,
+    /// Writer model override if set.
+    #[serde(default)]
+    pub writer_model: Option<String>,
     /// Structured-output mode rendered as a stable lowercase token
     /// (`"auto"` / `"on"` / `"off"`).
     pub structured_output: String,
@@ -80,6 +86,8 @@ mod tests {
             provider_config_redacted: ProviderConfigSafe {
                 base_url: "http://127.0.0.1:8080".to_string(),
                 model: "mlx-community/test".to_string(),
+                director_model: None,
+                writer_model: None,
                 structured_output: "auto".to_string(),
                 request_timeout_ms: 180_000,
                 connect_timeout_ms: 3_000,

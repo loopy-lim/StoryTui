@@ -1178,6 +1178,8 @@ mod tests {
             ProviderConfigSafe {
                 base_url: "http://127.0.0.1:8000".to_string(),
                 model: "a".to_string(),
+                director_model: None,
+                writer_model: None,
                 structured_output: "auto".to_string(),
                 request_timeout_ms: 1_000,
                 connect_timeout_ms: 1_000,
@@ -1212,6 +1214,8 @@ mod tests {
             ProviderConfigSafe {
                 base_url: "http://127.0.0.1:8000".to_string(),
                 model: "a".to_string(),
+                director_model: None,
+                writer_model: None,
                 structured_output: "auto".to_string(),
                 request_timeout_ms: 1_000,
                 connect_timeout_ms: 1_000,
