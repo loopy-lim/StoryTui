@@ -688,10 +688,16 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
         } else {
             &request.model
         };
-        // Attach the DirectorPlan JSON schema when the server supports
-        // structured output, so the model emits required fields (scene_goal,
-        // choices, ...) under canonical keys instead of omitting them.
-        let send_rf = self.structured_enabled() && request.json_schema.is_some();
+        // The Director plan is the hardest contract for a local model, so it
+        // needs guided decoding most. Decouple it from the shared
+        // `structured_enabled()` flag: a prior `generate_turn` Auto-fallback can
+        // disable that flag for the session, which would silently strip
+        // `response_format` from every later Director call and make the model
+        // free-ramble into the token cap (the 8192-token "no JSON" failures).
+        // The server provably honors json_schema, and any 4xx / parse failure is
+        // caught by the host's single-pass fallback — so always attaching the
+        // schema is both safe and the fix that lets weaker Director models plan.
+        let send_rf = request.json_schema.is_some();
         let body = ChatCompletionRequest::from_director(&request, model_name, send_rf);
         let max_attempts = self.config.max_retries.saturating_add(1);
 
