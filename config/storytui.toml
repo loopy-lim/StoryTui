@@ -2,7 +2,11 @@
 save_dir = "saves"
 
 # Director-Writer 2단계 파이프라인 (기획/선택지 전용 모델 + 서사/글쓰기 전용 모델 분리)
-use_director_writer = true
+# 현재는 OFF: private-local-model 같은 약한 모델은 Director의 복잡한 JSON 계획을 못 만들어
+# 8192토큰을 태우고 실패합니다. 싱글패스(메인 모델 한 번에 서사+선택지)가 훨씬
+# 빠르고 안정적입니다. Director 뿌리를 고치고 나면 다시 true로.
+# 폴백(FallbackToSinglePass)이 켜져 있어, true여도 Director 실패 시 막히진 않습니다.
+use_director_writer = false
 
 [player]
 # 유나는 아래 이름으로 호칭합니다. 비워 두면 모델이 플레이어라고만 부릅니다.
