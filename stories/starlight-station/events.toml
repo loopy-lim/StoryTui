@@ -1,0 +1,32 @@
+schema_version = "1.0.0"
+
+[[events]]
+id = "event.first_theory"
+priority = 10
+allow_relationship_skip = false
+trigger = { kind = "all", children = [
+  { kind = "flag_equals", id = "found_blackbox", value = true },
+  { kind = "trust_at_least", character = "sera", value = 2 },
+]}
+
+[events.effects]
+trust_delta = { "sera" = 1 }
+
+[[events]]
+id = "event.power_back"
+priority = 20
+allow_relationship_skip = false
+trigger = { kind = "all", children = [
+  { kind = "flag_equals", id = "power_restored", value = true },
+  { kind = "flag_equals", id = "shared_suspicion", value = true },
+]}
+
+[[events]]
+id = "event.truth_revealed"
+priority = 30
+allow_relationship_skip = true
+trigger = { kind = "all", children = [
+  { kind = "event_occurred", id = "event.power_back" },
+  { kind = "flag_equals", id = "confronted_truth", value = true },
+  { kind = "trust_at_least", character = "sera", value = 8 },
+]}

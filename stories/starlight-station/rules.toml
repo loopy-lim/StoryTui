@@ -1,0 +1,89 @@
+schema_version = "1.0.0"
+
+[limits]
+affection_min = -30
+affection_max = 30
+trust_min = -30
+trust_max = 30
+tension_min = 0
+tension_max = 30
+normal_delta_min = -3
+normal_delta_max = 3
+
+[[locations]]
+id = "control-deck"
+name = "관제실"
+connects_to = ["observation-deck", "docking-bay"]
+
+[[locations]]
+id = "observation-deck"
+name = "전망 데크"
+connects_to = ["control-deck", "docking-bay"]
+
+[[locations]]
+id = "docking-bay"
+name = "도킹 베이"
+connects_to = ["control-deck", "observation-deck"]
+
+[[flags]]
+id = "power_restored"
+default = false
+description = "플레이어가 보조 전원을 올려 관제실 시스템을 부분 복구했다."
+
+[[flags]]
+id = "found_blackbox"
+default = false
+description = "도킹 베이에서 태호의 마지막 기록 칩을 찾았다."
+
+[[flags]]
+id = "shared_suspicion"
+default = false
+description = "세라에게 정전이 사고가 아닐 수 있다는 의심을 공유했다."
+
+[[flags]]
+id = "trusted_sera"
+default = false
+description = "위험한 순간에 세라의 판단을 따르겠다고 약속했다."
+
+[[flags]]
+id = "confronted_truth"
+default = false
+description = "세라가 지운 접근 기록에 대해 직접 물었다."
+
+[[numbers]]
+id = "sera.affection"
+default = 0
+min = -30
+max = 30
+
+[[numbers]]
+id = "sera.trust"
+default = 0
+min = -30
+max = 30
+
+[[numbers]]
+id = "sera.tension"
+default = 10
+min = 0
+max = 30
+
+[[routes]]
+id = "truth"
+premise = "두 사람은 정전이 사고가 아님을 인정하고 함께 진실을 쫓기로 한다."
+enter_condition = { kind = "all", children = [
+  { kind = "flag_equals", id = "found_blackbox", value = true },
+  { kind = "flag_equals", id = "trusted_sera", value = true },
+  { kind = "trust_at_least", character = "sera", value = 8 },
+]}
+
+[[endings]]
+id = "ending-truth"
+label = "같이 보는 새벽"
+condition = { kind = "all", children = [
+  { kind = "event_occurred", id = "event.truth_revealed" },
+  { kind = "flag_equals", id = "confronted_truth", value = true },
+  { kind = "affection_at_least", character = "sera", value = 10 },
+  { kind = "trust_at_least", character = "sera", value = 12 },
+  { kind = "turn_at_least", value = 12 },
+]}
