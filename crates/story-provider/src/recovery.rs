@@ -129,6 +129,20 @@ pub fn parse_generated_turn(raw: &str, generation_id: Uuid) -> Result<ParseOutco
         }
     };
 
+    // Scrub foreign-script contamination (cyrillic / kana / CJK ideographs) that
+    // merged "safe/private" local models occasionally bleed into Korean
+    // prose. Korean modern narration does not use these inline; removing them is
+    // safe and a no-op on already-clean text. Lets us keep a creative-but-leaky
+    // model usable. Applied to player-facing text only.
+    parsed.narration = scrub_foreign_scripts(&parsed.narration);
+    for choice in parsed.choices.iter_mut() {
+        choice.label = scrub_foreign_scripts(&choice.label);
+        choice.intent = scrub_foreign_scripts(&choice.intent);
+        if let Some(preview) = choice.preview.take() {
+            choice.preview = Some(scrub_foreign_scripts(&preview));
+        }
+    }
+
     // Sanitize choice ids/intents AND deduplicate colliding labels by appending
     // an "(N)" suffix. A label collision is treated as a recoverable, cosmetic
     // defect rather than a contract violation: rejecting here would roll the
@@ -244,6 +258,51 @@ pub fn parse_director_plan(raw: &str) -> Result<DirectorPlan, ProviderError> {
 
     sanitize_choices(&mut plan.choices);
     Ok(plan)
+}
+
+/// Strip foreign-script contamination that merged local models occasionally
+/// bleed into Korean prose: Cyrillic, Hiragana, Katakana, and CJK ideographs
+/// (modern Korean narration does not use these inline). The creative content
+/// around the contaminant is preserved; only the foreign characters are
+/// dropped, and the leftover whitespace / empty brackets are tidied. This is a
+/// no-op on already-clean Korean text.
+pub fn scrub_foreign_scripts(input: &str) -> String {
+    let stripped: String = input
+        .chars()
+        .filter(|&c| {
+            let cp = u32::from(c);
+            !matches!(cp,
+                0x0400..=0x052F   // Cyrillic (+ extended)
+                | 0x3040..=0x309F  // Hiragana
+                | 0x30A0..=0x30FF  // Katakana
+                | 0x3400..=0x4DBF  // CJK Unified Ideographs Extension A
+                | 0x4E00..=0x9FFF  // CJK Unified Ideographs
+                | 0xF900..=0xFAFF  // CJK Compatibility Ideographs
+            )
+        })
+        .collect();
+    // Collapse runs of spaces/tabs and drop empty brackets/quotes left behind.
+    let mut out = String::with_capacity(stripped.len());
+    let mut prev_ws = false;
+    for ch in stripped.chars() {
+        match ch {
+            ' ' | '\t' => {
+                if !prev_ws {
+                    out.push(ch);
+                }
+                prev_ws = true;
+            }
+            _ => {
+                out.push(ch);
+                prev_ws = false;
+            }
+        }
+    }
+    out.replace("()", "")
+        .replace("“”", "")
+        .replace("''", "")
+        .trim()
+        .to_string()
 }
 
 /// Sanitize raw control characters (unescaped newlines/tabs) inside JSON string values.
@@ -759,5 +818,21 @@ mod tests {
     #[test]
     fn detail_passes_short_messages_through() {
         assert_eq!(detail("ok"), "ok");
+    }
+
+    #[test]
+    fn scrub_foreign_scripts_strips_contamination_not_korean() {
+        // Clean Korean is untouched.
+        assert_eq!(scrub_foreign_scripts("유나가 조용히 미소 지었다."), "유나가 조용히 미소 지었다.");
+        // Russian + kana + CJK ideographs are removed, surrounding Korean kept,
+        // double space collapsed.
+        assert_eq!(
+            scrub_foreign_scripts("그녀는 председている 줄 알았어."),
+            "그녀는 줄 알았어."
+        );
+        assert_eq!(scrub_foreign_scripts("却又 살짝 피하듯"), "살짝 피하듯");
+        assert_eq!(scrub_foreign_scripts("작업台上的 커피"), "작업 커피");
+        // Empty brackets left by removal are dropped.
+        assert_eq!(scrub_foreign_scripts("대사(却)를 건넸다"), "대사를 건넸다");
     }
 }
