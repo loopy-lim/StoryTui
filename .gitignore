@@ -1,3 +1,9 @@
 /saves/
 /config/omlx-api-key
 /config/*.local.toml
+
+# Rust build output
+/target/
+
+# macOS
+.DS_Store
