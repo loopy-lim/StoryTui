@@ -169,6 +169,25 @@ fn build_provider_with_drafts(drafts: Vec<GeneratedTurnDraft>) -> MockProvider {
 // happy path: opening + 3 player turns
 // ---------------------------------------------------------------------------
 
+#[test]
+fn rainy_reunion_initial_state_uses_pack_defaults_and_known_facts() {
+    let pack = load_pack();
+    let state = EngineState::initial(&pack);
+    let yuna_state = state.game.characters.get(&yuna()).expect("yuna state");
+
+    assert_eq!(yuna_state.affection, 0);
+    assert_eq!(yuna_state.trust, 0);
+    assert_eq!(yuna_state.tension, 8);
+    assert_eq!(pack.rules.tension_stat_limits().min, 0);
+    assert_eq!(pack.rules.tension_stat_limits().max, 30);
+    assert_eq!(state.game.numbers.get("yuna.tension"), Some(&8));
+    assert!(
+        yuna_state
+            .known_facts
+            .contains("카페 나무는 두 사람이 대학 시절 자주 오던 곳이다")
+    );
+}
+
 #[tokio::test]
 async fn rainy_reunion_three_turn_happy_path() {
     let pack = load_pack();

@@ -176,6 +176,9 @@ fn default_save_dir() -> PathBuf {
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
     pub provider: ProviderConfig,
+    /// Base-profile model used as a safe fallback when a persisted user model
+    /// is no longer advertised by the local server.
+    pub fallback_model: String,
     pub director_model: Option<String>,
     pub writer_model: Option<String>,
     pub save_dir: PathBuf,
@@ -235,35 +238,18 @@ pub fn load(cli: &CliOptions) -> Result<RuntimeConfig, String> {
                 .map_err(|e| format!("설정 파일을 읽지 못했습니다 ({}): {e}", path.display()))?;
             let parsed: FileConfig =
                 toml::from_str(&text).map_err(|e| format!("설정 TOML이 올바르지 않습니다: {e}"))?;
-            let mut parsed = parsed;
-            if let Some(secret_path) = parsed.provider.api_key_file.clone() {
-                let resolved = if Path::new(&secret_path).is_absolute() {
-                    PathBuf::from(&secret_path)
-                } else {
-                    path.parent()
-                        .unwrap_or_else(|| Path::new("."))
-                        .join(secret_path)
-                };
-                let secret = fs::read_to_string(&resolved).map_err(|e| {
-                    format!(
-                        "provider.api_key_file을 읽지 못했습니다 ({}): {e}",
-                        resolved.display()
-                    )
-                })?;
-                let secret = secret.trim().to_string();
-                if secret.is_empty() {
-                    return Err(format!(
-                        "provider.api_key_file이 비어 있습니다: {}",
-                        resolved.display()
-                    ));
-                }
-                parsed.provider.api_key = Some(secret);
-            }
             (parsed, Some(path))
         }
         None => (FileConfig::default(), None),
     };
 
+    // The CLI save directory determines both saves and the user-settings
+    // namespace. Apply it before reading user-settings so an isolated run
+    // cannot accidentally inherit the project's normal saved model.
+    if let Some(value) = &cli.save_dir {
+        file.save_dir = value.clone();
+    }
+    let fallback_model = file.provider.model.clone();
     let settings = load_user_settings(&file.save_dir)?;
     settings.apply_to(&mut file.provider);
     if let Some(dm) = &settings.director_model {
@@ -281,9 +267,34 @@ pub fn load(cli: &CliOptions) -> Result<RuntimeConfig, String> {
     }
     if let Some(value) = &cli.api_key_env {
         file.provider.api_key_env = Some(value.clone());
-    }
-    if let Some(value) = &cli.save_dir {
-        file.save_dir = value.clone();
+        // An safe environment credential must be able to replace a stale
+        // or missing file credential from the base profile.
+        file.provider.api_key_file = None;
+        file.provider.api_key = None;
+    } else if let Some(secret_path) = file.provider.api_key_file.clone() {
+        let resolved = if Path::new(&secret_path).is_absolute() {
+            PathBuf::from(&secret_path)
+        } else {
+            source_path
+                .as_deref()
+                .and_then(Path::parent)
+                .unwrap_or_else(|| Path::new("."))
+                .join(secret_path)
+        };
+        let secret = fs::read_to_string(&resolved).map_err(|e| {
+            format!(
+                "provider.api_key_file을 읽지 못했습니다 ({}): {e}",
+                resolved.display()
+            )
+        })?;
+        let secret = secret.trim().to_string();
+        if secret.is_empty() {
+            return Err(format!(
+                "provider.api_key_file이 비어 있습니다: {}",
+                resolved.display()
+            ));
+        }
+        file.provider.api_key = Some(secret);
     }
 
     let pack_dir = cli
@@ -304,6 +315,7 @@ pub fn load(cli: &CliOptions) -> Result<RuntimeConfig, String> {
 
     Ok(RuntimeConfig {
         provider: file.provider,
+        fallback_model,
         director_model: file.director_model,
         writer_model: file.writer_model,
         save_dir: file.save_dir,
@@ -425,6 +437,82 @@ mod tests {
                 .count(),
             0
         );
+        fs::remove_dir_all(dir).expect("clean test directory");
+    }
+
+    #[test]
+    fn cli_save_dir_selects_the_user_settings_namespace() {
+        let dir = test_dir("cli-save-dir");
+        let base_saves = dir.join("base-saves");
+        let cli_saves = dir.join("cli-saves");
+        let pack_dir = dir.join("pack");
+        let config_path = dir.join("storytui.toml");
+        fs::create_dir_all(&pack_dir).expect("pack directory");
+        fs::write(
+            &config_path,
+            format!(
+                "save_dir = \"{}\"\n[provider]\nmodel = \"base-model\"\n",
+                base_saves.display()
+            ),
+        )
+        .expect("base config");
+        save_user_settings(
+            &base_saves,
+            &UserSettings {
+                model: Some("stale-base-save-model".to_string()),
+                ..UserSettings::default()
+            },
+        )
+        .expect("base settings");
+        save_user_settings(
+            &cli_saves,
+            &UserSettings {
+                model: Some("cli-save-model".to_string()),
+                ..UserSettings::default()
+            },
+        )
+        .expect("cli settings");
+
+        let runtime = load(&CliOptions {
+            provider_config: Some(config_path),
+            pack: Some(pack_dir),
+            save_dir: Some(cli_saves.clone()),
+            ..CliOptions::default()
+        })
+        .expect("load config");
+
+        assert_eq!(runtime.save_dir, cli_saves);
+        assert_eq!(runtime.provider.model, "cli-save-model");
+        assert_eq!(runtime.fallback_model, "base-model");
+        fs::remove_dir_all(dir).expect("clean test directory");
+    }
+
+    #[test]
+    fn cli_api_key_env_bypasses_a_missing_base_key_file() {
+        let dir = test_dir("cli-api-key-env");
+        let pack_dir = dir.join("pack");
+        let config_path = dir.join("storytui.toml");
+        fs::create_dir_all(&pack_dir).expect("pack directory");
+        fs::write(
+            &config_path,
+            "[provider]\nmodel = \"base-model\"\napi_key_file = \"missing.secret\"\n",
+        )
+        .expect("base config");
+
+        let runtime = load(&CliOptions {
+            provider_config: Some(config_path),
+            pack: Some(pack_dir),
+            api_key_env: Some("STORYTUI_TEST_TOKEN".to_string()),
+            ..CliOptions::default()
+        })
+        .expect("load config");
+
+        assert_eq!(
+            runtime.provider.api_key_env.as_deref(),
+            Some("STORYTUI_TEST_TOKEN")
+        );
+        assert_eq!(runtime.provider.api_key_file, None);
+        assert_eq!(runtime.provider.api_key, None);
         fs::remove_dir_all(dir).expect("clean test directory");
     }
 }

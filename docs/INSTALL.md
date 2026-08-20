@@ -42,7 +42,10 @@ The workspace builds six crates:
 ## Run
 
 The checked-in profile targets the local OMLX instance at `127.0.0.1:8000`
-and selects the configured model.
+and selects the configured model. At startup StoryTUI checks `/v1/models` with
+a short probe timeout. If a saved model is no longer advertised, it falls back
+to the checked-in model (or the first advertised model) and repairs
+`saves/user-settings.toml` before generation.
 
 ```sh
 cargo run -p storytui
@@ -50,7 +53,9 @@ cargo run -p storytui
 
 The TUI starts in the Story screen. Use `1..9` or `Enter` to choose, `j/k` or
 arrow keys to move, `c` to cancel a generation, `Esc` to dismiss an error, and
-`q`/`Ctrl+C` to quit.
+`q`/`Ctrl+C` to quit. Press `o`, then `p`, to open the server-advertised model
+picker; `Enter` selects the main model, while `d` and `w` select the optional
+Director and Writer models.
 
 CLI overrides are available for one-off runs:
 
@@ -61,6 +66,9 @@ cargo run -p storytui -- \
   --model local-model-id \
   --base-url http://127.0.0.1:8000
 ```
+
+`--save-dir` also selects which `user-settings.toml` is loaded, so an isolated
+run does not inherit model choices from the default `./saves` directory.
 
 ## Provider configuration
 

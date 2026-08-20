@@ -324,13 +324,19 @@ fn reduce_start_new_game(state: &EngineState, pack: &StoryPack) -> Result<Transi
         // too (consistent with every subsequent turn).
         let request = build_director_request(generation_id, pack, &next.game, None);
         vec![
-            EngineEffect::RequestDirector { generation_id, request },
+            EngineEffect::RequestDirector {
+                generation_id,
+                request,
+            },
             EngineEffect::PublishView(Box::new(loading_view)),
         ]
     } else {
         let request = build_turn_request(generation_id, pack, &next.game, None, None);
         vec![
-            EngineEffect::RequestGeneration { generation_id, request },
+            EngineEffect::RequestGeneration {
+                generation_id,
+                request,
+            },
             EngineEffect::PublishView(Box::new(loading_view)),
         ]
     };
@@ -562,8 +568,10 @@ fn reduce_accept(
         draft.generation_id,
     ) {
         Ok(result) => {
+            let ending_resolved = result.ending.is_some();
             let (next, audit) = assemble_accepted_turn(state, pack, pending, draft.clone(), result);
-            if pending.player_choice_id != OPENING_CHOICE_ID
+            if !ending_resolved
+                && pending.player_choice_id != OPENING_CHOICE_ID
                 && pending.player_choice_id != FREE_ACTION_CHOICE_ID
                 && choice_set_repeats(pending.checkpoint.history.last(), &draft.choices)
             {
@@ -613,7 +621,13 @@ fn reduce_accept(
 /// checkpoint is the stable state itself, so cancellation/failure cannot undo
 /// the narration or the validated state patch that led here.
 fn reduce_choice_refresh(state: &EngineState, pack: &StoryPack) -> Transition {
-    if state.pending.is_some() || state.game.history.last().is_none() {
+    if state.pending.is_some()
+        || state
+            .game
+            .history
+            .last()
+            .is_none_or(|entry| entry.choices.is_empty())
+    {
         return Transition::identity(clone_state(state));
     }
     let generation_id = Uuid::new_v4();
@@ -632,15 +646,26 @@ fn reduce_choice_refresh(state: &EngineState, pack: &StoryPack) -> Transition {
     next.retry_pending = None;
     next.lineage = vec![generation_id];
     let view = build_view(&next, pack, Some(&pending), None);
+    let mut effects = Vec::new();
+    // A choice-only repair starts after the narration and state patch have
+    // already been accepted. Persist that stable turn before the next network
+    // request so a refresh failure or process exit cannot lose it.
+    if next.autosave_on_accept {
+        effects.push(EngineEffect::PersistStableState {
+            slot_id: AUTOSAVE_SLOT.to_string(),
+            description: Some(format!("턴 {} (선택지 갱신 전)", next.game.turn)),
+        });
+    }
+    effects.extend([
+        EngineEffect::RequestGeneration {
+            generation_id,
+            request,
+        },
+        EngineEffect::PublishView(Box::new(view)),
+    ]);
     Transition {
         state: next,
-        effects: vec![
-            EngineEffect::RequestGeneration {
-                generation_id,
-                request,
-            },
-            EngineEffect::PublishView(Box::new(view)),
-        ],
+        effects,
         audit: Vec::new(),
     }
 }
@@ -926,6 +951,7 @@ fn reduce_accept_director_plan(
                 pack,
                 &pending.checkpoint,
                 pending.player_action.as_ref(),
+                &validated.plan,
                 digest,
             );
             let mut next = clone_state(state);
@@ -1074,14 +1100,22 @@ fn assemble_accepted_2stage_turn(
     crate::memory::resolve_memories(&mut game.memories, &fired_events);
     game.memories.extend(new_memories);
 
+    let mut narration = writer.narration.clone();
+    let mut choices = validated.plan.choices.clone();
+    apply_resolved_ending(
+        &mut narration,
+        &mut choices,
+        validated.dry_run.ending.as_deref(),
+        pack,
+    );
     let entry = HistoryEntry {
         id: history_id,
         turn: game.turn,
         scene_id: game.current_scene_id.clone(),
         created_at: Utc::now(),
-        narration: writer.narration.clone(),
+        narration,
         player_action: recorded_player_action(pending),
-        choices: validated.plan.choices.clone(),
+        choices,
         applied_patch: validated.plan.proposed_patch.clone(),
         generation_id: pending.generation_id,
     };
@@ -1150,6 +1184,7 @@ fn assemble_accepted_turn(
     let new_memories =
         crate::memory::memories_from_turn(&result, pack, pending.requested_at_turn + 1, history_id);
 
+    let ending = result.ending.clone();
     let mut game = result.state;
     game.turn = pending.requested_at_turn + 1;
     let selected_choice = selected_choice_from_pending(pending);
@@ -1179,14 +1214,17 @@ fn assemble_accepted_turn(
     crate::memory::resolve_memories(&mut game.memories, &fired_events);
     game.memories.extend(new_memories);
 
+    let mut narration = draft.narration.clone();
+    let mut choices = draft.choices.clone();
+    apply_resolved_ending(&mut narration, &mut choices, ending.as_deref(), pack);
     let entry = HistoryEntry {
         id: history_id,
         turn: game.turn,
         scene_id: game.current_scene_id.clone(),
         created_at: Utc::now(),
-        narration: draft.narration.clone(),
+        narration,
         player_action: recorded_player_action(pending),
-        choices: draft.choices.clone(),
+        choices,
         applied_patch: draft.proposed_patch.clone(),
         generation_id: draft.generation_id,
     };
@@ -1223,6 +1261,26 @@ fn assemble_accepted_turn(
         use_director_writer: state.use_director_writer,
     };
     (next, result.change_log)
+}
+
+fn apply_resolved_ending(
+    narration: &mut String,
+    choices: &mut Vec<story_model::Choice>,
+    ending_id: Option<&str>,
+    pack: &StoryPack,
+) {
+    let Some(ending_id) = ending_id else {
+        return;
+    };
+    let label = pack
+        .rules
+        .endings
+        .get(ending_id)
+        .map(|ending| ending.label.as_str())
+        .unwrap_or(ending_id);
+    narration.push_str("\n\n[엔딩] ");
+    narration.push_str(label);
+    choices.clear();
 }
 
 /// Persist the action that led into a generated scene. Numbered choices are
@@ -1296,8 +1354,8 @@ fn extend_audit_tail(
 
 /// Build a fresh `GameState` for `pack`: location/time/chapter from
 /// `metadata.initial_state`, one `CharacterState` per character def with
-/// zeroed affection/trust/tension, the pack-declared initial relationship
-/// stage, and a `Neutral` emotion.
+/// pack-declared numeric defaults, known facts, initial relationship stage,
+/// and a `Neutral` emotion.
 fn build_initial_game_state(pack: &StoryPack) -> GameState {
     let init = &pack.metadata.initial_state;
     let characters = pack
@@ -1307,16 +1365,28 @@ fn build_initial_game_state(pack: &StoryPack) -> GameState {
             (
                 id.clone(),
                 CharacterState {
-                    affection: 0,
-                    trust: 0,
-                    tension: 0,
+                    affection: initial_character_stat(pack, &id.0, "affection"),
+                    trust: initial_character_stat(pack, &id.0, "trust"),
+                    tension: initial_character_stat(pack, &id.0, "tension"),
                     relationship_stage: def.initial_player_relationship,
                     current_emotion: Emotion::Neutral,
-                    known_facts: Default::default(),
+                    known_facts: def.known_facts.iter().cloned().collect(),
                     address_form_overrides: Default::default(),
                 },
             )
         })
+        .collect();
+    let flags = pack
+        .rules
+        .allowed_flags
+        .iter()
+        .map(|id| (id.clone(), false))
+        .collect();
+    let numbers = pack
+        .rules
+        .numbers
+        .iter()
+        .map(|(id, def)| (id.clone(), def.default))
         .collect();
     GameState {
         save_schema_version: story_model::SAVE_SCHEMA_VERSION,
@@ -1331,8 +1401,8 @@ fn build_initial_game_state(pack: &StoryPack) -> GameState {
         time_slot: init.time_slot,
         active_route: None,
         characters,
-        flags: Default::default(),
-        numbers: Default::default(),
+        flags,
+        numbers,
         strings: Default::default(),
         inventory: Default::default(),
         occurred_events: Default::default(),
@@ -1343,6 +1413,14 @@ fn build_initial_game_state(pack: &StoryPack) -> GameState {
         revision: 0,
         stable_generation_id: None,
     }
+}
+
+fn initial_character_stat(pack: &StoryPack, character_id: &str, axis: &str) -> i16 {
+    pack.rules
+        .numbers
+        .get(&format!("{character_id}.{axis}"))
+        .and_then(|def| i16::try_from(def.default).ok())
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -1628,10 +1706,16 @@ fn build_director_request(
     player_action: Option<&ParsedAction>,
 ) -> DirectorRequest {
     let bundle = build_prompt(pack, game, &game.history, player_action);
+    let mut system = bundle.system;
+    system.push_str("\n\n# Director stage override\n");
+    system.push_str(&pack.prompts.director);
+    system.push_str(
+        "\nThis request is the Director stage. Return only one DirectorPlan JSON object matching the supplied schema; do not return GeneratedTurn narration.",
+    );
     let messages = vec![
         story_model::ChatMessage {
             role: "system".to_string(),
-            content: bundle.system,
+            content: system,
         },
         story_model::ChatMessage {
             role: "user".to_string(),
@@ -1751,17 +1835,29 @@ fn build_writer_request(
     pack: &StoryPack,
     game: &GameState,
     player_action: Option<&ParsedAction>,
+    plan: &DirectorPlan,
     plan_digest: String,
 ) -> WriterRequest {
     let bundle = build_prompt(pack, game, &game.history, player_action);
+    let mut system = bundle.system;
+    system.push_str("\n\n# Writer stage override\n");
+    system.push_str(&pack.prompts.writer);
+    system.push_str(
+        "\nThis is the Writer stage. Follow the validated plan below exactly. Stream only player-visible Korean narration; do not emit a new patch, choices, JSON, or planning text.",
+    );
+    let mut user = bundle.user;
+    user.push_str("\n\n# Validated Director plan (engine-authorized)\n");
+    user.push_str(&story_model::serde_json::to_string(plan).unwrap_or_else(|_| "{}".to_string()));
+    user.push_str("\nplan_digest: ");
+    user.push_str(&plan_digest);
     let messages = vec![
         story_model::ChatMessage {
             role: "system".to_string(),
-            content: bundle.system,
+            content: system,
         },
         story_model::ChatMessage {
             role: "user".to_string(),
-            content: bundle.user,
+            content: user,
         },
     ];
     WriterRequest {
@@ -1830,7 +1926,8 @@ fn clone_state(state: &EngineState) -> EngineState {
 
 #[cfg(test)]
 mod tests {
-    use super::turn_digest;
+    use super::{apply_resolved_ending, turn_digest};
+    use story_model::{ConditionExpr, EndingDef};
 
     #[test]
     fn turn_digest_prefers_interpretation_then_falls_back_to_first_clause() {
@@ -1848,5 +1945,27 @@ mod tests {
         );
         // Blank interpretation is treated as absent.
         assert_eq!(turn_digest("비가 그쳤다.", Some("   ")), "비가 그쳤다");
+    }
+
+    #[test]
+    fn resolved_ending_is_appended_to_narration_and_closes_choices() {
+        let mut pack = crate::tests_support::sample_pack();
+        pack.rules.endings.insert(
+            "ending-test".to_string(),
+            EndingDef {
+                id: "ending-test".to_string(),
+                condition: ConditionExpr::All { children: vec![] },
+                label: "다시 시작되는 관계".to_string(),
+            },
+        );
+        let mut draft = crate::tests_support::valid_draft(story_model::uuid::Uuid::nil(), 0);
+        apply_resolved_ending(
+            &mut draft.narration,
+            &mut draft.choices,
+            Some("ending-test"),
+            &pack,
+        );
+        assert!(draft.narration.contains("[엔딩] 다시 시작되는 관계"));
+        assert!(draft.choices.is_empty());
     }
 }

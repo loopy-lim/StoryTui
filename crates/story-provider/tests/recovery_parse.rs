@@ -391,9 +391,7 @@ fn unclosed_thinking_block_is_rejected_cleanly_without_raw_leak() {
 fn json_before_a_trailing_think_block_still_locates() {
     // Some servers splice reasoning after the answer. The JSON must still be
     // located even when thinking (with braces) trails it.
-    let raw = format!(
-        "{VALID_BODY}\n<think>사후 사고 {{\"x\":1}}</think>"
-    );
+    let raw = format!("{VALID_BODY}\n<think>사후 사고 {{\"x\":1}}</think>");
     let outcome = parse_generated_turn(&raw, GID).expect("JSON before thinking must parse");
     assert_eq!(outcome.draft.narration, "비가 그쳤다.");
 }
@@ -413,8 +411,8 @@ fn non_uuid_history_ids_survive_a_thinking_corrupted_response() {
     let raw = format!(
         "<think>정리하자. 출력은 {{\"narration\":...}} 형태고 source_history_ids에 turn-N 값을 둔다.</think>\n{body}"
     );
-    let outcome = parse_generated_turn(&raw, GID)
-        .expect("bad provenance ids must be discarded, not fatal");
+    let outcome =
+        parse_generated_turn(&raw, GID).expect("bad provenance ids must be discarded, not fatal");
     assert!(
         outcome.draft.summary.source_history_ids.is_empty(),
         "non-UUID provenance ids must be dropped: {:?}",
@@ -425,8 +423,6 @@ fn non_uuid_history_ids_survive_a_thinking_corrupted_response() {
 // ---------------------------------------------------------------------------
 // integration: MockProvider + recovery path (Draft is pre-parsed)
 // ---------------------------------------------------------------------------
-
-
 
 #[tokio::test]
 async fn mock_draft_round_trips_through_parser() {

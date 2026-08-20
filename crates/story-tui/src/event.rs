@@ -29,6 +29,16 @@ pub fn map_key(key: KeyEvent, choice_count: usize, loading: bool, has_error: boo
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return KeyAction::Quit;
     }
+    // A recoverable-error overlay is modal. Its footer advertises only retry,
+    // dismiss, and quit, so never let hidden story commands execute behind it.
+    if has_error {
+        return match key.code {
+            KeyCode::Char('q' | 'ㅂ') => KeyAction::Quit,
+            KeyCode::Char('r' | 'ㄱ') => KeyAction::Command(EngineCommand::RegenerateCurrentTurn),
+            KeyCode::Esc => KeyAction::Command(EngineCommand::DismissError),
+            _ => KeyAction::None,
+        };
+    }
     match key.code {
         // Accept the same physical shortcuts while a Korean 2-beolsik layout
         // is active: q=ㅂ, r=ㄱ, c=ㅊ, j=ㅓ, k=ㅏ, n=ㅜ.
@@ -186,6 +196,22 @@ mod tests {
         assert_eq!(
             map_key(key(KeyCode::Char('r')), 3, false, true),
             KeyAction::Command(EngineCommand::RegenerateCurrentTurn)
+        );
+    }
+
+    #[test]
+    fn error_overlay_blocks_story_commands_and_navigation() {
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Down,
+            KeyCode::Char('1'),
+            KeyCode::Char('n'),
+        ] {
+            assert_eq!(map_key(key(code), 3, false, true), KeyAction::None);
+        }
+        assert_eq!(
+            map_key(key(KeyCode::Esc), 3, false, true),
+            KeyAction::Command(EngineCommand::DismissError)
         );
     }
 }

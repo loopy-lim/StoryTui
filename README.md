@@ -32,7 +32,7 @@ by code) — see [`docs/RELEASE-RUNTIME-GATE.md`](./docs/RELEASE-RUNTIME-GATE.md
 - G2 — clean-machine install repro.
 - G3 — blind Korean evaluation ≥ 3.8 / 5.
 - G4 — Apple-Silicon binary + checksum.
-- G5 — second-Pack swap.
+- G5 — committed second Pack의 10-turn live swap evidence.
 
 **Interactive host loop**: wired into `main.rs`. It loads the provider
 profile and Story Pack, starts the opening generation, polls the provider,

@@ -118,6 +118,7 @@ fn sample_rules() -> StoryRules {
             min: DEFAULT_STAT_MIN,
             max: DEFAULT_STAT_MAX,
         },
+        stat_limits_by_axis: None,
         default_choice_count: 3,
     }
 }

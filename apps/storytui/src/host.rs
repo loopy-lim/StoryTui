@@ -18,7 +18,7 @@ use story_tui::{App, HomeRequest};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio_util::sync::CancellationToken;
 
-use storytui::config::{RuntimeConfig, UserSettings, load_user_settings};
+use storytui::config::{RuntimeConfig, UserSettings, load_user_settings, save_user_settings};
 
 mod diagnostics;
 mod saves;
@@ -90,6 +90,46 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
         OpenAiCompatibleProvider::new(provider_config.clone())
             .map_err(|e| format!("provider를 만들지 못했습니다: {e}"))?,
     );
+    let mut repaired_main_model = false;
+    let mut repaired_stage_models = false;
+    match provider.list_models().await {
+        Ok(advertised) if !advertised.is_empty() => {
+            if let Some(model) = settings::reconcile_active_model(
+                &provider_config.model,
+                &config.fallback_model,
+                &advertised,
+            ) && model != provider_config.model
+            {
+                tracing::warn!(
+                    stale_model = %provider_config.model,
+                    fallback_model = %model,
+                    "configured model is not advertised; using an available local model"
+                );
+                provider_config.model = model;
+                repaired_main_model = true;
+                config.provider = provider_config.clone();
+                provider = Arc::new(
+                    OpenAiCompatibleProvider::new(provider_config.clone())
+                        .map_err(|e| format!("대체 provider를 만들지 못했습니다: {e}"))?,
+                );
+            }
+            for stage_model in [&mut config.director_model, &mut config.writer_model] {
+                if let Some(current) = stage_model.clone()
+                    && !advertised.iter().any(|model| model == &current)
+                {
+                    tracing::warn!(
+                        stale_model = %current,
+                        fallback_model = %provider_config.model,
+                        "stage model is not advertised; using the active model"
+                    );
+                    *stage_model = Some(provider_config.model.clone());
+                    repaired_stage_models = true;
+                }
+            }
+        }
+        Ok(_) => tracing::warn!("provider advertised an empty model list"),
+        Err(error) => tracing::warn!(%error, "provider model preflight failed"),
+    }
     let save_store = SaveStore::open(&config.save_dir)
         .map_err(|e| format!("세이브 디렉터리를 열지 못했습니다: {e}"))?;
 
@@ -116,9 +156,25 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
     let mut app = App::new(build_view(&engine, &pack, None, None));
     app.set_lists(&engine.game.history, &engine.game.memories);
     app.set_can_continue(resume_engine.is_some());
-    settings::refresh_view(&mut app, &provider_config, health, config.director_model.clone(), config.writer_model.clone());
+    settings::refresh_view(
+        &mut app,
+        &provider_config,
+        health,
+        config.director_model.clone(),
+        config.writer_model.clone(),
+    );
     app.show_home();
     let mut user_settings = load_user_settings(&config.save_dir)?;
+    if repaired_main_model {
+        user_settings.model = Some(provider_config.model.clone());
+    }
+    if repaired_stage_models {
+        user_settings.director_model = config.director_model.clone();
+        user_settings.writer_model = config.writer_model.clone();
+    }
+    if repaired_main_model || repaired_stage_models {
+        save_user_settings(&config.save_dir, &user_settings)?;
+    }
     let (tx, mut rx) = unbounded_channel();
     let mut cancellation: Option<(story_model::uuid::Uuid, CancellationToken)> = None;
 
@@ -165,6 +221,10 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                             &mut provider, &mut user_settings, &mut config,
                             &save_store, &tx, &mut cancellation, &mut resume_engine,
                         ).await?;
+                        needs_redraw = true;
+                    }
+                    Event::Paste(text) => {
+                        app.handle_paste(&text);
                         needs_redraw = true;
                     }
                     Event::Resize(..) => needs_redraw = true,
@@ -309,17 +369,14 @@ async fn handle_ui_requests(
             model,
             config,
             provider_config,
+            provider,
             user_settings,
-        )?;
+        )
+        .await?;
     }
     if let Some(model) = app.take_selected_writer_model() {
-        settings::apply_writer_model(
-            app,
-            model,
-            config,
-            provider_config,
-            user_settings,
-        )?;
+        settings::apply_writer_model(app, model, config, provider_config, provider, user_settings)
+            .await?;
     }
     if let Some(request) = app.take_home_request() {
         match request {

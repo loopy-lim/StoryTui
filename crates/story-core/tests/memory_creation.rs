@@ -249,10 +249,10 @@ fn key_item_confession_betrayal_first_meeting_classify() {
 }
 
 #[test]
-fn non_memory_event_produces_nothing() {
+fn unclassified_canonical_event_still_produces_other_memory() {
     let state = base_state();
     let mut rules = rules_with_events();
-    // An event whose id carries no memory-kind hint.
+    // A canonical event whose id carries no legacy memory-kind hint.
     rules.events.insert(
         EventId("ambient.rain_starts".to_string()),
         EventDef {
@@ -266,10 +266,10 @@ fn non_memory_event_produces_nothing() {
     );
     let result = fire(&state, &rules, &["ambient.rain_starts"]);
     let mems = memories_from_turn(&result, &dummy_pack(&rules), 1, Uuid::new_v4());
-    assert!(
-        mems.is_empty(),
-        "events without a memory-kind hint yield no memory"
-    );
+    assert_eq!(mems.len(), 1);
+    assert_eq!(mems[0].kind, MemoryKind::Other);
+    assert_eq!(mems[0].facts[0].object, "event:ambient.rain_starts");
+    assert!(!mems[0].unresolved);
 }
 
 #[test]

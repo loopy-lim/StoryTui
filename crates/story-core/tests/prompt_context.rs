@@ -12,10 +12,10 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use story_core::prompt_context::{PromptBundle, build_prompt, build_prompt_with_choice};
 use story_model::{
-    ActionType, CharacterDef, CharacterId, CharacterState, Emotion, GameState, HistoryEntry,
-    LocationDef, LocationId, PackContentPolicy, PackInitialState, PackMetadata, PackRating,
-    ParsedAction, PromptFragments, RelationshipStage, SAVE_SCHEMA_VERSION, StatePatch, StoryPack,
-    StoryRules, TimeSlot,
+    ActionType, CharacterDef, CharacterId, CharacterState, ConditionExpr, Emotion, EventDef,
+    EventEffects, EventId, GameState, HistoryEntry, LocationDef, LocationId, PackContentPolicy,
+    PackInitialState, PackMetadata, PackRating, ParsedAction, PromptFragments, RelationshipStage,
+    SAVE_SCHEMA_VERSION, StatePatch, StoryPack, StoryRules, TimeSlot,
 };
 
 // ---------------------------------------------------------------------------
@@ -285,6 +285,64 @@ fn selected_numbered_choice_is_included_in_next_prompt() {
 }
 
 #[test]
+fn prompt_carries_character_canon_event_rules_and_progress_state() {
+    let (mut pack, mut state, recent) = fixture(false);
+    let yuna = pack
+        .characters
+        .get_mut(&CharacterId("yuna".to_string()))
+        .expect("yuna definition");
+    yuna.personality = vec!["감정을 단정하지 않고 증거를 확인한다".to_string()];
+    yuna.speech_style = "짧고 정확한 해요체".to_string();
+    yuna.known_facts = vec!["카페 나무는 대학 시절 자주 오던 곳이다".to_string()];
+    yuna.unknown_facts = vec!["플레이어의 반송된 편지".to_string()];
+    yuna.secrets = vec!["보내지 못한 편지를 보관하고 있다".to_string()];
+    pack.rules.events.insert(
+        EventId("event.honest_exchange".to_string()),
+        EventDef {
+            id: EventId("event.honest_exchange".to_string()),
+            trigger: ConditionExpr::FlagEquals {
+                id: "apologized".to_string(),
+                value: true,
+            },
+            priority: 10,
+            effects: EventEffects::default(),
+            allow_relationship_skip: false,
+            route_lock: None,
+        },
+    );
+    state.active_route = Some("reconciliation".to_string());
+    state
+        .occurred_events
+        .insert("event.first_meeting".to_string());
+
+    let bundle = build_prompt(&pack, &state, &recent, None);
+    assert!(bundle.user.contains("감정을 단정하지 않고 증거를 확인한다"));
+    assert!(bundle.user.contains("speech_style: 짧고 정확한 해요체"));
+    assert!(
+        bundle
+            .user
+            .contains("PRIVATE_unknown_facts: 플레이어의 반송된 편지")
+    );
+    assert!(
+        bundle
+            .user
+            .contains("PRIVATE_secrets: 보내지 못한 편지를 보관하고 있다")
+    );
+    assert!(
+        bundle
+            .user
+            .contains("event event.honest_exchange: trigger=")
+    );
+    assert!(bundle.user.contains("\"active_route\":\"reconciliation\""));
+    assert!(bundle.user.contains("event.first_meeting"));
+    assert!(
+        bundle
+            .user
+            .contains("\"current_scene_id\":\"cafe-reunion\"")
+    );
+}
+
+#[test]
 fn hash_is_64_lowercase_hex_chars() {
     let (pack, state, recent) = fixture(false);
     let bundle = build_prompt(&pack, &state, &recent, None);
@@ -454,4 +512,3 @@ fn empty_history_has_no_recent_arc_block() {
     assert!(!bundle.user.contains("# Recent arc"));
     assert!(!bundle.user.contains("# 반복 감지"));
 }
-

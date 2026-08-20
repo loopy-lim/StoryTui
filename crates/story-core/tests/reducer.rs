@@ -349,6 +349,34 @@ fn forbidden_relationship_transition_rejects_patch() {
     assert_eq!(state.revision, 5);
 }
 
+#[test]
+fn condition_failed_event_proposal_is_not_recorded_as_occurred() {
+    let mut rules = hand_built_rules();
+    rules.events.insert(
+        EventId("e-never".to_string()),
+        EventDef {
+            id: EventId("e-never".to_string()),
+            trigger: ConditionExpr::FlagEquals {
+                id: "met_namu".to_string(),
+                value: false,
+            },
+            priority: 1,
+            effects: EventEffects::default(),
+            allow_relationship_skip: false,
+            route_lock: None,
+        },
+    );
+    let state = hand_built_state(); // met_namu is true
+    let patch = StatePatch {
+        add_events: BTreeSet::from(["e-never".to_string()]),
+        ..StatePatch::default()
+    };
+
+    let result = apply_patch(&state, &rules, &patch, GEN_ID).expect("proposal is valid");
+    assert!(result.fired_events.is_empty());
+    assert!(!result.state.occurred_events.contains("e-never"));
+}
+
 // ===========================================================================
 // Event firing + ordering
 // ===========================================================================

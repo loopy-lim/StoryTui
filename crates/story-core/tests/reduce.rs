@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use story_core::engine::{EngineState, Transition, commit_turn, reduce};
+use story_core::engine::{AUTOSAVE_SLOT, EngineState, Transition, commit_turn, reduce};
 use story_core::engine_cmd::{EngineCommand, EngineEffect};
 use story_core::reducer::ApplyResult;
 use story_model::{
@@ -820,6 +820,10 @@ fn repeated_choice_set_is_refreshed_without_rewriting_the_accepted_turn() {
 
     assert_eq!(refreshed.state.game.turn, 2, "scene is committed once");
     assert!(refreshed.state.pending.as_ref().unwrap().choice_refresh);
+    assert!(refreshed.effects.iter().any(|effect| matches!(
+        effect,
+        EngineEffect::PersistStableState { slot_id, .. } if slot_id == AUTOSAVE_SLOT
+    )));
     assert_eq!(
         refreshed.state.game.history.last().unwrap().narration,
         second_draft.narration,

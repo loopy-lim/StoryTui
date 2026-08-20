@@ -192,7 +192,7 @@ fn check_ranges(
         state,
         |c| c.affection,
         &rules.delta_limits.affection,
-        &rules.stat_limits,
+        rules.affection_stat_limits(),
         "affection",
     )?;
     check_axis_delta(
@@ -200,7 +200,7 @@ fn check_ranges(
         state,
         |c| c.trust,
         &rules.delta_limits.trust,
-        &rules.stat_limits,
+        rules.trust_stat_limits(),
         "trust",
     )?;
     check_axis_delta(
@@ -208,7 +208,7 @@ fn check_ranges(
         state,
         |c| c.tension,
         &rules.delta_limits.tension,
-        &rules.stat_limits,
+        rules.tension_stat_limits(),
         "tension",
     )?;
 

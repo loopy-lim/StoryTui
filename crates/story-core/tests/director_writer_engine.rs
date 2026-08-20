@@ -222,6 +222,20 @@ fn start_new_game_on_director_path_emits_request_director() {
     let mut init = EngineState::initial(&pack);
     init.use_director_writer = true;
     let t = reduce(&init, EngineCommand::StartNewGame, &pack).expect("start");
+    let director_request = t
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            EngineEffect::RequestDirector { request, .. } => Some(request),
+            _ => None,
+        })
+        .expect("director request");
+    assert!(
+        director_request.messages[0]
+            .content
+            .contains("# Director stage override")
+    );
+    assert!(director_request.messages[0].content.contains("\nd\n"));
     assert!(
         t.effects
             .iter()
@@ -380,15 +394,39 @@ fn accept_director_plan_valid_emits_request_writer_and_stores_plan() {
     .expect("accept director");
 
     // RequestWriter emitted; the validated plan is stored on the pending.
-    let writer = t
+    let (writer, writer_request) = t
         .effects
         .iter()
         .find_map(|e| match e {
-            EngineEffect::RequestWriter { generation_id, .. } => Some(*generation_id),
+            EngineEffect::RequestWriter {
+                generation_id,
+                request,
+            } => Some((*generation_id, request)),
             _ => None,
         })
         .expect("valid plan MUST emit RequestWriter");
     assert_eq!(writer, gid);
+    assert!(
+        writer_request.messages[0]
+            .content
+            .contains("# Writer stage override")
+    );
+    assert!(writer_request.messages[0].content.contains("\nw\n"));
+    assert!(
+        writer_request.messages[1]
+            .content
+            .contains("# Validated Director plan")
+    );
+    assert!(
+        writer_request.messages[1]
+            .content
+            .contains("\"scene_goal\":\"scene\"")
+    );
+    assert!(
+        writer_request.messages[1]
+            .content
+            .contains(&writer_request.plan_digest)
+    );
     assert!(
         t.state.pending.as_ref().unwrap().validated_plan.is_some(),
         "validated plan stored after AcceptDirectorPlan"

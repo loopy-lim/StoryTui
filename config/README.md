@@ -11,7 +11,14 @@ cargo run -p storytui
 ```
 
 기본 프로필은 `storytui.toml`이며 현재 로컬 OMLX 주소와 모델을 예시로
-가리킨다. 서버가 인증을 요구하지 않으면 그대로 사용할 수 있다.
+가리킨다. 서버가 인증을 요구하지 않으면 그대로 사용할 수 있다. 시작할
+때 `/v1/models`를 짧게 조회하며, 저장된 모델이 서버에서 사라졌으면 기본
+프로필 모델 또는 서버의 첫 모델로 자동 복구하고 `saves/user-settings.toml`에
+반영한다.
+
+TUI에서는 `o` → `p`로 모델 목록을 열 수 있다. `Enter`는 메인 모델,
+`d`는 Director 모델, `w`는 Writer 모델로 선택하며 선택 결과는 현재
+`save_dir` 아래의 `user-settings.toml`에 저장된다.
 
 ## 인증이 필요한 서버
 

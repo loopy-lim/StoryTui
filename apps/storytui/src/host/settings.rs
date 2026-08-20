@@ -35,11 +35,7 @@ pub async fn refresh_model_list(
     preserve_selection: bool,
 ) {
     match provider.list_models().await {
-        Ok(mut models) => {
-            if !models.iter().any(|model| model == &provider_config.model) {
-                models.push(provider_config.model.clone());
-                models.sort_unstable();
-            }
+        Ok(models) => {
             if preserve_selection {
                 app.refresh_models(models, &provider_config.model);
             } else {
@@ -57,6 +53,23 @@ pub async fn refresh_model_list(
             }
         }
     }
+}
+
+/// Select an advertised model without treating a stale persisted value as a
+/// server capability. Prefer the current model, then the checked-in profile
+/// fallback, then the first stable server-advertised id.
+pub fn reconcile_active_model(
+    current: &str,
+    fallback: &str,
+    advertised: &[String],
+) -> Option<String> {
+    if advertised.iter().any(|model| model == current) {
+        return Some(current.to_string());
+    }
+    if advertised.iter().any(|model| model == fallback) {
+        return Some(fallback.to_string());
+    }
+    advertised.first().cloned()
 }
 
 /// Persist and activate a newly selected model. This creates a fresh provider
@@ -91,20 +104,25 @@ pub async fn apply_model(
 }
 
 /// Persist and activate a newly selected Director model.
-pub fn apply_director_model(
+pub async fn apply_director_model(
     app: &mut App,
     model: String,
     config: &mut RuntimeConfig,
     provider_config: &ProviderConfig,
+    provider: &OpenAiCompatibleProvider,
     user_settings: &mut UserSettings,
 ) -> Result<(), String> {
     config.director_model = Some(model.clone());
     user_settings.director_model = Some(model);
     save_user_settings(&config.save_dir, user_settings)?;
+    let health = provider
+        .health()
+        .await
+        .unwrap_or(ProviderHealth::Unavailable);
     refresh_view(
         app,
         provider_config,
-        ProviderHealth::Ready,
+        health,
         user_settings.director_model.clone(),
         user_settings.writer_model.clone(),
     );
@@ -112,22 +130,50 @@ pub fn apply_director_model(
 }
 
 /// Persist and activate a newly selected Writer model.
-pub fn apply_writer_model(
+pub async fn apply_writer_model(
     app: &mut App,
     model: String,
     config: &mut RuntimeConfig,
     provider_config: &ProviderConfig,
+    provider: &OpenAiCompatibleProvider,
     user_settings: &mut UserSettings,
 ) -> Result<(), String> {
     config.writer_model = Some(model.clone());
     user_settings.writer_model = Some(model);
     save_user_settings(&config.save_dir, user_settings)?;
+    let health = provider
+        .health()
+        .await
+        .unwrap_or(ProviderHealth::Unavailable);
     refresh_view(
         app,
         provider_config,
-        ProviderHealth::Ready,
+        health,
         user_settings.director_model.clone(),
         user_settings.writer_model.clone(),
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reconcile_active_model;
+
+    #[test]
+    fn stale_model_falls_back_to_profile_model() {
+        let advertised = vec!["available-a".to_string(), "profile".to_string()];
+        assert_eq!(
+            reconcile_active_model("removed", "profile", &advertised).as_deref(),
+            Some("profile")
+        );
+    }
+
+    #[test]
+    fn stale_model_uses_first_advertised_when_profile_is_missing() {
+        let advertised = vec!["available-a".to_string(), "available-b".to_string()];
+        assert_eq!(
+            reconcile_active_model("removed", "also-removed", &advertised).as_deref(),
+            Some("available-a")
+        );
+    }
 }

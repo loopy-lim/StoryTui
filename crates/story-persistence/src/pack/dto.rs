@@ -450,7 +450,8 @@ pub fn rules_dto_to_canonical(dto: &RulesToml) -> Result<story_model::StoryRules
         },
     };
 
-    // Stat limits (per-axis MVP: use the most permissive bound across axes)
+    // Keep the broad legacy bound for old consumers, and retain the actual
+    // per-axis Pack limits for authoritative validation.
     let stat_min = dto
         .limits
         .affection_min
@@ -473,6 +474,20 @@ pub fn rules_dto_to_canonical(dto: &RulesToml) -> Result<story_model::StoryRules
         min: stat_min,
         max: stat_max,
     };
+    rules.stat_limits_by_axis = Some(DeltaLimits {
+        affection: Int16Range {
+            min: dto.limits.affection_min.unwrap_or(DEFAULT_STAT_MIN),
+            max: dto.limits.affection_max.unwrap_or(DEFAULT_STAT_MAX),
+        },
+        trust: Int16Range {
+            min: dto.limits.trust_min.unwrap_or(DEFAULT_STAT_MIN),
+            max: dto.limits.trust_max.unwrap_or(DEFAULT_STAT_MAX),
+        },
+        tension: Int16Range {
+            min: dto.limits.tension_min.unwrap_or(DEFAULT_STAT_MIN),
+            max: dto.limits.tension_max.unwrap_or(DEFAULT_STAT_MAX),
+        },
+    });
 
     // Locations + adjacency
     for loc in &dto.locations {
@@ -737,6 +752,12 @@ max = 30
         assert!(rules.allowed_flags.contains("apologized"));
         assert_eq!(rules.delta_limits.affection.min, -3);
         assert_eq!(rules.stat_limits.max, 30);
+        assert_eq!(rules.affection_stat_limits().min, -30);
+        assert_eq!(rules.affection_stat_limits().max, 30);
+        assert_eq!(
+            rules.tension_stat_limits().min,
+            story_model::DEFAULT_STAT_MIN
+        );
         assert!(rules.numbers.contains_key("yuna.affection"));
     }
 

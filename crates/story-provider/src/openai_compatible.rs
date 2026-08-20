@@ -34,6 +34,8 @@ use crate::sse::{SseEvent, SseParser};
 /// Maximum backoff cap. The exponential backoff starts at `BASE_BACKOFF_MS`.
 const MAX_BACKOFF: Duration = Duration::from_millis(1_000);
 const BASE_BACKOFF_MS: u64 = 20;
+/// UI probes must never inherit the multi-minute generation deadline.
+const PROBE_TIMEOUT_MS: u64 = 3_000;
 
 /// Returns `true` when the host part of `url` is a loopback address
 /// (`127.0.0.0/8`, `localhost`, `::1`). Used to decide the ADR-002 non-loopback
@@ -161,11 +163,15 @@ impl OpenAiCompatibleProvider {
     /// This is intentionally a single GET: unlike generation, model discovery
     /// has no cancellation token or retry contract.
     pub async fn list_models(&self) -> Result<Vec<String>, ProviderError> {
-        let response = self
-            .authorize(self.client.get(self.models_url()))
-            .send()
-            .await
-            .map_err(|error| map_send_error(error, self.config.request_timeout_ms))?;
+        let response = tokio::time::timeout(
+            Duration::from_millis(PROBE_TIMEOUT_MS),
+            self.authorize(self.client.get(self.models_url())).send(),
+        )
+        .await
+        .map_err(|_| ProviderError::Timeout {
+            ms: PROBE_TIMEOUT_MS,
+        })?
+        .map_err(|error| map_send_error(error, PROBE_TIMEOUT_MS))?;
 
         if !response.status().is_success() {
             return Err(ProviderError::Protocol(format!(
@@ -358,7 +364,12 @@ impl OpenAiCompatibleProvider {
                 };
             let content = parsed.content();
             let usage = parsed.usage();
-            log_token_usage("turn", request.generation_id, &self.config.model, usage.clone());
+            log_token_usage(
+                "turn",
+                request.generation_id,
+                &self.config.model,
+                usage.clone(),
+            );
             let finish_reason = parsed.finish_reason().unwrap_or("missing").to_string();
             return match parse_generated_turn(&content, request.generation_id) {
                 Ok(outcome) => {
@@ -550,25 +561,27 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             supports_structured_output: self.structured_enabled(),
-            supports_director: false,
-            supports_streaming: false,
+            supports_director: true,
+            supports_streaming: true,
         }
     }
 
     async fn health(&self) -> Result<ProviderHealth, ProviderError> {
-        let result = self
-            .authorize(self.client.get(self.health_url()))
-            .send()
-            .await;
+        let result = tokio::time::timeout(
+            Duration::from_millis(PROBE_TIMEOUT_MS),
+            self.authorize(self.client.get(self.health_url())).send(),
+        )
+        .await;
         match result {
-            Err(e) => {
+            Err(_) => Ok(ProviderHealth::Degraded),
+            Ok(Err(e)) => {
                 if e.is_timeout() {
                     Ok(ProviderHealth::Degraded)
                 } else {
                     Ok(ProviderHealth::Unavailable)
                 }
             }
-            Ok(resp) => {
+            Ok(Ok(resp)) => {
                 let s = resp.status();
                 if s == StatusCode::OK {
                     Ok(ProviderHealth::Ready)
@@ -600,7 +613,8 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
                     min_narration_chars = self.config.min_narration_chars,
                     "short valid scene; requesting one best-effort expansion"
                 );
-                let retry = length_repair_request(&request, &draft, self.config.min_narration_chars);
+                let retry =
+                    length_repair_request(&request, &draft, self.config.min_narration_chars);
                 match self
                     .do_generate(&retry, false, &cancel, Some(self.config.temperature))
                     .await

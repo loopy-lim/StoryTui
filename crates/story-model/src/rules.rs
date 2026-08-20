@@ -97,6 +97,10 @@ pub struct StoryRules {
     pub delta_limits: DeltaLimits,
     /// Final affection/trust/tension bounds (default `-100..=100`).
     pub stat_limits: Int16Range,
+    /// Optional per-axis final bounds. Older canonical data falls back to the
+    /// shared `stat_limits` field for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stat_limits_by_axis: Option<DeltaLimits>,
     /// Default number of choices offered per turn (MVP = 3).
     pub default_choice_count: u8,
 }
@@ -110,9 +114,31 @@ impl StoryRules {
                 min: DEFAULT_STAT_MIN,
                 max: DEFAULT_STAT_MAX,
             },
+            stat_limits_by_axis: None,
             default_choice_count: 3,
             ..Self::default()
         }
+    }
+
+    pub fn affection_stat_limits(&self) -> &Int16Range {
+        self.stat_limits_by_axis
+            .as_ref()
+            .map(|limits| &limits.affection)
+            .unwrap_or(&self.stat_limits)
+    }
+
+    pub fn trust_stat_limits(&self) -> &Int16Range {
+        self.stat_limits_by_axis
+            .as_ref()
+            .map(|limits| &limits.trust)
+            .unwrap_or(&self.stat_limits)
+    }
+
+    pub fn tension_stat_limits(&self) -> &Int16Range {
+        self.stat_limits_by_axis
+            .as_ref()
+            .map(|limits| &limits.tension)
+            .unwrap_or(&self.stat_limits)
     }
 }
 

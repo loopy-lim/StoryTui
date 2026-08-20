@@ -255,6 +255,12 @@ fn build_user(
     s.push_str("\n\n# Relationship ledger (engine-owned)\n");
     s.push_str(&relationship_ledger(state));
 
+    s.push_str("\n# Character canon and voice (pack-owned)\n");
+    s.push_str(&character_context(pack, state));
+
+    s.push_str("\n# Story progression rules (engine-authoritative)\n");
+    s.push_str(&progression_context(pack));
+
     s.push_str("\n# Current dramatic beat\n");
     s.push_str(&dramatic_brief(state, &recall.included));
     s.push_str("\n# Autonomous world and NPC initiative\n");
@@ -326,6 +332,95 @@ fn build_user(
     }
 
     s
+}
+
+fn character_context(pack: &StoryPack, state: &GameState) -> String {
+    let mut out = String::new();
+    out.push_str(
+        "Treat voice, knowledge, goals, and boundaries below as canon. Unknown facts and secrets are private: do not reveal or let a character act on them unless the live state or an authorized event has established that knowledge.\n",
+    );
+    for (id, def) in &pack.characters {
+        let live = state.characters.get(id);
+        out.push_str(&format!("## {} ({})\n", def.name, id.0));
+        if let Some(age) = def.age {
+            out.push_str(&format!("age: {age}\n"));
+        }
+        append_list(&mut out, "personality", &def.personality);
+        append_list(&mut out, "appearance", &def.appearance);
+        append_list(&mut out, "values", &def.values);
+        append_list(&mut out, "likes", &def.likes);
+        append_list(&mut out, "dislikes", &def.dislikes);
+        append_value(&mut out, "speech_style", &def.speech_style);
+        append_value(&mut out, "honorific_rule", &def.honorific_rule);
+        append_list(&mut out, "frequent_phrases", &def.frequent_phrases);
+        append_list(&mut out, "avoid_phrases", &def.avoid_phrases);
+        append_value(&mut out, "current_goal", &def.current_goal);
+        append_value(&mut out, "long_term_desire", &def.long_term_desire);
+        append_list(&mut out, "canonical_known_facts", &def.known_facts);
+        if let Some(live) = live {
+            let known: Vec<String> = live.known_facts.iter().cloned().collect();
+            append_list(&mut out, "live_known_facts", &known);
+            if !live.address_form_overrides.is_empty() {
+                out.push_str(&format!(
+                    "live_address_forms: {}\n",
+                    serde_json::to_string(&live.address_form_overrides)
+                        .unwrap_or_else(|_| "{}".to_string())
+                ));
+            }
+        }
+        append_list(&mut out, "PRIVATE_unknown_facts", &def.unknown_facts);
+        append_list(&mut out, "PRIVATE_secrets", &def.secrets);
+    }
+    out
+}
+
+fn append_list(out: &mut String, label: &str, values: &[String]) {
+    if !values.is_empty() {
+        out.push_str(label);
+        out.push_str(": ");
+        out.push_str(&values.join(" | "));
+        out.push('\n');
+    }
+}
+
+fn append_value(out: &mut String, label: &str, value: &str) {
+    if !value.trim().is_empty() {
+        out.push_str(label);
+        out.push_str(": ");
+        out.push_str(value);
+        out.push('\n');
+    }
+}
+
+fn progression_context(pack: &StoryPack) -> String {
+    let mut out = String::new();
+    out.push_str(
+        "`state_patch.add_events` only proposes an event. Propose an id only when its trigger is true after this turn's patch and its route lock matches. Rust re-checks every condition and records only fired events.\n",
+    );
+    for (id, event) in &pack.rules.events {
+        out.push_str(&format!(
+            "event {}: trigger={}; route_lock={}; effects={}\n",
+            id.0,
+            serde_json::to_string(&event.trigger).unwrap_or_else(|_| "null".to_string()),
+            event.route_lock.as_deref().unwrap_or("none"),
+            serde_json::to_string(&event.effects).unwrap_or_else(|_| "{}".to_string()),
+        ));
+    }
+    for (id, route) in &pack.rules.routes {
+        out.push_str(&format!(
+            "route {id}: enter_condition={}; premise={}\n",
+            serde_json::to_string(&route.enter_condition).unwrap_or_else(|_| "null".to_string()),
+            route.premise,
+        ));
+    }
+    for (id, ending) in &pack.rules.endings {
+        out.push_str(&format!(
+            "ending {id}: condition={}; label={}\n",
+            serde_json::to_string(&ending.condition).unwrap_or_else(|_| "null".to_string()),
+            ending.label,
+        ));
+    }
+    out
 }
 
 fn mentioned_proper_nouns(
@@ -642,9 +737,7 @@ fn normalize_token(word: &str) -> Option<String> {
             break;
         }
     }
-    let w = w
-        .trim_matches(|c: char| !c.is_alphanumeric())
-        .to_string();
+    let w = w.trim_matches(|c: char| !c.is_alphanumeric()).to_string();
     if (w.is_ascii() && w.chars().count() < 2) || REPETITION_STOPWORDS.contains(&w.as_str()) {
         return None;
     }
@@ -694,17 +787,31 @@ fn state_snapshot_json(state: &GameState) -> String {
             "stage".to_string(),
             serde_json::to_value(c.relationship_stage).expect("stage serializes"),
         );
+        m.insert(
+            "known_facts".to_string(),
+            serde_json::to_value(&c.known_facts).expect("known facts serialize"),
+        );
+        m.insert(
+            "address_form_overrides".to_string(),
+            serde_json::to_value(&c.address_form_overrides).expect("address forms serialize"),
+        );
         characters.insert(id.0.clone(), serde_json::Value::Object(m));
     }
 
     let root = serde_json::json!({
+        "active_route": state.active_route,
+        "current_chapter": state.current_chapter,
+        "current_scene_id": state.current_scene_id,
         "location": state.location,
         "time_slot": state.time_slot,
         "turn": state.turn,
         "characters": characters,
         "flags": state.flags,
         "numbers": state.numbers,
+        "strings": state.strings,
         "inventory": state.inventory,
+        "occurred_events": state.occurred_events,
+        "last_choice": state.last_choice,
     });
     serde_json::to_string(&root).expect("state snapshot serializes")
 }

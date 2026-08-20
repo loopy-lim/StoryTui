@@ -20,7 +20,9 @@
 
 use story_model::serde_json::Value;
 use story_model::uuid::Uuid;
-use story_model::{Choice, DirectorPlan, GeneratedTurnDraft, ProviderError, StatePatch, TokenUsage, TurnSummary};
+use story_model::{
+    Choice, DirectorPlan, GeneratedTurnDraft, ProviderError, StatePatch, TokenUsage, TurnSummary,
+};
 
 use ProviderError::InvalidGeneration;
 
@@ -107,7 +109,9 @@ pub fn parse_generated_turn(raw: &str, generation_id: Uuid) -> Result<ParseOutco
             let quote_repaired = escape_unescaped_quotes(&aliased);
             let ctrl_repaired = sanitize_json_control_characters(&quote_repaired);
             if quote_repaired != aliased || ctrl_repaired != quote_repaired {
-                repairs.push("escaped bare quotes and raw control chars inside JSON strings".to_string());
+                repairs.push(
+                    "escaped bare quotes and raw control chars inside JSON strings".to_string(),
+                );
             }
             let repaired = strip_trailing_commas(&ctrl_repaired);
             if repaired != ctrl_repaired {
@@ -196,8 +200,11 @@ pub fn parse_director_plan(raw: &str) -> Result<DirectorPlan, ProviderError> {
 
     let stripped = strip_reasoning(&work);
     let trimmed = stripped.trim();
-    let located = locate_json(trimmed)
-        .ok_or_else(|| InvalidGeneration(detail("json_extract: no JSON object found in director plan")))?;
+    let located = locate_json(trimmed).ok_or_else(|| {
+        InvalidGeneration(detail(
+            "json_extract: no JSON object found in director plan",
+        ))
+    })?;
 
     let aliased = normalize_director_aliases(located);
     let normalized = normalize_common_wire_aliases(&aliased);
@@ -381,24 +388,24 @@ fn normalize_director_aliases(input: &str) -> String {
         return input.to_string();
     };
 
-    if !map.contains_key("scene_goal") && map.contains_key("goal") {
-        if let Some(v) = map.remove("goal") {
-            map.insert("scene_goal".to_string(), v);
-        }
+    if !map.contains_key("scene_goal")
+        && map.contains_key("goal")
+        && let Some(v) = map.remove("goal")
+    {
+        map.insert("scene_goal".to_string(), v);
     }
-    if !map.contains_key("proposed_patch") {
-        if let Some(v) = map
+    if !map.contains_key("proposed_patch")
+        && let Some(v) = map
             .remove("proposed_state_patch")
             .or_else(|| map.remove("state_patch"))
             .or_else(|| map.remove("patch"))
-        {
-            map.insert("proposed_patch".to_string(), v);
-        }
+    {
+        map.insert("proposed_patch".to_string(), v);
     }
-    if !map.contains_key("choices") {
-        if let Some(v) = map.remove("options").or_else(|| map.remove("choice_list")) {
-            map.insert("choices".to_string(), v);
-        }
+    if !map.contains_key("choices")
+        && let Some(v) = map.remove("options").or_else(|| map.remove("choice_list"))
+    {
+        map.insert("choices".to_string(), v);
     }
 
     serde_json::to_string(&Value::Object(map)).unwrap_or_else(|_| input.to_string())
@@ -823,7 +830,10 @@ mod tests {
     #[test]
     fn scrub_foreign_scripts_strips_contamination_not_korean() {
         // Clean Korean is untouched.
-        assert_eq!(scrub_foreign_scripts("유나가 조용히 미소 지었다."), "유나가 조용히 미소 지었다.");
+        assert_eq!(
+            scrub_foreign_scripts("유나가 조용히 미소 지었다."),
+            "유나가 조용히 미소 지었다."
+        );
         // Russian + kana + CJK ideographs are removed, surrounding Korean kept,
         // double space collapsed.
         assert_eq!(

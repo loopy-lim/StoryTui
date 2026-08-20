@@ -56,12 +56,24 @@ The opening has already been shown. Do not reproduce its prose; continue from th
 
 
 # Current state
-{"characters":{"ami":{"affection":10,"emotion":"neutral","stage":"acquaintance","tension":0,"trust":5},"yuna":{"affection":11,"emotion":"neutral","stage":"acquaintance","tension":1,"trust":6},"zoe":{"affection":12,"emotion":"neutral","stage":"acquaintance","tension":2,"trust":7}},"flags":{"apologized":false,"met_namu":true,"shared_umbrella":false},"inventory":{"i-letter":2},"location":"cafe-namu","numbers":{"score":1,"yuna.affection":9,"yuna.trust":4},"time_slot":"evening","turn":3}
+{"active_route":null,"characters":{"ami":{"address_form_overrides":{},"affection":10,"emotion":"neutral","known_facts":[],"stage":"acquaintance","tension":0,"trust":5},"yuna":{"address_form_overrides":{},"affection":11,"emotion":"neutral","known_facts":[],"stage":"acquaintance","tension":1,"trust":6},"zoe":{"address_form_overrides":{},"affection":12,"emotion":"neutral","known_facts":[],"stage":"acquaintance","tension":2,"trust":7}},"current_chapter":"chapter-1","current_scene_id":"cafe-reunion","flags":{"apologized":false,"met_namu":true,"shared_umbrella":false},"inventory":{"i-letter":2},"last_choice":null,"location":"cafe-namu","numbers":{"score":1,"yuna.affection":9,"yuna.trust":4},"occurred_events":[],"strings":{},"time_slot":"evening","turn":3}
 
 # Relationship ledger (engine-owned)
 - ami: stage=Acquaintance; affection=10; trust=5; tension=0; emotion=Neutral
 - yuna: stage=Acquaintance; affection=11; trust=6; tension=1; emotion=Neutral
 - zoe: stage=Acquaintance; affection=12; trust=7; tension=2; emotion=Neutral
+
+# Character canon and voice (pack-owned)
+Treat voice, knowledge, goals, and boundaries below as canon. Unknown facts and secrets are private: do not reveal or let a character act on them unless the live state or an authorized event has established that knowledge.
+## ami (ami)
+age: 29
+## yuna (yuna)
+age: 29
+## zoe (zoe)
+age: 29
+
+# Story progression rules (engine-authoritative)
+`state_patch.add_events` only proposes an event. Propose an id only when its trigger is true after this turn's patch and its route lock matches. Rust re-checks every condition and records only fired events.
 
 # Current dramatic beat
 mode=Scene. Advance exactly one observable relationship or situation beat at cafe-namu. Do not restart the premise or repeat the last selected approach. End with a concrete new pressure, question, or consequence.
@@ -92,4 +104,4 @@ The three choices must cause different next-scene goals or consequences, not mer
 
 
 === HASH ===
-a94371d22838d08ae47740dc334b26ec46dea188c51a727cd51af0c650804745
+9c1e6c98c7b4544f79a9023b52bfcc03411bf980ca34060a814a1536c58457ed

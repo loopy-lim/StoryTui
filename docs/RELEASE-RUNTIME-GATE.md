@@ -19,7 +19,8 @@ Each item below is bounded by something code cannot deliver on its own:
   packs.
 - An Apple-Silicon binary requires building on the target hardware with the
   target toolchain.
-- A second-Pack swap requires a second content-complete pack.
+- A second-Pack swap requires live 10-turn evidence with the committed second
+  pack, not only loader tests.
 
 ## Gate checklist
 
@@ -76,7 +77,7 @@ xcode-select --install
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 git clone <repo> && cd StoryTui
 cargo test --workspace        # green
-cargo run -p storytui         # banner prints; host loop is the open item
+cargo run -p storytui         # live provider is a separate runtime dependency
 ```
 
 **Pass criterion:** the workspace test suite is green on a host that has
@@ -126,19 +127,19 @@ the checksum verifies; bundle the binary + checksum + this gate document.
 
 ### G5 — Second-Pack swap
 
-**Goal:** load a second, content-complete pack (not `rainy-reunion`) and
-play it for ≥ 10 turns without code changes. Proves the engine is not
-over-fit to one pack.
+**Goal:** load the committed second pack, `starlight-station`, and play it for
+≥ 10 turns without code changes. Proves the engine is not over-fit to one
+pack.
 
 **Reproduction commands (operator):**
 
 ```sh
-# Author or obtain a second pack at stories/<second-pack>/.
-# Validate it loads:
-cargo test -p story-persistence --test loader_validation
+# Validate both committed packs load:
+cargo test -p story-persistence --test rainy_reunion
+cargo test -p story-persistence --test starlight_station
 
 # Run:
-cargo run --release -p storytui -- --pack ./stories/<second-pack>
+cargo run --release -p storytui -- --pack ./stories/starlight-station
 # Play 10 turns. Confirm:
 #    - choices render correctly;
 #    - no patch_unknown_flag (the pack's flags are honored);

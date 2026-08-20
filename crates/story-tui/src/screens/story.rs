@@ -94,6 +94,7 @@ pub fn render_model_picker(frame: &mut Frame, area: Rect, items: &[String], sele
             .collect()
     };
     let paragraph = Paragraph::new(rows)
+        .scroll((model_picker_scroll(area, selected), 0))
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -103,6 +104,11 @@ pub fn render_model_picker(frame: &mut Frame, area: Rect, items: &[String], sele
         .wrap(Wrap { trim: false });
     frame.render_widget(Clear, area);
     frame.render_widget(paragraph, area);
+}
+
+pub fn model_picker_scroll(area: Rect, selected: usize) -> u16 {
+    let visible_rows = area.height.saturating_sub(2) as usize;
+    selected.saturating_sub(visible_rows.saturating_sub(1)) as u16
 }
 
 /// Render the Story screen for `view`, highlighting `selected` (clamped to the
@@ -583,7 +589,7 @@ fn render_choice_panel(
     streaming_narration: Option<&str>,
 ) {
     let turn = view.status.turn;
-    let elapsed_mins = (turn as u32) * 30;
+    let elapsed_mins = turn * 30;
     let hours = elapsed_mins / 60;
     let mins = elapsed_mins % 60;
     let elapsed_label = if turn == 0 {
@@ -696,10 +702,15 @@ fn render_input_panel(frame: &mut Frame, area: Rect, input: &InputBuffer) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::LightCyan))
         .title("직접 입력 · Enter 전송 · Esc 취소");
+    let (before, after) = input.split_at_cursor();
     frame.render_widget(
-        Paragraph::new(format!("{}▌", input.text()))
-            .style(Style::default().fg(Color::White))
-            .block(block),
+        Paragraph::new(Line::from(vec![
+            Span::raw(before),
+            Span::styled("▌", Style::default().fg(Color::Yellow)),
+            Span::raw(after),
+        ]))
+        .style(Style::default().fg(Color::White))
+        .block(block),
         area,
     );
 }

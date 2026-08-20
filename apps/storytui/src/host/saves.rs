@@ -46,15 +46,16 @@ fn engine_from_envelope(pack: &StoryPack, envelope: SaveEnvelope) -> Result<Engi
 const MANUAL_SAVE_SLOTS: [&str; 3] = ["slot-1", "slot-2", "slot-3"];
 
 fn selectable_slots(save_store: &SaveStore, pack: &StoryPack, mode: SaveLoadMode) -> Vec<SlotMeta> {
-    let mut existing = save_store
-        .list_slots()
-        .into_iter()
-        .filter(|slot| slot.story_id == pack.metadata.story_id)
-        .collect::<Vec<_>>();
+    let mut existing = save_store.list_slots().into_iter().collect::<Vec<_>>();
     existing.sort_by(|a, b| a.slot_id.cmp(&b.slot_id));
     if mode == SaveLoadMode::Load {
-        return existing;
+        return existing
+            .into_iter()
+            .filter(|slot| slot.story_id == pack.metadata.story_id)
+            .collect();
     }
+    // Save mode must show a manual slot occupied by another pack as occupied,
+    // otherwise Enter silently overwrites it without confirmation.
     MANUAL_SAVE_SLOTS
         .iter()
         .map(|id| {

@@ -81,6 +81,21 @@ pub fn apply_patch(
 
     // --- Stage 7b: compute fired events ---------------------------------
     let fired = compute_fired_events(&next, rules, &sanitized.add_events);
+    // `add_events` is a proposal, not a direct mutation. Record only events
+    // whose authoritative trigger and route lock actually passed.
+    for event_id in &fired {
+        if next.occurred_events.insert(event_id.0.clone()) {
+            record_field(
+                &mut log,
+                ChangeSource::LlmPatch,
+                format!("occurred_events.{}", event_id.0),
+                serde_json::Value::Bool(false),
+                serde_json::Value::Bool(true),
+                serde_json::Value::Bool(true),
+                None,
+            );
+        }
+    }
 
     // Did any *fired* event grant allow_relationship_skip?
     let fired_skip_allowed = fired.iter().any(|ev| {
@@ -271,20 +286,6 @@ fn apply_direct_mutations(
             serde_json::json!(applied),
             None,
         );
-    }
-
-    for ev in &patch.add_events {
-        if next.occurred_events.insert(ev.clone()) {
-            record_field(
-                log,
-                llm,
-                format!("occurred_events.{ev}"),
-                serde_json::Value::Bool(false),
-                serde_json::Value::Bool(true),
-                serde_json::Value::Bool(true),
-                None,
-            );
-        }
     }
 
     if let Some(loc) = &patch.next_location {
@@ -530,12 +531,13 @@ fn apply_event_affection_delta(
         }
         let was = c.affection;
         let projected = was.saturating_add(*delta);
-        if !rules.stat_limits.contains(projected) {
+        let stat_limits = rules.affection_stat_limits();
+        if !stat_limits.contains(projected) {
             return Err(CoreError::invalid_patch(
                 PATCH_STAT_OUT_OF_RANGE,
                 format!(
                     "event {ev_id} affection for {ch} projected to {projected}, outside [{}, {}]",
-                    rules.stat_limits.min, rules.stat_limits.max
+                    stat_limits.min, stat_limits.max
                 ),
             ));
         }
@@ -589,12 +591,13 @@ fn apply_event_trust_delta(
         }
         let was = c.trust;
         let projected = was.saturating_add(*delta);
-        if !rules.stat_limits.contains(projected) {
+        let stat_limits = rules.trust_stat_limits();
+        if !stat_limits.contains(projected) {
             return Err(CoreError::invalid_patch(
                 PATCH_STAT_OUT_OF_RANGE,
                 format!(
                     "event {ev_id} trust for {ch} projected to {projected}, outside [{}, {}]",
-                    rules.stat_limits.min, rules.stat_limits.max
+                    stat_limits.min, stat_limits.max
                 ),
             ));
         }
@@ -640,12 +643,13 @@ fn apply_event_tension_delta(
         }
         let was = c.tension;
         let projected = was.saturating_add(*delta);
-        if !rules.stat_limits.contains(projected) {
+        let stat_limits = rules.tension_stat_limits();
+        if !stat_limits.contains(projected) {
             return Err(CoreError::invalid_patch(
                 PATCH_STAT_OUT_OF_RANGE,
                 format!(
                     "event {ev_id} tension for {ch} projected to {projected}, outside [{}, {}]",
-                    rules.stat_limits.min, rules.stat_limits.max
+                    stat_limits.min, stat_limits.max
                 ),
             ));
         }

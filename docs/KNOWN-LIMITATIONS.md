@@ -10,7 +10,7 @@ The binary `apps/storytui` now runs the interactive event pump:
 `crossterm` event stream → `App::handle_key` → `EngineCommand` → `reduce` →
 `provider.generate_turn` → `AcceptGeneration` → publish view. Provider
 failures restore the last stable checkpoint and render a recoverable error.
-What remains to prove with runtime evidence:
+Automated coverage already proves:
 
 - The full engine flow against a `MockProvider` over a 100-turn synthetic
   soak (`crates/story-core/tests/soak.rs`).
@@ -23,7 +23,8 @@ What remains to prove with runtime evidence:
   (`apps/storytui/tests/bench.rs`).
 
 The host loop is playable with a reachable, authenticated OpenAI-compatible
-server. A real 100-turn session is still an open release gate because the
+server. A live first-scene generation has been verified against the checked-in
+OMLX profile. A real 100-turn session is still an open release gate because the
 automated long-run suite uses MockProvider.
 
 ## MVP quality metrics are pending a real model
@@ -65,12 +66,12 @@ overlay only reflects the start/end of one generation call. The
 `EngineState::use_director_writer` flag toggles the 2-stage path; the
 settings UI does not yet expose it.
 
-## Single-pack focus
+## Cross-pack runtime evidence is still limited
 
-The committed pack is `stories/rainy-reunion`. A second content-complete
-pack is an open runtime gate (G5). The loader and validator are pack-shape
-driven, not pack-specific, but only `rainy-reunion` has been exercised
-end-to-end at the integration-test level.
+Two packs are committed: `stories/rainy-reunion` and
+`stories/starlight-station`. Both pass loader validation, while only
+`rainy-reunion` has been exercised through the app-level integration path.
+The 10-turn live-model swap to `starlight-station` remains runtime gate G5.
 
 ## Non-goal: cloud providers
 
@@ -81,8 +82,11 @@ out of scope. A cloud provider that speaks the OpenAI shape (e.g.
 
 ## Settings are profile-based
 
-The current Settings contract is a TOML profile plus CLI overrides. The
-renderer is still read-only, but `config/storytui.toml` supplies the provider
-URL, selected model, authentication file/environment variable, sampling,
-timeouts, retry budget, context budget, and save directory. In-app editing and
-writing a profile remain a future UX improvement.
+The current Settings contract is a TOML profile plus CLI and per-save-directory
+user overrides. The in-app model picker reads `/v1/models` and persists the
+main, Director, and Writer selections to `saves/user-settings.toml`; if a
+persisted model disappears, startup selects the checked-in fallback (or the
+first advertised model) and repairs the user setting. Provider URL,
+authentication, sampling, timeouts, retry budget, context budget, and save
+directory still come from the base profile or CLI. Editing those values in the
+TUI remains a future UX improvement.

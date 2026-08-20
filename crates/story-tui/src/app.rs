@@ -27,8 +27,8 @@ use crate::screens::home::{menu_selection_at, render_home};
 use crate::screens::save_load::render_save_load;
 use crate::screens::settings::{SettingsView, render_settings};
 use crate::screens::story::{
-    ListMode, StoryStackEntry, choice_index_at, home_shortcut_at, render_list, render_model_picker,
-    render_story,
+    ListMode, StoryStackEntry, choice_index_at, home_shortcut_at, model_picker_scroll, render_list,
+    render_model_picker, render_story,
 };
 
 /// Which manual save manager the host should open.
@@ -169,7 +169,11 @@ impl App {
             settings_returns_home: false,
             generation_models: BTreeMap::new(),
             generation_durations: BTreeMap::new(),
-            generation_start_time: if loading { Some(std::time::Instant::now()) } else { None },
+            generation_start_time: if loading {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            },
         }
     }
 
@@ -298,7 +302,8 @@ impl App {
     }
 
     pub fn generation_elapsed_seconds(&self) -> Option<u64> {
-        self.generation_start_time.map(|start| start.elapsed().as_secs())
+        self.generation_start_time
+            .map(|start| start.elapsed().as_secs())
     }
 
     /// Replace the view (e.g. the host published a new one). Clamps the
@@ -370,10 +375,7 @@ impl App {
                 turn: entry.turn,
                 scene_id: entry.scene_id.clone(),
                 model: self.generation_models.get(&entry.generation_id).cloned(),
-                generation_secs: self
-                    .generation_durations
-                    .get(&entry.generation_id)
-                    .copied(),
+                generation_secs: self.generation_durations.get(&entry.generation_id).copied(),
                 player_action: entry
                     .player_action
                     .as_ref()
@@ -439,6 +441,16 @@ impl App {
             self.handle_save_load_key(key);
             return None;
         }
+        if self.view.error.is_some() {
+            return match map_key(key, self.view.choices.len(), false, true) {
+                KeyAction::None | KeyAction::MoveSelection(_) => None,
+                KeyAction::Quit => {
+                    self.should_quit = true;
+                    None
+                }
+                KeyAction::Command(command) => self.resolve_command(command, pending_generation_id),
+            };
+        }
         if self.input_mode {
             return self.handle_input_key(key);
         }
@@ -479,7 +491,8 @@ impl App {
                     self.list_mode = None;
                 }
                 KeyCode::Char('d' | 'ㅇ') if self.list_mode == Some(ListMode::ModelPicker) => {
-                    self.selected_director_model = self.model_items.get(self.model_selected).cloned();
+                    self.selected_director_model =
+                        self.model_items.get(self.model_selected).cloned();
                     self.list_mode = None;
                 }
                 KeyCode::Char('w' | 'ㅈ') if self.list_mode == Some(ListMode::ModelPicker) => {
@@ -590,6 +603,14 @@ impl App {
         }
     }
 
+    /// Insert a terminal bracketed-paste payload into the active free-input
+    /// editor. Paste events outside input mode are intentionally ignored.
+    pub fn handle_paste(&mut self, text: &str) {
+        if self.input_mode {
+            self.input.insert_str(text);
+        }
+    }
+
     /// Render the Story screen for the current view.
     pub fn render(&self, frame: &mut Frame, area: Rect) {
         self.last_render_area.set(area);
@@ -683,7 +704,8 @@ impl App {
                 return;
             }
             if self.list_mode == Some(ListMode::ModelPicker) {
-                let index = mouse.row.saturating_sub(area.y.saturating_add(1)) as usize;
+                let scroll = model_picker_scroll(area, self.model_selected) as usize;
+                let index = scroll + mouse.row.saturating_sub(area.y.saturating_add(1)) as usize;
                 if let Some(model) = self.model_items.get(index).cloned() {
                     self.model_selected = index;
                     self.selected_model = Some(model);
@@ -753,6 +775,15 @@ impl App {
     }
 
     fn handle_save_load_key(&mut self, key: KeyEvent) {
+        let requested_mode = match key.code {
+            KeyCode::Char('s' | 'ㄴ') => Some(SaveLoadMode::Save),
+            KeyCode::Char('l' | 'ㅣ') => Some(SaveLoadMode::Load),
+            _ => None,
+        };
+        if let Some(mode) = requested_mode {
+            self.save_load_request = Some(SaveLoadRequest::Open(mode));
+            return;
+        }
         let Some(state) = self.save_load.as_mut() else {
             return;
         };
@@ -764,14 +795,6 @@ impl App {
             }
             KeyCode::Down | KeyCode::Char('j' | 'ㅓ') => {
                 state.selected = (state.selected + 1).min(state.slots.len().saturating_sub(1));
-                state.overwrite_confirmation = false;
-            }
-            KeyCode::Char('s' | 'ㄴ') => {
-                state.mode = SaveLoadMode::Save;
-                state.overwrite_confirmation = false;
-            }
-            KeyCode::Char('l' | 'ㅣ') => {
-                state.mode = SaveLoadMode::Load;
                 state.overwrite_confirmation = false;
             }
             KeyCode::Enter => {
@@ -1082,6 +1105,49 @@ mod tests {
                 slot_id: "slot-1".to_string()
             })
         );
+    }
+
+    #[test]
+    fn switching_save_load_mode_requests_fresh_slots() {
+        let mut app = App::new(sample_view(3));
+        app.open_save_load(SaveLoadMode::Load, vec![save_slot("autosave", true)]);
+        app.handle_key(key(KeyCode::Char('s')), None);
+        assert_eq!(
+            app.take_save_load_request(),
+            Some(SaveLoadRequest::Open(SaveLoadMode::Save))
+        );
+    }
+
+    #[test]
+    fn paste_is_inserted_only_while_free_input_is_active() {
+        let mut app = App::new(sample_view(3));
+        app.handle_paste("무시");
+        assert_eq!(app.input.text(), "");
+        app.input_mode = true;
+        app.handle_paste("안녕\n유나");
+        assert_eq!(app.input.text(), "안녕유나");
+    }
+
+    #[test]
+    fn error_overlay_blocks_auxiliary_screens_as_well_as_story_commands() {
+        let mut app = App::new(sample_view(3));
+        app.view.error = Some(story_model::DomainErrorView {
+            code: "test".to_string(),
+            title_ko: "오류".to_string(),
+            message_ko: "재시도 필요".to_string(),
+            recoverable: true,
+        });
+        for code in [
+            KeyCode::Char('o'),
+            KeyCode::Char('h'),
+            KeyCode::Char('m'),
+            KeyCode::Home,
+        ] {
+            assert_eq!(app.handle_key(key(code), None), None);
+        }
+        assert!(!app.settings_visible);
+        assert!(app.list_mode.is_none());
+        assert!(!app.home_visible);
     }
 
     #[test]

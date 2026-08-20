@@ -140,6 +140,14 @@ impl InputBuffer {
         self.graphemes.concat()
     }
 
+    /// Text before and after the grapheme cursor, for cursor-aware rendering.
+    pub fn split_at_cursor(&self) -> (String, String) {
+        (
+            self.graphemes[..self.cursor].concat(),
+            self.graphemes[self.cursor..].concat(),
+        )
+    }
+
     /// Grapheme count (what the on-screen `n/max_chars` counter shows).
     pub fn char_count(&self) -> usize {
         self.graphemes.len()
@@ -188,6 +196,14 @@ mod tests {
         assert_eq!(b.char_count(), 1);
         assert_eq!(b.text(), "가");
         assert_eq!(b.display_width(), 2, "Hangul syllable is wide");
+    }
+
+    #[test]
+    fn split_at_cursor_preserves_grapheme_boundaries() {
+        let mut b = InputBuffer::new(50);
+        b.insert_str("안녕👨‍👩‍👧");
+        b.cursor_left();
+        assert_eq!(b.split_at_cursor(), ("안녕".to_string(), "👨‍👩‍👧".to_string()));
     }
 
     #[test]

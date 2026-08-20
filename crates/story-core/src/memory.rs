@@ -24,8 +24,11 @@
 //! | `resolve_promise[...]`  | resolver — clears prior `Promise` unresolved | no |
 //! | `resolve_secret[...]`   | resolver — clears prior `SecretReveal` unresolved | no |
 //!
-//! Events whose id carries none of these hints produce no memory (they are not
-//! memory-worthy). The resolver convention is the MVP "resolves" relation
+//! Events whose id carries none of these hints still produce an `Other`
+//! memory. Fired events are canonical, validator-approved story beats; dropping
+//! them because a pack author chose a semantic id such as
+//! `event.truth_revealed` made long-running relationships forget their most
+//! important turns. The resolver convention is the MVP "resolves" relation
 //! permitted by the W9 plan: a fired resolver event clears the `unresolved`
 //! flag on prior memories of the matching kind via [`resolve_memories`].
 //!
@@ -73,9 +76,7 @@ pub fn memories_from_turn(
         let Some(def) = pack.rules.events.get(ev_id) else {
             continue;
         };
-        let Some(kind) = memory_kind_for_event(&def.id.0) else {
-            continue;
-        };
+        let kind = memory_kind_for_event(&def.id.0).unwrap_or(MemoryKind::Other);
         let participants = participants_of(def);
         let (facts, importance) = build_facts(&def.id.0, kind, &participants);
         let unresolved = starts_unresolved(&def.id.0, kind);
