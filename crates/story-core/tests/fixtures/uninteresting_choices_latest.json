@@ -1,0 +1,35 @@
+{
+  "selected_label": "유나의 손목 시계와 코트 상태를 살핀다",
+  "choices": [
+    {
+      "id": "choice-1",
+      "label": "시계와 코트의 상태를 언급하며 변화를 확인한다",
+      "intent": "유나의 현재 상태와 과거의 차이를 짚어본다",
+      "tone": "observant",
+      "target": null,
+      "risk": "low",
+      "hidden_requirements": [],
+      "preview": null
+    },
+    {
+      "id": "choice-2",
+      "label": "창밖의 비와 재즈 소리를 언급하며 분위기를 전환한다",
+      "intent": "장소의 분위기를 활용해 대화를 이끈다",
+      "tone": "calm",
+      "target": null,
+      "risk": "low",
+      "hidden_requirements": [],
+      "preview": null
+    },
+    {
+      "id": "choice-3",
+      "label": "먼저 유나의 최근 근황을 묻는다",
+      "intent": "유나의 질문 의도를 선점한다",
+      "tone": "inquisitive",
+      "target": null,
+      "risk": "low",
+      "hidden_requirements": [],
+      "preview": null
+    }
+  ]
+}

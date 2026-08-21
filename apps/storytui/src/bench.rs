@@ -31,8 +31,8 @@ use story_model::{
 use story_provider::{LlmProvider, MockProvider, MockResponse};
 use tokio_util::sync::CancellationToken;
 
-/// Per-benchmark configuration. The defaults mirror the operator TOML
-/// (`temperature` 0.85, `top_p` 0.92, `top_k` 40, `max_tokens` 1800) so a
+/// Per-benchmark configuration. The defaults mirror the checked-in local
+/// profile (`temperature` 0.5, `top_p` 0.92, `top_k` 40, `max_tokens` 8192) so a
 /// real-provider run is a drop-in replacement.
 #[derive(Clone, Debug)]
 pub struct BenchConfig {
@@ -52,10 +52,10 @@ impl Default for BenchConfig {
     fn default() -> Self {
         Self {
             turns: 10,
-            temperature: 0.85,
+            temperature: 0.5,
             top_p: 0.92,
             top_k: 40,
-            max_tokens: 1800,
+            max_tokens: 8192,
         }
     }
 }
@@ -268,7 +268,10 @@ fn deterministic_draft(i: u32, primary: CharacterId) -> GeneratedTurnDraft {
     patch.affection_delta.insert(primary, 1);
     GeneratedTurnDraft {
         generation_id: story_model::uuid::Uuid::nil(),
-        narration: format!("벤치 턴 {i}: 유나가 고개를 끄덕인다."),
+        // Keep the fixed action while making the scene marker one token. The
+        // narration-quality gate should not mistake benchmark scaffolding
+        // words ("벤치 턴") for a third recurring story motif.
+        narration: format!("장면번호{i}: 유나가 고개를 끄덕인다."),
         choices: vec![
             choice("choice-0", "조용히 기다린다", RiskLevel::Low),
             choice("choice-1", "말을 건넨다", RiskLevel::Medium),

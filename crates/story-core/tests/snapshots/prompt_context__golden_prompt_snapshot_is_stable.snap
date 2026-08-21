@@ -95,13 +95,14 @@ narration: 비가 창을 때렸다.
 ## turn 2 (cafe-reunion)
 비가 창을 때렸다
 
-# Choice roles for this turn
-Return exactly three choices in this order:
-1. relationship move: directly ask, set a boundary, or offer something that changes interpersonal distance
-2. evidence move: observe, verify, or investigate a concrete clue without forcing a confession
-3. situation move: change the immediate situation through movement, delay, risk, or a third factor
-The three choices must cause different next-scene goals or consequences, not merely different wording. Treat recent chosen directions (none) as a soft anti-repeat signal; avoid re-offering the player's last selected label: (none)
+# Engine-owned choice design
+The engine assigned the dramatic job of each choice slot. Keep this order and do not collapse two slots into the same likely next scene.
+1. role=relationship; objective=현재 압력: 현재 관계의 미해결 질문. 여기에 직접 닿는 질문, 솔직한 인정, 경계 설정 또는 제안으로 관계의 거리를 실제로 바꾼다; cost=상대가 거절하거나 긴장이 높아질 수 있고, 플레이어도 취약함을 드러낸다; immediate_consequence=상대는 중립적인 맞장구가 아니라 답변·거절·역질문 중 하나로 자신의 목표(상대의 현재 의도)를 드러낸다; risk=medium 또는 high
+2. role=evidence; objective=현재 압력: 현재 관계의 미해결 질문. 이와 연결된 구체적인 말, 물건, 시간 또는 불일치를 확인해 새 정보를 얻거나 가능성 하나를 지운다; cost=지나치게 캐묻거나 본론을 피하는 사람으로 보일 수 있다; immediate_consequence=다음 장면에서 사용할 수 있는 구체적 단서 하나가 생기거나 기존 추측 하나가 틀렸음이 드러난다; risk=low 또는 medium
+3. role=situation; objective=사용 가능한 장면 변화 자원: 현재 장소의 시간 압력이나 제삼의 변수. 이동, 마감, 제삼자, 제안 또는 즉시 행동으로 장면 조건을 바꾼다; cost=현재 질문을 미뤄 오해를 남기거나 대화할 수 있는 시간을 잃을 수 있다; immediate_consequence=장소·시간·참여자·즉시 목표 중 하나가 달라져 다음 장면이 같은 대화의 반복이 되지 않는다; risk=medium 또는 high
+Recently chosen directions: none. Never offer the last selected action again, even as a paraphrase: (none).
+For every choice: write one concrete player action or line; make `intent` name its actual goal; make `preview` a non-empty, spoiler-free Korean hint about what it tests or changes. Do not use observation, waiting, silence, small talk, or atmosphere commentary unless it creates a new deadline, discovery, refusal, movement, or relationship consequence. The set must include both a lower-risk option and a medium-or-higher-risk option.
 
 
 === HASH ===
-9c1e6c98c7b4544f79a9023b52bfcc03411bf980ca34060a814a1536c58457ed
+f4df99b6fb2c43d1d1a9167a2794ae70bad2445f3d7ed98ca9393d949c2034a6

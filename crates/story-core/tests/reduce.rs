@@ -13,7 +13,9 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use story_core::engine::{AUTOSAVE_SLOT, EngineState, Transition, commit_turn, reduce};
+use story_core::engine::{
+    AUTOSAVE_SLOT, EngineState, NarrationRepair, Transition, commit_turn, reduce,
+};
 use story_core::engine_cmd::{EngineCommand, EngineEffect};
 use story_core::reducer::ApplyResult;
 use story_model::{
@@ -118,7 +120,9 @@ fn valid_draft(generation_id: uuid::Uuid, affection_delta: i16) -> GeneratedTurn
     patch.affection_delta.insert(cid(), affection_delta);
     GeneratedTurnDraft {
         generation_id,
-        narration: format!("유나가 고개를 끄덕인다 (affection {affection_delta:+})."),
+        narration: format!(
+            "유나가 고개를 끄덕인다 (affection {affection_delta:+}, generation {generation_id})."
+        ),
         choices: vec![
             choice("choice-0", "다시 만난다", RiskLevel::Low),
             choice("choice-1", "돌아선다", RiskLevel::Medium),
@@ -173,6 +177,45 @@ fn choice(id: &str, label: &str, risk: RiskLevel) -> Choice {
         hidden_requirements: vec![],
         preview: None,
     }
+}
+
+fn designed_choice(id: &str, label: &str, intent: &str, risk: RiskLevel, preview: &str) -> Choice {
+    Choice {
+        id: id.to_string(),
+        label: label.to_string(),
+        intent: intent.to_string(),
+        tone: None,
+        target: None,
+        risk,
+        hidden_requirements: vec![],
+        preview: Some(preview.to_string()),
+    }
+}
+
+fn interesting_choices() -> Vec<Choice> {
+    vec![
+        designed_choice(
+            "fresh-relationship",
+            "지금 떠났던 이유를 솔직하게 묻는다",
+            "거절 가능성을 감수하고 관계의 핵심 질문에 답을 요구한다",
+            RiskLevel::High,
+            "회피하던 이별의 이유와 두 사람의 거리를 시험한다",
+        ),
+        designed_choice(
+            "fresh-evidence",
+            "찢긴 승차권의 날짜를 함께 확인한다",
+            "말과 맞지 않는 구체적인 시간 단서를 확인한다",
+            RiskLevel::Low,
+            "과거의 설명에서 어긋난 날짜 하나를 확인한다",
+        ),
+        designed_choice(
+            "fresh-situation",
+            "막차 전에 강변 전시로 함께 이동하자고 제안한다",
+            "남은 시간을 걸고 장소와 대화 조건을 바꾼다",
+            RiskLevel::Medium,
+            "제안을 받아들이는지에 따라 다음 장소와 대화 시간이 달라진다",
+        ),
+    ]
 }
 
 /// Drive `StartNewGame`, fish out the `RequestGeneration` id, return it.
@@ -269,7 +312,10 @@ fn accepted_opening_generation_bumps_turn_and_offers_choices() {
     );
     let view = published_view(&t);
     assert_eq!(view.choices.len(), 3, "opening offers 3 choices");
-    assert_eq!(view.narration, "유나가 고개를 끄덕인다 (affection +1).");
+    assert!(
+        view.narration
+            .starts_with("유나가 고개를 끄덕인다 (affection +1")
+    );
     assert_eq!(view.status.turn, 1);
     assert_eq!(view.status.affection, Some(1));
     assert_eq!(view.screen, Screen::Story);
@@ -781,6 +827,201 @@ fn quit_returns_state_unchanged() {
 }
 
 #[test]
+fn latest_live_uninteresting_fixture_is_refreshed_before_display() {
+    let pack = sample_pack();
+    let (pending, generation_id) = start_and_pending_id(&pack);
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/uninteresting_choices_latest.json"))
+            .expect("live choice fixture");
+    let mut draft = valid_draft(generation_id, 1);
+    draft.choices = serde_json::from_value(fixture["choices"].clone()).expect("fixture choices");
+    let accepted_narration = draft.narration.clone();
+
+    let transition = reduce(
+        &pending,
+        EngineCommand::AcceptGeneration {
+            draft: Box::new(draft),
+        },
+        &pack,
+    )
+    .expect("accept then refresh weak choices");
+
+    assert_eq!(transition.state.game.turn, 1, "the scene still commits");
+    assert_eq!(
+        transition.state.game.history.last().unwrap().narration,
+        accepted_narration,
+        "choice repair cannot rewrite accepted prose"
+    );
+    assert!(transition.state.pending.as_ref().unwrap().choice_refresh);
+    let repair_prompt = transition
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            EngineEffect::RequestGeneration { request, .. } => request.messages.last(),
+            _ => None,
+        })
+        .expect("choice-only request")
+        .content
+        .as_str();
+    assert!(repair_prompt.contains("preview가 비어 있다"));
+    assert!(repair_prompt.contains("위험도가 모두 비슷하다"));
+    assert!(repair_prompt.contains("관찰·기다리기·분위기 언급"));
+}
+
+#[test]
+fn just_selected_action_is_rejected_even_before_last_choice_commits() {
+    let pack = sample_pack();
+    let (opening_pending, opening_id) = start_and_pending_id(&pack);
+    let mut opening = valid_draft(opening_id, 1);
+    opening.choices[0].label = "유나의 손목 시계와 코트 상태를 살핀다".to_string();
+    let opening = reduce(
+        &opening_pending,
+        EngineCommand::AcceptGeneration {
+            draft: Box::new(opening),
+        },
+        &pack,
+    )
+    .expect("opening");
+    assert!(
+        opening.state.game.last_choice.is_none(),
+        "opening does not have a historical last choice"
+    );
+    let submitted = reduce(
+        &opening.state,
+        EngineCommand::SubmitChoice {
+            choice_id: "choice-0".to_string(),
+        },
+        &pack,
+    )
+    .expect("submit current choice");
+    let generation_id = submitted.state.pending.as_ref().unwrap().generation_id;
+    let mut draft = valid_draft(generation_id, 1);
+    draft.choices = interesting_choices();
+    draft.choices[0] = designed_choice(
+        "echo",
+        "시계와 코트 상태를 언급해 변화를 확인한다",
+        "손목 시계와 코트 상태의 차이를 다시 살핀다",
+        RiskLevel::High,
+        "시계와 옷차림의 변화를 확인한다",
+    );
+
+    let transition = reduce(
+        &submitted.state,
+        EngineCommand::AcceptGeneration {
+            draft: Box::new(draft),
+        },
+        &pack,
+    )
+    .expect("accept echoing set");
+
+    assert!(transition.state.pending.as_ref().unwrap().choice_refresh);
+    let repair_prompt = transition
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            EngineEffect::RequestGeneration { request, .. } => request.messages.last(),
+            _ => None,
+        })
+        .expect("choice repair prompt")
+        .content
+        .as_str();
+    assert!(repair_prompt.contains("플레이어가 방금 고른 행동을 다시 제시한다"));
+}
+
+#[test]
+fn manual_choice_refresh_preserves_turn_and_accepts_a_new_designed_set() {
+    let pack = sample_pack();
+    let (opening_pending, opening_id) = start_and_pending_id(&pack);
+    let stable = reduce(
+        &opening_pending,
+        EngineCommand::AcceptGeneration {
+            draft: Box::new(valid_draft(opening_id, 1)),
+        },
+        &pack,
+    )
+    .expect("opening")
+    .state;
+    let before = serde_json::to_vec(&stable.game).unwrap();
+
+    let refreshing =
+        reduce(&stable, EngineCommand::RegenerateChoices, &pack).expect("manual choice refresh");
+    assert_eq!(serde_json::to_vec(&refreshing.state.game).unwrap(), before);
+    assert!(refreshing.state.pending.as_ref().unwrap().choice_refresh);
+    assert!(refreshing.effects.iter().any(|effect| matches!(
+        effect,
+        EngineEffect::PersistStableState { slot_id, .. } if slot_id == AUTOSAVE_SLOT
+    )));
+
+    let refresh_id = refreshing.state.pending.as_ref().unwrap().generation_id;
+    let mut replacement = valid_draft(refresh_id, 0);
+    replacement.choices = interesting_choices();
+    let complete = reduce(
+        &refreshing.state,
+        EngineCommand::AcceptGeneration {
+            draft: Box::new(replacement),
+        },
+        &pack,
+    )
+    .expect("accept new choices");
+
+    assert!(complete.state.pending.is_none());
+    assert_eq!(complete.state.game.turn, stable.game.turn);
+    assert_eq!(
+        complete.state.game.history.last().unwrap().choices,
+        interesting_choices()
+    );
+}
+
+#[test]
+fn failed_choice_refresh_keeps_the_old_offers_and_exposes_retry() {
+    let pack = sample_pack();
+    let (opening_pending, opening_id) = start_and_pending_id(&pack);
+    let stable = reduce(
+        &opening_pending,
+        EngineCommand::AcceptGeneration {
+            draft: Box::new(valid_draft(opening_id, 1)),
+        },
+        &pack,
+    )
+    .expect("opening")
+    .state;
+    let before = serde_json::to_vec(&stable.game).unwrap();
+    let refreshing =
+        reduce(&stable, EngineCommand::RegenerateChoices, &pack).expect("manual choice refresh");
+    let refresh_id = refreshing.state.pending.as_ref().unwrap().generation_id;
+    let mut repeated = valid_draft(refresh_id, 0);
+    repeated.choices = stable.game.history.last().unwrap().choices.clone();
+    for choice in &mut repeated.choices {
+        choice.intent = choice.label.clone();
+        choice.preview = Some("기존 제안을 표현만 바꿔 다시 시도한다".to_string());
+    }
+
+    let rejected = reduce(
+        &refreshing.state,
+        EngineCommand::AcceptGeneration {
+            draft: Box::new(repeated),
+        },
+        &pack,
+    )
+    .expect("reject repeated refresh");
+
+    assert_eq!(serde_json::to_vec(&rejected.state.game).unwrap(), before);
+    assert!(rejected.state.pending.is_none());
+    assert!(
+        rejected
+            .state
+            .retry_pending
+            .as_ref()
+            .unwrap()
+            .choice_refresh
+    );
+    assert!(rejected.effects.iter().any(|effect| matches!(
+        effect,
+        EngineEffect::ShowRecoverableError(error) if error.code == "choice_quality_failed"
+    )));
+}
+
+#[test]
 fn repeated_choice_set_is_refreshed_without_rewriting_the_accepted_turn() {
     let pack = sample_pack();
     let (opening_pending, opening_id) = start_and_pending_id(&pack);
@@ -857,6 +1098,223 @@ fn repeated_choice_set_is_refreshed_without_rewriting_the_accepted_turn() {
         complete.state.game.history.last().unwrap().choices[1].label,
         "편지를 함께 확인한다"
     );
+}
+
+#[test]
+fn repeated_narration_is_rewritten_before_commit_and_preserves_authoritative_fields() {
+    let pack = sample_pack();
+    let repeated = include_str!("fixtures/repeated_narration_ko.txt");
+    let (opening_pending, opening_id) = start_and_pending_id(&pack);
+    let mut opening = valid_draft(opening_id, 1);
+    opening.narration = repeated.to_string();
+    let opened = reduce(
+        &opening_pending,
+        EngineCommand::AcceptGeneration {
+            draft: Box::new(opening),
+        },
+        &pack,
+    )
+    .expect("accept opening");
+
+    let submitted = reduce(
+        &opened.state,
+        EngineCommand::SubmitChoice {
+            choice_id: "choice-0".to_string(),
+        },
+        &pack,
+    )
+    .expect("submit choice");
+    let first_id = submitted.state.pending.as_ref().unwrap().generation_id;
+    let mut rejected = valid_draft(first_id, 1);
+    rejected.narration = repeated.to_string();
+    let authoritative_choices = rejected.choices.clone();
+    let repairing = reduce(
+        &submitted.state,
+        EngineCommand::AcceptGeneration {
+            draft: Box::new(rejected),
+        },
+        &pack,
+    )
+    .expect("start narration repair");
+
+    assert_eq!(
+        repairing.state.game.turn, 1,
+        "rejected prose is not committed"
+    );
+    assert_eq!(repairing.state.game.history.len(), 1);
+    assert!(
+        !repairing
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, EngineEffect::PersistStableState { .. }))
+    );
+    assert!(matches!(
+        repairing
+            .state
+            .pending
+            .as_ref()
+            .and_then(|pending| pending.narration_repair.as_ref()),
+        Some(NarrationRepair::SinglePass { .. })
+    ));
+    let (repair_id, repair_request) = repairing
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            EngineEffect::RequestGeneration {
+                generation_id,
+                request,
+            } => Some((*generation_id, request)),
+            _ => None,
+        })
+        .expect("one automatic repair request");
+    assert!(
+        repair_request
+            .messages
+            .last()
+            .unwrap()
+            .content
+            .contains("Narration-only quality repair")
+    );
+
+    let repaired_text = "유나는 창가에서 몸을 일으켜 계산서 뒷면에 전시회 주소를 적었다. 그리고 오늘 저녁 여섯 시까지 올 수 있는지 구체적으로 물었다.";
+    let mut repaired = valid_draft(repair_id, -3);
+    repaired.narration = repaired_text.to_string();
+    repaired.choices[0].label = "모델이 바꾸려 한 선택지".to_string();
+    repaired
+        .proposed_patch
+        .set_flags
+        .insert("nonexistent_flag".to_string(), true);
+    let completed = reduce(
+        &repairing.state,
+        EngineCommand::AcceptGeneration {
+            draft: Box::new(repaired),
+        },
+        &pack,
+    )
+    .expect("accept repaired narration");
+
+    assert_eq!(completed.state.game.turn, 2);
+    let entry = completed.state.game.history.last().unwrap();
+    assert_eq!(entry.narration, repaired_text);
+    assert_eq!(entry.choices, authoritative_choices);
+    assert_eq!(
+        entry.applied_patch.affection_delta.get(&cid()),
+        Some(&1),
+        "repair response cannot replace the first draft's patch"
+    );
+    assert!(
+        !entry
+            .applied_patch
+            .set_flags
+            .contains_key("nonexistent_flag")
+    );
+}
+
+#[test]
+fn second_repetitive_narration_is_not_committed_or_repaired_again() {
+    let pack = sample_pack();
+    let repeated = include_str!("fixtures/repeated_narration_ko.txt");
+    let (opening_pending, opening_id) = start_and_pending_id(&pack);
+    let mut opening = valid_draft(opening_id, 1);
+    opening.narration = repeated.to_string();
+    let opened = reduce(
+        &opening_pending,
+        EngineCommand::AcceptGeneration {
+            draft: Box::new(opening),
+        },
+        &pack,
+    )
+    .expect("accept opening");
+    let submitted = reduce(
+        &opened.state,
+        EngineCommand::SubmitChoice {
+            choice_id: "choice-0".to_string(),
+        },
+        &pack,
+    )
+    .expect("submit");
+    let first_id = submitted.state.pending.as_ref().unwrap().generation_id;
+    let mut rejected = valid_draft(first_id, 1);
+    rejected.narration = repeated.to_string();
+    let repairing = reduce(
+        &submitted.state,
+        EngineCommand::AcceptGeneration {
+            draft: Box::new(rejected),
+        },
+        &pack,
+    )
+    .expect("repair");
+    let repair_id = repairing.state.pending.as_ref().unwrap().generation_id;
+    let mut repeated_again = valid_draft(repair_id, 1);
+    repeated_again.narration = repeated.to_string();
+    let failed = reduce(
+        &repairing.state,
+        EngineCommand::AcceptGeneration {
+            draft: Box::new(repeated_again),
+        },
+        &pack,
+    )
+    .expect("bounded repair failure");
+
+    assert_eq!(failed.state.game.turn, 1);
+    assert_eq!(failed.state.game.history.len(), 1);
+    assert!(failed.state.pending.is_none());
+    assert!(failed.state.retry_pending.is_some());
+    assert!(failed.effects.iter().any(|effect| matches!(
+        effect,
+        EngineEffect::ShowRecoverableError(error)
+            if error.code == "narration_quality_failed"
+    )));
+    assert!(
+        !failed
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, EngineEffect::RequestGeneration { .. }))
+    );
+}
+
+#[test]
+fn second_consecutive_no_progress_turn_is_repaired_before_commit() {
+    let pack = sample_pack();
+    let (opening_pending, opening_id) = start_and_pending_id(&pack);
+    let opening = valid_draft(opening_id, 0);
+    let opened = reduce(
+        &opening_pending,
+        EngineCommand::AcceptGeneration {
+            draft: Box::new(opening),
+        },
+        &pack,
+    )
+    .expect("quiet opening is allowed");
+    let submitted = reduce(
+        &opened.state,
+        EngineCommand::SubmitChoice {
+            choice_id: "choice-0".to_string(),
+        },
+        &pack,
+    )
+    .expect("submit");
+    let generation_id = submitted.state.pending.as_ref().unwrap().generation_id;
+    let quiet_again = valid_draft(generation_id, 0);
+    let repairing = reduce(
+        &submitted.state,
+        EngineCommand::AcceptGeneration {
+            draft: Box::new(quiet_again),
+        },
+        &pack,
+    )
+    .expect("repair stalled turn");
+
+    assert_eq!(repairing.state.game.turn, 1);
+    let instruction = repairing
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            EngineEffect::RequestGeneration { request, .. } => request.messages.last(),
+            _ => None,
+        })
+        .expect("repair prompt");
+    assert!(instruction.content.contains("직전 턴에 이어 변화가 없다"));
 }
 
 fn published_view(t: &Transition) -> AppViewModel {

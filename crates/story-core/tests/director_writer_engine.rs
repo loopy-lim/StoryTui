@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use story_core::engine::{EngineState, reduce};
+use story_core::engine::{EngineState, NarrationRepair, reduce};
 use story_core::engine_cmd::{EngineCommand, EngineEffect};
 use story_model::{
     CharacterDef, CharacterId, Choice, DirectorPlan, GeneratedTurnDraft, LocationDef, LocationId,
@@ -108,12 +108,12 @@ fn choice(id: &str, label: &str, risk: RiskLevel) -> Choice {
     Choice {
         id: id.to_string(),
         label: label.to_string(),
-        intent: "intent".to_string(),
+        intent: label.to_string(),
         tone: None,
         target: None,
         risk,
         hidden_requirements: vec![],
-        preview: None,
+        preview: Some(format!("{label} 선택의 즉각적인 대가와 반응을 확인한다")),
     }
 }
 
@@ -157,7 +157,11 @@ fn valid_plan() -> DirectorPlan {
         reveal_fact_ids: vec!["f-rain".to_string()],
         must_not_reveal_fact_ids: vec![],
         proposed_patch: patch,
-        choices: vec![choice("next-0", "간다", RiskLevel::Safe)],
+        choices: vec![
+            choice("next-0", "솔직하게 묻는다", RiskLevel::High),
+            choice("next-1", "구체적인 단서를 확인한다", RiskLevel::Low),
+            choice("next-2", "다른 장소로 이동한다", RiskLevel::Medium),
+        ],
         conflict_checks: vec![],
         end_condition: "scene continues".to_string(),
     }
@@ -501,6 +505,50 @@ fn accept_director_plan_invalid_restores_checkpoint_and_skips_writer() {
 }
 
 #[test]
+fn retry_after_director_rejection_restarts_at_the_director() {
+    let (state, pack) = prime_then_enable_director();
+    let submitted = reduce(
+        &state,
+        EngineCommand::SubmitChoice {
+            choice_id: "choice-0".to_string(),
+        },
+        &pack,
+    )
+    .expect("submit");
+    let gid = submitted
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            EngineEffect::RequestDirector { generation_id, .. } => Some(*generation_id),
+            _ => None,
+        })
+        .expect("RequestDirector");
+    let rejected = reduce(
+        &submitted.state,
+        EngineCommand::AcceptDirectorPlan {
+            generation_id: gid,
+            plan: Box::new(bad_plan_unknown_character()),
+        },
+        &pack,
+    )
+    .expect("reject invalid plan");
+
+    let retried =
+        reduce(&rejected.state, EngineCommand::RegenerateCurrentTurn, &pack).expect("retry");
+    assert!(retried.effects.iter().any(|effect| matches!(
+        effect,
+        EngineEffect::RequestDirector { generation_id, .. } if *generation_id != gid
+    )));
+    assert!(
+        !retried
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, EngineEffect::RequestGeneration { .. })),
+        "a Director rejection must not silently switch to the single-pass path"
+    );
+}
+
+#[test]
 fn accept_writer_finish_commits_plan_patch_and_writer_narration() {
     let (state, pack) = prime_then_enable_director();
     let t = reduce(
@@ -573,7 +621,7 @@ fn accept_writer_finish_commits_plan_patch_and_writer_narration() {
     // History narration is the WRITER's text; choices are the DIRECTOR's.
     let entry = t.state.game.history.last().expect("history entry");
     assert_eq!(entry.narration, "나무가 조용히 고개를 끄덕인다.");
-    assert_eq!(entry.choices.len(), 1);
+    assert_eq!(entry.choices.len(), 3);
     assert_eq!(entry.choices[0].id, "next-0");
     assert_eq!(entry.applied_patch, plan.proposed_patch);
 }
@@ -647,6 +695,92 @@ fn accept_writer_finish_strips_embedded_patch_in_narration() {
         t.state.game.characters.get(&cid()).unwrap().affection,
         expected,
         "Director's +2 applied, Writer's smuggled +99 ignored"
+    );
+}
+
+#[test]
+fn writer_repetition_gets_one_narration_only_rewrite_before_commit() {
+    let (state, pack) = prime_then_enable_director();
+    let submitted = reduce(
+        &state,
+        EngineCommand::SubmitChoice {
+            choice_id: "choice-0".to_string(),
+        },
+        &pack,
+    )
+    .expect("submit");
+    let director_id = submitted.state.pending.as_ref().unwrap().generation_id;
+    let planned = reduce(
+        &submitted.state,
+        EngineCommand::AcceptDirectorPlan {
+            generation_id: director_id,
+            plan: Box::new(valid_plan()),
+        },
+        &pack,
+    )
+    .expect("plan");
+
+    // The primed opening narration is exactly "비가 그쳤다.".
+    let repairing = reduce(
+        &planned.state,
+        EngineCommand::AcceptWriterFinish {
+            finish: Box::new(WriterFinish {
+                generation_id: director_id,
+                full_text: "비가 그쳤다.".to_string(),
+                usage: None,
+            }),
+        },
+        &pack,
+    )
+    .expect("writer repair");
+    assert_eq!(repairing.state.game.turn, state.game.turn);
+    assert!(matches!(
+        repairing
+            .state
+            .pending
+            .as_ref()
+            .and_then(|pending| pending.narration_repair.as_ref()),
+        Some(NarrationRepair::Writer { .. })
+    ));
+    let (repair_id, request) = repairing
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            EngineEffect::RequestWriter {
+                generation_id,
+                request,
+            } => Some((*generation_id, request)),
+            _ => None,
+        })
+        .expect("one writer repair request");
+    assert_ne!(repair_id, director_id);
+    assert!(
+        request
+            .messages
+            .last()
+            .unwrap()
+            .content
+            .contains("Writer narration quality repair")
+    );
+
+    let completed = reduce(
+        &repairing.state,
+        EngineCommand::AcceptWriterFinish {
+            finish: Box::new(WriterFinish {
+                generation_id: repair_id,
+                full_text:
+                    "나무는 접어 둔 초대장을 테이블 위에 펴고, 오늘 전시회에 동행할지 묻는다."
+                        .to_string(),
+                usage: None,
+            }),
+        },
+        &pack,
+    )
+    .expect("accept writer repair");
+    assert_eq!(completed.state.game.turn, state.game.turn + 1);
+    assert_eq!(
+        completed.state.game.history.last().unwrap().narration,
+        "나무는 접어 둔 초대장을 테이블 위에 펴고, 오늘 전시회에 동행할지 묻는다."
     );
 }
 

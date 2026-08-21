@@ -116,7 +116,9 @@ fn valid_draft(generation_id: uuid::Uuid, affection_delta: i16) -> GeneratedTurn
     patch.affection_delta.insert(cid(), affection_delta);
     GeneratedTurnDraft {
         generation_id,
-        narration: format!("유나가 고개를 끄덕인다 (affection {affection_delta:+})."),
+        narration: format!(
+            "유나가 고개를 끄덕인다 (affection {affection_delta:+}, generation {generation_id})."
+        ),
         choices: vec![
             choice("choice-0", "다시 만난다", RiskLevel::Low),
             choice("choice-1", "돌아선다", RiskLevel::Medium),

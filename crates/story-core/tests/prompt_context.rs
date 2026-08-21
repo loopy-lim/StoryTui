@@ -412,7 +412,7 @@ fn earlier_turns_beyond_the_window_appear_as_a_recap() {
     // the recent window, the turns before it must come back as a compact recap
     // so the model keeps long-term continuity instead of repeating old beats.
     let (pack, state, _) = fixture(false);
-    // 6 turns with a window of 4 ⇒ turns 1–2 are recap, turns 3–6 are recent.
+    // 6 turns with a window of 2 ⇒ turns 1–4 are recap, turns 5–6 are recent.
     let recent = vec![
         recap_history_entry(1, "오래전 첫 만남의 장면이다."),
         recap_history_entry(2, "두 번째 장면, 비가 내렸다."),
@@ -430,10 +430,21 @@ fn earlier_turns_beyond_the_window_appear_as_a_recap() {
     // Older turns are summarized in the recap.
     assert!(bundle.user.contains("오래전 첫 만남"));
     assert!(bundle.user.contains("두 번째 장면"));
-    // The recent window is still rendered in full.
+    // Only the last two turns are rendered in full.
     assert!(bundle.user.contains("# Recent turns"));
     assert!(bundle.user.contains("여섯 번째 장면"));
-    // The recap must NOT reproduce the most recent turn (that lives in Recent).
+    let raw_recent_section = bundle
+        .user
+        .split("# Recent turns")
+        .nth(1)
+        .unwrap_or_default()
+        .split("# Recent arc")
+        .next()
+        .unwrap_or_default();
+    assert!(raw_recent_section.contains("다섯 번째 장면"));
+    assert!(raw_recent_section.contains("여섯 번째 장면"));
+    assert!(!raw_recent_section.contains("네 번째 장면"));
+    // The raw recent section must NOT reproduce the oldest turn.
     let recent_section = bundle
         .user
         .split("# Recent turns")
@@ -471,18 +482,28 @@ fn recent_arc_renders_from_stored_summaries() {
 #[test]
 fn repetition_note_fires_when_a_motif_is_shared() {
     let (pack, state, _) = fixture(false);
-    // No stored summaries ⇒ alignment false ⇒ digests derived from narration;
-    // every narration shares "커피".
-    let recent: Vec<HistoryEntry> = (1..=6)
-        .map(|t| recap_history_entry(t, &format!("유나가 커피를 {t}번 내렸다")))
-        .collect();
+    // The first sentences are unrelated. The repeated motifs only occur in
+    // later prose, which the former digest/first-clause scan could not see.
+    let recent = vec![
+        recap_history_entry(1, "문이 닫혔다. 유나는 시계를 보고 창밖으로 시선을 돌렸다."),
+        recap_history_entry(
+            2,
+            "재즈가 멎었다. 시계 초침 아래에서 창밖의 빛과 시선을 피했다.",
+        ),
+        recap_history_entry(
+            3,
+            "주문표가 놓였다. 손가락이 시계를 두드리고 시선은 창밖에 머문다.",
+        ),
+    ];
     let bundle = build_prompt(&pack, &state, &recent, None);
     assert!(
         bundle.user.contains("# 반복 감지"),
         "expected a repetition note: {}",
         bundle.user
     );
-    assert!(bundle.user.contains("커피"));
+    assert!(bundle.user.contains("시계"));
+    assert!(bundle.user.contains("창밖"));
+    assert!(bundle.user.contains("시선"));
 }
 
 #[test]

@@ -24,8 +24,9 @@ health_path = "/health"
 # from this environment variable and is never written to diagnostics/saves.
 # Authentication is optional. For an authenticated server, set either
 # api_key_env or api_key_file in a private override profile.
-# Low temperature keeps the model focused on the fixed JSON contract.
-temperature = 0.2
+# Moderate temperature reduces scene/motif collapse while the schema and
+# engine quality gate keep the JSON contract deterministic enough to recover.
+temperature = 0.5
 top_p = 0.92
 top_k = 40
 # Narration, choices, state_patch and summary share one completion. Reserve

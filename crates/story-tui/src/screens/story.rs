@@ -23,6 +23,8 @@ use unicode_width::UnicodeWidthStr;
 pub const MIN_WIDTH: u16 = 60;
 pub const MIN_HEIGHT: u16 = 16;
 
+const CHOICE_REFRESH_SHORTCUT: &str = "[R] 선택지 다시 만들기  ";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ListMode {
     History,
@@ -169,14 +171,14 @@ pub fn render_story(
             Constraint::Fill(3),
             Constraint::Length(choice_height),
             Constraint::Length(3),
-            Constraint::Length(2),
+            Constraint::Length(3),
         ])
         .split(body)
     } else {
         Layout::vertical([
             Constraint::Fill(3),
             Constraint::Length(choice_height),
-            Constraint::Length(2),
+            Constraint::Length(3),
         ])
         .split(body)
     };
@@ -273,14 +275,14 @@ pub fn choice_index_at(
             Constraint::Fill(3),
             Constraint::Length(choice_height),
             Constraint::Length(3),
-            Constraint::Length(2),
+            Constraint::Length(3),
         ])
         .split(body)
     } else {
         Layout::vertical([
             Constraint::Fill(3),
             Constraint::Length(choice_height),
-            Constraint::Length(2),
+            Constraint::Length(3),
         ])
         .split(body)
     };
@@ -289,7 +291,14 @@ pub fn choice_index_at(
     let mut cursor = content_start;
     let width = choice_area.width.saturating_sub(4).max(1) as usize;
     for (index, choice) in view.choices.iter().enumerate() {
-        let line_count = choice_lines(index, &choice.label, choice.risk, width).len() as u16;
+        let line_count = choice_lines(
+            index,
+            &choice.label,
+            choice.preview.as_deref(),
+            choice.risk,
+            width,
+        )
+        .len() as u16;
         if row >= cursor && row < cursor.saturating_add(line_count) {
             return Some(index);
         }
@@ -324,23 +333,22 @@ pub fn home_shortcut_at(
             Constraint::Fill(3),
             Constraint::Length(choice_height),
             Constraint::Length(3),
-            Constraint::Length(2),
+            Constraint::Length(3),
         ])
         .split(body)[3]
     } else {
         Layout::vertical([
             Constraint::Fill(3),
             Constraint::Length(choice_height),
-            Constraint::Length(2),
+            Constraint::Length(3),
         ])
         .split(body)[2]
     };
     let shortcut = "[Home] 홈";
     let start = area
         .x
-        .saturating_add(status_values_prefix(view).width() as u16)
-        .saturating_add(4);
-    row == status_area.y.saturating_add(1)
+        .saturating_add(CHOICE_REFRESH_SHORTCUT.width() as u16);
+    row == status_area.y.saturating_add(2)
         && column >= start
         && column < start.saturating_add(shortcut.width() as u16)
 }
@@ -569,6 +577,7 @@ fn choice_panel_height(view: &AppViewModel, width: u16) -> u16 {
                 choice_lines(
                     index,
                     &choice.label,
+                    choice.preview.as_deref(),
                     choice.risk,
                     width.saturating_sub(4).max(1) as usize,
                 )
@@ -671,9 +680,15 @@ fn render_choice_panel(
         let width = inner.width.saturating_sub(2).max(1) as usize;
         for (index, choice) in view.choices.iter().enumerate() {
             let highlight = index == selected.min(view.choices.len().saturating_sub(1));
-            for (line_index, mut line) in choice_lines(index, &choice.label, choice.risk, width)
-                .into_iter()
-                .enumerate()
+            for (line_index, mut line) in choice_lines(
+                index,
+                &choice.label,
+                choice.preview.as_deref(),
+                choice.risk,
+                width,
+            )
+            .into_iter()
+            .enumerate()
             {
                 line.spans.insert(
                     0,
@@ -719,10 +734,16 @@ fn render_status_panel(frame: &mut Frame, area: Rect, view: &AppViewModel) {
     let block = Block::default()
         .borders(Borders::TOP)
         .border_style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(Paragraph::new(status_line(view)).block(block), area);
+    frame.render_widget(Paragraph::new(status_lines(view)).block(block), area);
 }
 
-fn choice_lines(index: usize, label: &str, risk: RiskLevel, width: usize) -> Vec<Line<'static>> {
+fn choice_lines(
+    index: usize,
+    label: &str,
+    preview: Option<&str>,
+    risk: RiskLevel,
+    width: usize,
+) -> Vec<Line<'static>> {
     let marker = format!("{}. ", index + 1);
     let continuation = " ".repeat(marker.width());
     let mut lines = wrap_choice_label(label, &marker, &continuation, width);
@@ -742,6 +763,13 @@ fn choice_lines(index: usize, label: &str, risk: RiskLevel, width: usize) -> Vec
             Span::raw(continuation),
             Span::styled(risk_text, Style::default().fg(risk_color(risk))),
         ]));
+    }
+    if let Some(preview) = preview.map(str::trim).filter(|preview| !preview.is_empty()) {
+        let preview_lines = wrap_choice_label(preview, "   ↳ ", "     ", width);
+        lines.extend(preview_lines.into_iter().map(|mut line| {
+            line.style = Style::default().fg(Color::DarkGray);
+            line
+        }));
     }
     lines
 }
@@ -803,29 +831,29 @@ fn append_wrapped_word(
     }
 }
 
-fn status_line(view: &AppViewModel) -> Line<'static> {
-    let values = status_values_prefix(view);
-    let mut spans = vec![Span::raw(values)];
+fn status_lines(view: &AppViewModel) -> Vec<Line<'static>> {
+    let values = Line::from(status_values_prefix(view));
     if view.status.turn == 0 && view.choices.is_empty() && view.loading.is_none() {
-        spans.extend([
-            Span::raw("    "),
-            Span::styled(
+        vec![
+            values,
+            Line::from(Span::styled(
                 "[N] 게임 시작",
                 Style::default()
                     .fg(Color::LightCyan)
                     .add_modifier(Modifier::BOLD),
-            ),
-        ]);
+            )),
+        ]
     } else if view.loading.is_none() && view.error.is_none() {
-        spans.extend([
-            Span::raw("    "),
-            Span::styled(
-                "[Home] 홈  [O] 설정  [S] 저장  [L] 불러오기",
+        vec![
+            values,
+            Line::from(Span::styled(
+                format!("{CHOICE_REFRESH_SHORTCUT}[Home] 홈  [O] 설정  [S] 저장  [L] 불러오기"),
                 Style::default().fg(Color::DarkGray),
-            ),
-        ]);
+            )),
+        ]
+    } else {
+        vec![values]
     }
-    Line::from(spans)
 }
 
 fn status_values_prefix(view: &AppViewModel) -> String {
@@ -936,7 +964,8 @@ fn risk_color(r: RiskLevel) -> Color {
 
 #[cfg(test)]
 mod tests {
-    use super::{fmt_duration, speaker_dialogue_line};
+    use super::{choice_lines, fmt_duration, speaker_dialogue_line};
+    use story_model::RiskLevel;
 
     #[test]
     fn fmt_duration_renders_compact_korean_labels() {
@@ -946,6 +975,21 @@ mod tests {
         assert_eq!(fmt_duration(133), "2분 13초");
         assert_eq!(fmt_duration(3600), "1시간 0분");
         assert_eq!(fmt_duration(3900), "1시간 5분");
+    }
+
+    #[test]
+    fn choice_preview_is_a_visible_second_line() {
+        let lines = choice_lines(
+            0,
+            "시계가 멈춘 이유를 직접 묻는다",
+            Some("회피하던 시간의 의미를 시험한다"),
+            RiskLevel::Medium,
+            80,
+        );
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].to_string().contains("시계가 멈춘 이유"));
+        assert!(lines[1].to_string().contains("↳"));
+        assert!(lines[1].to_string().contains("시간의 의미를 시험한다"));
     }
 
     #[test]

@@ -44,6 +44,9 @@ pub fn map_key(key: KeyEvent, choice_count: usize, loading: bool, has_error: boo
         // is active: q=ㅂ, r=ㄱ, c=ㅊ, j=ㅓ, k=ㅏ, n=ㅜ.
         KeyCode::Char('q' | 'ㅂ') => KeyAction::Quit,
         KeyCode::Char('n' | 'ㅜ') => KeyAction::Command(EngineCommand::StartNewGame),
+        KeyCode::Char('r' | 'ㄱ') if !loading && choice_count > 0 => {
+            KeyAction::Command(EngineCommand::RegenerateChoices)
+        }
         KeyCode::Char('j' | 'ㅓ') | KeyCode::Down => KeyAction::MoveSelection(1),
         KeyCode::Char('k' | 'ㅏ') | KeyCode::Up => KeyAction::MoveSelection(-1),
         KeyCode::Enter => {
@@ -69,9 +72,6 @@ pub fn map_key(key: KeyEvent, choice_count: usize, loading: bool, has_error: boo
                 // loading state; nil here, resolved by the App.
                 generation_id: story_model::uuid::Uuid::nil(),
             })
-        }
-        KeyCode::Char('r' | 'ㄱ') if has_error => {
-            KeyAction::Command(EngineCommand::RegenerateCurrentTurn)
         }
         KeyCode::Esc => KeyAction::Command(EngineCommand::DismissError),
         _ => KeyAction::None,
@@ -188,10 +188,15 @@ mod tests {
     }
 
     #[test]
-    fn r_retries_only_when_error_is_visible() {
+    fn r_refreshes_choices_idle_and_retries_turn_when_error_is_visible() {
         assert_eq!(
             map_key(key(KeyCode::Char('r')), 3, false, false),
-            KeyAction::None
+            KeyAction::Command(EngineCommand::RegenerateChoices)
+        );
+        assert_eq!(
+            map_key(key(KeyCode::Char('r')), 3, true, false),
+            KeyAction::None,
+            "an in-flight generation cannot start a second choice refresh"
         );
         assert_eq!(
             map_key(key(KeyCode::Char('r')), 3, false, true),

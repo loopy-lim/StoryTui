@@ -29,10 +29,11 @@ use story_model::serde_json;
 use story_model::{Choice, GameState, HistoryEntry, MemoryEntry, ParsedAction, StoryPack};
 
 use crate::memory_selector::{SelectionContext, select};
+use crate::narration_quality::recurring_motifs;
 
 /// Keep the immediately-played context crisp. Longer-lived information comes
 /// back through the scored memory recall below instead of growing forever.
-const RECENT_TURN_WINDOW: usize = 4;
+const RECENT_TURN_WINDOW: usize = 2;
 /// A deliberately conservative slice of the provider context for recalled
 /// memories. The provider still applies its final context bound afterwards.
 const MEMORY_RECALL_BUDGET_TOKENS: u32 = 6_000;
@@ -295,8 +296,12 @@ fn build_user(
         s.push_str(&memory_context(&recall.included));
     }
 
-    s.push_str("\n# Choice roles for this turn\n");
-    s.push_str(&choice_role_brief(state));
+    s.push_str("\n# Engine-owned choice design\n");
+    s.push_str(&crate::choice_quality::design_prompt(
+        state,
+        pack,
+        player_choice,
+    ));
 
     if let Some(choice) = player_choice {
         s.push_str("\n# Player selected choice\n");
@@ -512,55 +517,6 @@ fn world_initiative(pack: &StoryPack, state: &GameState) -> String {
     text
 }
 
-fn choice_role_brief(state: &GameState) -> String {
-    const ROLES: [[&str; 3]; 3] = [
-        [
-            "relationship move: directly ask, set a boundary, or offer something that changes interpersonal distance",
-            "evidence move: observe, verify, or investigate a concrete clue without forcing a confession",
-            "situation move: change the immediate situation through movement, delay, risk, or a third factor",
-        ],
-        [
-            "evidence move: observe, verify, or investigate a concrete clue without forcing a confession",
-            "situation move: change the immediate situation through movement, delay, risk, or a third factor",
-            "relationship move: directly ask, set a boundary, or offer something that changes interpersonal distance",
-        ],
-        [
-            "situation move: change the immediate situation through movement, delay, risk, or a third factor",
-            "relationship move: directly ask, set a boundary, or offer something that changes interpersonal distance",
-            "evidence move: observe, verify, or investigate a concrete clue without forcing a confession",
-        ],
-    ];
-    let mut roles = ROLES[(state.turn % ROLES.len() as u32) as usize].to_vec();
-    let recent = crate::narrative::recent_choice_roles(state);
-    // This is a preference, never a validation gate: a story can legitimately
-    // revisit a relationship move when the state demands it.
-    if let Some(last_role) = recent.last() {
-        roles.sort_by_key(|role| {
-            if role.starts_with(last_role.as_str()) {
-                1
-            } else {
-                0
-            }
-        });
-    }
-    format!(
-        "Return exactly three choices in this order:\n1. {}\n2. {}\n3. {}\nThe three choices must cause different next-scene goals or consequences, not merely different wording. Treat recent chosen directions ({}) as a soft anti-repeat signal; avoid re-offering the player's last selected label: {}\n",
-        roles[0],
-        roles[1],
-        roles[2],
-        if recent.is_empty() {
-            "none".to_string()
-        } else {
-            recent.join(", ")
-        },
-        state
-            .last_choice
-            .as_ref()
-            .map(|choice| choice.label.as_str())
-            .unwrap_or("(none)"),
-    )
-}
-
 fn memory_context(memories: &[MemoryEntry]) -> String {
     let mut text = String::new();
     for memory in memories {
@@ -642,9 +598,9 @@ fn truncate_prose(text: &str, max_chars: usize) -> String {
 const RECENT_ARC_RENDER_TURNS: usize = 4;
 
 /// Render `# Recent arc` (last [`RECENT_ARC_RENDER_TURNS`] digests) and, only
-/// when a motif is shared across ≥2 of the last [`REPETITION_DETECT_TURNS`]
-/// digests, a `# 반복 감지` note. Returns an empty string when there is no
-/// history (keeps byte-identical prompts for the very first turn).
+/// when a motif is shared across at least two recent full narrations, a
+/// `# 반복 감지` note. Returns an empty string when there is no history (keeps
+/// byte-identical prompts for the very first turn).
 fn recent_arc_block(state: &GameState, full: &[HistoryEntry]) -> String {
     if full.is_empty() {
         return String::new();
@@ -673,11 +629,11 @@ fn recent_arc_block(state: &GameState, full: &[HistoryEntry]) -> String {
         s.push('\n');
     }
 
-    // Repetition check over a wider window than the rendered arc.
-    let detect_start = full.len().saturating_sub(REPETITION_DETECT_TURNS);
-    let digests: Vec<String> = (detect_start..full.len()).map(digest_for).collect();
-    let refs: Vec<&str> = digests.iter().map(String::as_str).collect();
-    let motifs = shared_motifs(&refs);
+    // Repetition check over complete recent narrations, not only the stored
+    // digest or first sentence. Weak local models often move recurring props
+    // (clock/window/gaze) into later paragraphs where a digest scan misses
+    // them.
+    let motifs = recurring_motifs(full);
     if !motifs.is_empty() {
         s.push_str(&format!(
             "\n# 반복 감지\n\
@@ -706,66 +662,6 @@ pub fn first_clause(text: &str, max_chars: usize) -> String {
     }
     let head: String = clause.chars().take(max_chars).collect();
     format!("{head}…")
-}
-
-/// Number of recent digests scanned for repetition. Wider than the rendered arc
-/// so a motif that started just outside the prose window is still caught.
-const REPETITION_DETECT_TURNS: usize = 6;
-const REPETITION_MAX_KEYWORDS: usize = 5;
-/// Korean glue words / verb endings to ignore. Korean morphology is not
-/// analyzed; this small list plus the "shared across ≥2 turns" bar keeps noise
-/// low — the model still has the arc digests themselves to judge from.
-const REPETITION_STOPWORDS: &[&str] = &[
-    "했다", "있다", "없다", "한다", "하는", "하고", "위해", "그", "이", "저", "등", "및", "수",
-    "것", "때", "임", "됨",
-];
-/// Trailing particles stripped so inflected forms cluster (유나가/유나는 → 유나).
-/// Tried in order; the first match wins (`strip_suffix` is applied once).
-const REPETITION_PARTICLES: &[&str] = &[
-    "들은", "이가", "는", "가", "은", "이", "을", "를", "에", "의", "도", "와", "과", "로",
-];
-
-/// Normalize one whitespace token into a comparable content token, or `None`
-/// when it is a stopword or non-alphanumeric. A length floor applies only to
-/// ASCII tokens: a single Hangul syllable (비, 눈, 밤) is a legitimate motif.
-fn normalize_token(word: &str) -> Option<String> {
-    let trimmed = word.trim_matches(|c: char| !c.is_alphanumeric());
-    let mut w = trimmed.to_string();
-    for particle in REPETITION_PARTICLES {
-        if let Some(stripped) = w.strip_suffix(particle) {
-            w = stripped.to_string();
-            break;
-        }
-    }
-    let w = w.trim_matches(|c: char| !c.is_alphanumeric()).to_string();
-    if (w.is_ascii() && w.chars().count() < 2) || REPETITION_STOPWORDS.contains(&w.as_str()) {
-        return None;
-    }
-    Some(w.to_lowercase())
-}
-
-/// Return content tokens that appear in at least 2 of `digests` (document
-/// frequency, not raw count), sorted and capped. Empty when nothing repeats.
-fn shared_motifs(digests: &[&str]) -> Vec<String> {
-    use std::collections::{BTreeMap, BTreeSet};
-    let mut document_frequency: BTreeMap<String, usize> = BTreeMap::new();
-    for digest in digests {
-        let seen: BTreeSet<String> = digest
-            .split_whitespace()
-            .filter_map(normalize_token)
-            .collect();
-        for token in seen {
-            *document_frequency.entry(token).or_default() += 1;
-        }
-    }
-    let mut out: Vec<String> = document_frequency
-        .into_iter()
-        .filter(|(_, count)| *count >= 2)
-        .map(|(token, _)| token)
-        .collect();
-    out.sort_unstable();
-    out.truncate(REPETITION_MAX_KEYWORDS);
-    out
 }
 
 /// Build a deterministic compact-JSON snapshot of the current state. Iteration
@@ -997,34 +893,15 @@ mod tests {
         assert!(bundle.user.contains("반송된 편지의 이유"));
         assert!(bundle.user.contains("오래된 재즈를 좋아한다"));
         assert!(bundle.user.contains("# Current dramatic beat"));
-        assert!(bundle.user.contains("# Choice roles for this turn"));
-        assert!(bundle.user.contains("relationship move"));
-        assert!(bundle.user.contains("evidence move"));
-        assert!(bundle.user.contains("situation move"));
+        assert!(bundle.user.contains("# Engine-owned choice design"));
+        assert!(bundle.user.contains("role=relationship"));
+        assert!(bundle.user.contains("cost="));
+        assert!(bundle.user.contains("immediate_consequence="));
+        assert!(bundle.user.contains("role=relationship"));
+        assert!(bundle.user.contains("role=evidence"));
+        assert!(bundle.user.contains("role=situation"));
+        assert!(bundle.user.contains("cost="));
+        assert!(bundle.user.contains("immediate_consequence="));
         assert!(bundle.user.contains("편지를 직접 묻는다"));
-    }
-
-    #[test]
-    fn normalize_token_strips_particle_and_filters() {
-        assert_eq!(normalize_token("유나가"), Some("유나".to_string()));
-        assert_eq!(normalize_token("커피를"), Some("커피".to_string()));
-        assert_eq!(normalize_token("비가"), Some("비".to_string()));
-        assert_eq!(normalize_token("했다"), None); // stopword
-        assert_eq!(normalize_token("…"), None); // non-alphanumeric
-        assert_eq!(normalize_token("a"), None); // too short
-    }
-
-    #[test]
-    fn shared_motifs_returns_tokens_in_two_or_more_digests() {
-        let digests = ["유나가 커피를 내렸다", "커피가 식었다", "비가 창을 때렸다"];
-        let m = shared_motifs(&digests);
-        assert!(m.contains(&"커피".to_string()), "{m:?}");
-        assert!(!m.contains(&"유나".to_string())); // only in 1 digest
-    }
-
-    #[test]
-    fn shared_motifs_empty_when_nothing_repeats() {
-        let digests = ["유나가 웃었다", "편지가 발견됐다", "문이 닫혔다"];
-        assert!(shared_motifs(&digests).is_empty());
     }
 }

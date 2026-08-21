@@ -52,7 +52,7 @@ pub const LINT_EMBEDDED_PATCH: &str = "embedded_patch_attempt";
 ///
 /// Always returns `Ok` — the lint pass never rejects a turn (the Writer's
 /// misbehavior is stripped, not punished). The [`CoreError`] return type is
-/// retained for forward compatibility (e.g. an safe allow-list of
+/// retained for forward compatibility (e.g. an explicit allow-list of
 /// forbidden substrings that would hard-reject).
 pub fn finalize_writer_output(
     text: String,

@@ -23,9 +23,6 @@ async fn mlx_smoke_health_models_korean_chat() {
             return;
         }
     };
-    let model =
-        std::env::var("STORYTUI_MLX_MODEL").unwrap_or_else(|_| "mlx-community/default".to_string());
-
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
         .build()
@@ -56,6 +53,23 @@ async fn mlx_smoke_health_models_korean_chat() {
     );
     let models_json: serde_json::Value = models.json().await.expect("models body is JSON");
     assert!(models_json.is_object(), "models response is not an object");
+    let advertised_models = models_json
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .expect("models response has no data array")
+        .iter()
+        .filter_map(|entry| entry.get("id").and_then(serde_json::Value::as_str))
+        .collect::<Vec<_>>();
+    assert!(
+        !advertised_models.is_empty(),
+        "models response advertised no usable model ids"
+    );
+    let model =
+        std::env::var("STORYTUI_MLX_MODEL").unwrap_or_else(|_| advertised_models[0].to_string());
+    assert!(
+        advertised_models.contains(&model.as_str()),
+        "requested model {model} is not advertised by /v1/models: {advertised_models:?}"
+    );
 
     // One Korean chat completion — assert a valid envelope with choices.
     let body = serde_json::json!({

@@ -2,7 +2,7 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Give the model a compact semantic digest of the recent arc plus an safe repetition flag (with motifs), so weaker local models stop regressing/repeating earlier beats — without any extra LLM call.
+**Goal:** Give the model a compact semantic digest of the recent arc plus an explicit repetition flag (with motifs), so weaker local models stop regressing/repeating earlier beats — without any extra LLM call.
 
 **Architecture:** Store one digest line per accepted turn into the already-persisted (but unused) `GameState.recent_summaries` (model `interpretation` when present, else the narration's first clause). Render the last 4 as `# Recent arc` and run a deterministic token-overlap repetition check over the last 6, emitting `# 반복 감지` only when a motif is shared across ≥2 turns. This replaces the surface-level `# Anti-repeat` block added earlier.
 

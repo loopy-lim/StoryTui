@@ -215,7 +215,7 @@ model = "mlx-community/x"
             provider: ProviderConfig,
         }
         let cfg: Cfg = toml::from_str(toml_str).expect("parse");
-        // safe fields honored.
+        // Explicit fields honored.
         assert_eq!(cfg.provider.base_url, "http://127.0.0.1:9090");
         assert_eq!(cfg.provider.model, "mlx-community/x");
         // Defaults fill the gaps.

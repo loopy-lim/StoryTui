@@ -1432,7 +1432,7 @@ mod tests {
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 8,
-            row: 18,
+            row: 17,
             modifiers: KeyModifiers::NONE,
         });
 

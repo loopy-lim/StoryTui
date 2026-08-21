@@ -19,7 +19,7 @@ established in the prior debugging pass:
 
 So beyond the 4-turn prose window the model has only state numbers, and it
 regresses. (A bounded `# Earlier story` recap was already added for turns before
-the window; this design adds the semantic "current arc" + an safe repetition
+the window; this design adds the semantic "current arc" + an explicit repetition
 signal for the recent window.)
 
 ## Goal
@@ -27,7 +27,7 @@ signal for the recent window.)
 Give the model, each turn:
 
 1. A compact **semantic digest of the recent arc** (mood + story), and
-2. An safe **repetition flag** (with the recurring motifs) so it steers to a
+2. An explicit **repetition flag** (with the recurring motifs) so it steers to a
    new beat.
 
 …without any extra LLM call.

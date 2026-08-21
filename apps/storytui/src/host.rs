@@ -553,10 +553,14 @@ async fn dispatch(
                 generation_id,
                 mut request,
             } => {
-                let token = cancellation
-                    .as_ref()
-                    .map(|(_, token)| token.clone())
-                    .unwrap_or_default();
+                // A narration-quality repair receives a fresh generation id.
+                // Replace the completed Director/Writer token so Cancel maps
+                // to the repair request rather than the prior attempt.
+                if let Some((_, token)) = cancellation.take() {
+                    token.cancel();
+                }
+                let token = CancellationToken::new();
+                *cancellation = Some((generation_id, token.clone()));
                 let tx = tx.clone();
                 let provider = Arc::clone(provider);
                 if let Some(ref m) = config.writer_model {

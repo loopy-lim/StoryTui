@@ -9,7 +9,7 @@
 //!
 //! # Event -> MemoryKind mapping (convention)
 //!
-//! `EventDef` does not yet carry an safe `memory_kind` hint, so the kind is
+//! `EventDef` does not yet carry an explicit `memory_kind` hint, so the kind is
 //! derived deterministically from the event id (case-insensitive substring):
 //!
 //! | id contains             | MemoryKind        | starts `unresolved` |

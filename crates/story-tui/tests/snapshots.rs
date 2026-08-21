@@ -34,19 +34,19 @@ fn base_view() -> AppViewModel {
                 id: "choice-0".to_string(),
                 label: "먼저 사과한다".to_string(),
                 risk: RiskLevel::Low,
-                preview: None,
+                preview: Some("사과를 받아들이는지 관계의 거리를 시험한다".to_string()),
             },
             ChoiceView {
                 id: "choice-1".to_string(),
                 label: "아무 말 없이 앉는다".to_string(),
                 risk: RiskLevel::Medium,
-                preview: None,
+                preview: Some("침묵을 견디는 동안 유나가 먼저 본론을 꺼내는지 본다".to_string()),
             },
             ChoiceView {
                 id: "choice-2".to_string(),
                 label: "빗소리를 핑계로 시선을 피한다".to_string(),
                 risk: RiskLevel::Safe,
-                preview: None,
+                preview: Some("긴장을 낮추지만 중요한 질문을 미룰 수 있다".to_string()),
             },
         ],
         status: StatusLine {

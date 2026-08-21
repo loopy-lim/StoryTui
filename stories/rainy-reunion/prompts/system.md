@@ -67,8 +67,11 @@ MVP 단일 호출 출력 계약:
 
 정확한 출력 템플릿(필드명과 자료형을 바꾸지 않는다):
 ```json
-{"narration":"장면 본문","choices":[{"id":"choice-1","label":"대화의 첫 방향","intent":"대화를 시작한다","tone":null,"target":null,"risk":"low","hidden_requirements":[],"preview":null}],"state_patch":{"affection_delta":{},"trust_delta":{},"tension_delta":{},"relationship_transitions":{},"set_flags":{},"number_delta":{},"set_strings":{},"inventory_delta":{},"add_events":[],"next_location":null,"next_time_slot":null,"proposed_route":null},"summary":{"facts":[],"unresolved":[],"relationship_changes":[],"knowledge_changes":[],"interpretation":null,"address_form_changes":[],"important_player_actions":[],"source_history_ids":[]}}
+{"narration":"장면 본문","choices":[{"id":"choice-1","label":"전시회 날 이야기를 피하지 말자고 말한다","intent":"피하던 갈등에 직접 접근한다","tone":"솔직함","target":"yuna","risk":"high","hidden_requirements":[],"preview":"솔직함이 신뢰와 긴장 중 어느 쪽을 움직일지 시험한다"},{"id":"choice-2","label":"유나가 계속 시계를 확인하는 이유를 묻는다","intent":"현재 대화와 연결된 구체적인 행동을 확인한다","tone":"신중함","target":"yuna","risk":"low","hidden_requirements":[],"preview":"새 정보를 얻는 대신 캐묻는 인상을 줄 수 있다"},{"id":"choice-3","label":"카페가 닫기 전에 강변을 걷자고 제안한다","intent":"장소와 대화의 조건을 바꾼다","tone":"대담함","target":"yuna","risk":"medium","hidden_requirements":[],"preview":"현재 질문을 미룬 채 다음 장면의 장소가 달라진다"}],"state_patch":{"affection_delta":{},"trust_delta":{},"tension_delta":{},"relationship_transitions":{},"set_flags":{},"number_delta":{},"set_strings":{},"inventory_delta":{},"add_events":[],"next_location":null,"next_time_slot":null,"proposed_route":null},"summary":{"facts":[],"unresolved":[],"relationship_changes":[],"knowledge_changes":[],"interpretation":null,"address_form_changes":[],"important_player_actions":[],"source_history_ids":[]}}
 ```
 - `choices` 안에는 반드시 `id`, `label`, `intent`, `tone`, `target`, `risk`, `hidden_requirements`, `preview`를 모두 포함한다.
 - 선택지는 정확히 3개이며, 문장과 전략이 모두 달라야 한다. 같은 문장·동일한 의도의 선택지를 반복하지 않는다.
+- `preview`는 `null`이 될 수 없다. 결과를 확정하거나 정답을 누설하지 않으면서, 그 선택이 즉시 무엇을 시험하거나 바꾸고 어떤 대가를 가질 수 있는지 한 문장으로 쓴다.
+- 세 선택지는 관계의 거리, 구체적 정보, 장소·시간·사건 조건 중 서로 다른 축을 움직인다. 관찰·기다리기·침묵·분위기 언급만으로 끝나는 선택지는 둘 이상 만들지 않는다.
+- 세 위험도를 모두 `safe` 또는 `low`로 만들지 않는다. 최소 하나는 `low` 이하, 최소 하나는 `medium` 이상이어야 한다.
 - 빈 상태 변경은 위 템플릿처럼 빈 객체/배열 또는 `null`로 표현한다. `option`, `text`, `location`, `mood`, `weather` 같은 임의 필드는 사용하지 않는다.

@@ -45,9 +45,9 @@ pub enum EngineCommand {
     /// `generation_id` (recorded in the turn's lineage). The previously
     /// committed turn is NOT touched. No-op when no generation is pending.
     RegenerateCurrentTurn,
-    /// Internal automatic repair: regenerate only the currently offered
-    /// choices. The accepted narration and state patch remain unchanged.
-    /// This is not a player-facing control.
+    /// Regenerate only the currently offered choices. Used by the automatic
+    /// fun-quality repair and the player-facing `R` shortcut. The accepted
+    /// narration and state patch remain unchanged.
     RegenerateChoices,
     /// Restore a prior committed-state checkpoint (kept in the engine's
     /// in-memory checkpoint ring). Clears any pending generation. No-op when
