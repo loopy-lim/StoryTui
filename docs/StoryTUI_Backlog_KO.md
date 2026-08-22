@@ -167,17 +167,17 @@
   - 장소 adjacency 없는 이동을 검출한다.
 - 테스트: invalid reference matrix, unreachable fixture.
 
-### ST-014 모든 인물 Story Pack 메타데이터 검증
+### ST-014 Story Pack 지원 등급 검증
 
 - Feature: Content metadata
-- Task: teen rating의 주요 인물 나이와 모든 인물 선언을 검증한다.
+- Task: Pack 등급이 `general` 또는 `teen`인지 검증한다.
 - 우선순위: P1
 - 선행 작업: ST-011
 - Acceptance criteria:
-  - teen Pack의 모든 주요 인물은 18세 이상 정수 나이를 가진다.
-  - `all_major_characters_safe = true`가 없으면 로드를 거부한다.
-  - 기술 지원과 모델 정책 보장을 구분하는 안내가 있다.
-- 테스트: 모든 인물 정상, 나이 누락, 17세, 선언 누락.
+  - 지원 등급 두 종류는 정상 로드한다.
+  - 그 밖의 등급은 시작 전에 명확한 오류로 거부한다.
+  - 예제 Pack과 기본 프롬프트는 전체 이용가 표현 범위를 지킨다.
+- 테스트: `general`, `teen`, 지원하지 않는 등급.
 
 ### ST-015 예제 `rainy-reunion` Pack
 
@@ -466,4 +466,3 @@
 - 새 public schema 또는 타입은 version·migration 영향을 검토한다.
 - 실제 runtime이 필요한 티켓은 Mock 결과만으로 완료하지 않는다.
 - 문서·fixture·테스트 이름이 티켓 ID를 추적할 수 있다.
-

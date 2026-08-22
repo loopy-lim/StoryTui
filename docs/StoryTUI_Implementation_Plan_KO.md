@@ -205,7 +205,7 @@ LLM 없이도 게임 상태와 규칙 전이를 완전히 테스트할 수 있�
 
 - TOML/Markdown 로더
 - schema version과 semver 호환
-- 참조 무결성·경로 탈출·모든 인물 Pack 메타데이터 검증
+- 참조 무결성·경로 탈출·지원 등급 검증
 - 1캐릭터·3장소·5플래그 예제 Pack
 
 ### 제외 범위
@@ -220,7 +220,7 @@ LLM 없이도 게임 상태와 규칙 전이를 완전히 테스트할 수 있�
 3. character·location·flag·event·route ID registry를 만든다.
 4. 조건식 참조와 도달 가능성을 검사한다.
 5. Markdown prompt fragment의 필수 placeholder를 검사한다.
-6. 모든 인물 등급일 때 주요 인물 나이·모든 인물 선언을 검증한다.
+6. Pack 등급이 `general` 또는 `teen`인지 검증한다.
 7. 좋은 fixture와 오류별 작은 fixture를 작성한다.
 
 ### 산출물
@@ -235,7 +235,7 @@ LLM 없이도 게임 상태와 규칙 전이를 완전히 테스트할 수 있�
 - 누락 파일, TOML 문법, 중복 ID, 없는 참조
 - Pack root 밖 `../` 참조
 - unsupported major, same-major minor default
-- 미성년 또는 나이 누락 teen Pack 거부
+- 지원하지 않는 Pack 등급 거부
 - snapshot으로 진단 메시지 고정
 
 ### 완료 조건
@@ -700,7 +700,7 @@ Director와 Writer가 사용할 compact context가 명세대로 안정적으로 
 5. example Pack을 `pack validate`와 100턴 test에 사용한다.
 6. 실제 100턴 세션에서 server interruption과 app restart를 삽입한다.
 7. `story-core` public API에서 UI·provider leak를 검사한다.
-8. 알려진 제한·모델 license·모든 인물 Pack 원칙을 문서화한다.
+8. 알려진 제한·모델 license·안전한 Pack 원칙을 문서화한다.
 
 ### 산출물
 
@@ -746,4 +746,3 @@ v1.0 태그 이후 별도 roadmap에서 웹 렌더러, 벡터 검색, 이미지�
 - 다음 단계 진입 여부와 근거
 
 빌드 성공은 runtime proof를 대체하지 않는다. 실제 모델을 실행하지 못한 단계는 그 사실을 명시하고 해당 게이트를 열지 않는다.
-

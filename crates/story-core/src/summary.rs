@@ -3,15 +3,15 @@
 //! [`validate_summary`] enforces the "summaries may not invent facts" rule
 //! (Technical Spec §12.3). A [`TurnSummary`] is a compact recall index over the
 //! raw [`HistoryEntry`]s; it is accepted only if every assertion it makes can
-//! trace to a real source entry. This keeps summaries honest: the engine
-//! rejects (does not commit) any summary that invents facts, drops a required
-//! field, or attributes content to a history id that does not exist.
+//! trace to a real source entry. The engine discards an invalid derived
+//! summary and falls back to narration-derived context without discarding the
+//! otherwise valid committed turn.
 //!
 //! # Rules
 //!
-//! Let `asserts_content = !(facts.is_empty() && relationship_changes.is_empty()
-//! && knowledge_changes.is_empty() && address_form_changes.is_empty() &&
-//! important_player_actions.is_empty() && interpretation.is_some())`.
+//! Let `asserts_content` mean that any semantic field (`facts`, `unresolved`,
+//! relationship/knowledge/address-form changes, important player actions, or
+//! `interpretation`) is populated.
 //!
 //! 1. If `asserts_content` and `summary.source_history_ids` is empty → reject
 //!    ([`SUMMARY_MISSING_SOURCE_HISTORY_IDS`]). The summary must anchor itself
@@ -38,6 +38,7 @@ use crate::error::{CoreError, SUMMARY_MISSING_SOURCE_HISTORY_IDS, SUMMARY_UNSOUR
 /// with a stable reason code when it invents facts or omits a required field.
 pub fn validate_summary(summary: &TurnSummary, sources: &[&HistoryEntry]) -> Result<(), CoreError> {
     let asserts_content = !summary.facts.is_empty()
+        || !summary.unresolved.is_empty()
         || !summary.relationship_changes.is_empty()
         || !summary.knowledge_changes.is_empty()
         || !summary.address_form_changes.is_empty()
@@ -133,6 +134,14 @@ mod tests {
         let mut s = bare_summary();
         s.facts = vec!["x".to_string()];
         let err = validate_summary(&s, &[]).expect_err("missing anchor");
+        assert_eq!(err.reason_code(), Some(SUMMARY_MISSING_SOURCE_HISTORY_IDS));
+    }
+
+    #[test]
+    fn unresolved_content_without_anchor_rejected() {
+        let mut s = bare_summary();
+        s.unresolved = vec!["아직 확인되지 않은 약속".to_string()];
+        let err = validate_summary(&s, &[]).expect_err("unresolved needs an anchor");
         assert_eq!(err.reason_code(), Some(SUMMARY_MISSING_SOURCE_HISTORY_IDS));
     }
 

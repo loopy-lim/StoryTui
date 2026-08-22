@@ -16,10 +16,16 @@ pub fn refresh_view(
     provider_config: &ProviderConfig,
     health: ProviderHealth,
     director_model: Option<String>,
+    choice_model: Option<String>,
     writer_model: Option<String>,
 ) {
     app.set_settings(
-        provider_config_safe_with_models(provider_config, director_model, writer_model),
+        provider_config_safe_with_models(
+            provider_config,
+            director_model,
+            choice_model,
+            writer_model,
+        ),
         health,
         provider_config.temperature,
         provider_config.top_p,
@@ -98,6 +104,7 @@ pub async fn apply_model(
         provider_config,
         health,
         user_settings.director_model.clone(),
+        user_settings.choice_model.clone(),
         user_settings.writer_model.clone(),
     );
     Ok(())
@@ -124,6 +131,34 @@ pub async fn apply_director_model(
         provider_config,
         health,
         user_settings.director_model.clone(),
+        user_settings.choice_model.clone(),
+        user_settings.writer_model.clone(),
+    );
+    Ok(())
+}
+
+/// Persist and activate the lightweight choice-rewrite model.
+pub async fn apply_choice_model(
+    app: &mut App,
+    model: String,
+    config: &mut RuntimeConfig,
+    provider_config: &ProviderConfig,
+    provider: &OpenAiCompatibleProvider,
+    user_settings: &mut UserSettings,
+) -> Result<(), String> {
+    config.choice_model = Some(model.clone());
+    user_settings.choice_model = Some(model);
+    save_user_settings(&config.save_dir, user_settings)?;
+    let health = provider
+        .health()
+        .await
+        .unwrap_or(ProviderHealth::Unavailable);
+    refresh_view(
+        app,
+        provider_config,
+        health,
+        user_settings.director_model.clone(),
+        user_settings.choice_model.clone(),
         user_settings.writer_model.clone(),
     );
     Ok(())
@@ -150,6 +185,7 @@ pub async fn apply_writer_model(
         provider_config,
         health,
         user_settings.director_model.clone(),
+        user_settings.choice_model.clone(),
         user_settings.writer_model.clone(),
     );
     Ok(())

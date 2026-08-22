@@ -139,7 +139,20 @@ pub fn recent_choice_roles(game: &GameState) -> Vec<String> {
 pub fn classify_choice(choice: &Choice) -> &'static str {
     let text = format!("{} {}", choice.intent, choice.label).to_lowercase();
     if [
-        "ask", "trust", "boundary", "offer", "사과", "묻", "약속", "거절", "마음",
+        "ask",
+        "trust",
+        "boundary",
+        "offer",
+        "사과",
+        "묻",
+        "약속",
+        "거절",
+        "마음",
+        "솔직",
+        "진심",
+        "답한다",
+        "고백",
+        "경계",
     ]
     .iter()
     .any(|needle| text.contains(needle))
@@ -152,7 +165,16 @@ pub fn classify_choice(choice: &Choice) -> &'static str {
         "clue",
         "확인",
         "조사",
-        "찾",
+        "찾는다",
+        "찾아본",
+        "찾아낸",
+        "읽",
+        "대조",
+        "꺼내",
+        "보여",
+        "편지",
+        "메시지",
+        "사진",
         "증거",
         "관찰",
     ]

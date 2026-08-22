@@ -2,7 +2,7 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Load a Story Pack (TOML + Markdown) into a canonical `StoryPack`, validating everything before play starts — file/encoding/path safety, schema-version compatibility, referential integrity, reachability, and teen metadata. Produce the `rainy-reunion` example Pack with zero validator errors/warnings. ST-011, ST-012, ST-013, ST-014, ST-015.
+**Goal:** Load a Story Pack (TOML + Markdown) into a canonical `StoryPack`, validating everything before play starts — file/encoding/path safety, schema-version compatibility, referential integrity, reachability, and supported audience rating. Produce the `rainy-reunion` example Pack with zero validator errors/warnings. ST-011, ST-012, ST-013, ST-014, ST-015.
 
 **Architecture:** Canonical `StoryPack` + `CharacterDef` + Pack DTOs live in `story-model` (pure data). The loader + file/parse/validation orchestration lives in `story-persistence` (depends on story-model, story-core, toml, semver, sha2, tempfile, thiserror). Semantic referential-integrity & reachability checks reuse `story-core` where possible. **The loader executes NO arbitrary code** (ADR-007) and collects ALL errors before reporting (Korean, with file/field/position).
 
@@ -24,14 +24,13 @@ pub struct PackMetadata {
     pub language: String,                    // "ko-KR"
     pub genres: Vec<String>,
     pub rating: PackRating,
-    pub all_major_characters_safe: bool,
     pub default_choice_count: u8,
     pub initial_state: PackInitialState,
     pub content: PackContentPolicy,
 }
-#[serde(rename_all="snake_case")] pub enum PackRating { General, Teen, teen }
+#[serde(rename_all="snake_case")] pub enum PackRating { General, Teen }
 pub struct PackInitialState { pub chapter: String, pub scene: String, pub location: LocationId, pub time_slot: TimeSlot }
-#[serde(rename_all="snake_case")] pub struct PackContentPolicy { pub safe_content: String, pub violence: String }
+#[serde(rename_all="snake_case")] pub struct PackContentPolicy { pub violence: String }
 
 pub struct CharacterDef {
     pub id: CharacterId, pub name: String, pub age: Option<u32>,
@@ -70,13 +69,13 @@ pack/
   mod.rs
   dto.rs          — raw TOML structs: StoryToml, CharactersToml ([[characters]]), RulesToml, EventsToml ([[events]])
   loader.rs       — PackLoader::load(root: &Path) -> Result<StoryPack, PackError>
-  validate.rs     — referential integrity, reachability, teen metadata (collects all errors)
+  validate.rs     — referential integrity and reachability (collects all errors)
   migrate.rs      — same-major in-memory default fill; reject unsupported major
 error.rs          — PackError (Korean messages, file/field/position)
 ```
 
 ### DTOs (dto.rs) — mirror the TOML field names from Technical Spec §6.2/§6.3
-- `StoryToml`: `schema_version: String, story_id, story_version, min_engine_version, title, language, genres, rating, all_major_characters_safe, default_choice_count, [initial_state] {chapter,scene,location,time_slot}, [content] {safe_content, violence}`.
+- `StoryToml`: `schema_version: String, story_id, story_version, min_engine_version, title, language, genres, rating, default_choice_count, [initial_state] {chapter,scene,location,time_slot}, [content] {violence}`.
 - `CharactersToml`: `schema_version: String, [[characters]] { id, name, age, pronouns, personality, appearance, values, likes, dislikes, secrets, initial_player_relationship, speech_style, honorific_rule, frequent_phrases, avoid_phrases, known_facts, unknown_facts, current_goal, long_term_desire }`.
 - `RulesToml`: locations, allowed flags/numbers/strings/items, delta/stat limits, relationship rules. Map to the W3 `StoryRules` fields.
 - `EventsToml`: `[[events]] { id, trigger(toml-encoded ConditionExpr), priority, effects{...}, allow_relationship_skip, route_lock }`.
@@ -91,15 +90,15 @@ Order (each failure collected, all reported):
 4. **Schema major compat:** compare `schema_version` major vs `PACK_SCHEMA_VERSION`. Same major → continue (minor diffs migrated in-memory). Unsupported major ⇒ `PackError::UnsupportedSchemaVersion`.
 5. Build canonical types; collect referential-integrity errors (validate.rs).
 6. Reachability/transition checks (validate.rs).
-7. teen metadata check (validate.rs).
+7. Supported audience rating check (validate.rs).
 8. Return `Ok(StoryPack)` OR a single aggregated `PackError::Multiple(Vec<..>)` listing every problem (file/field/position, Korean).
 
-**Original Pack files are NEVER written/mutated by load.** (Migration output is a separate safe `pack migrate --out` later — not in W4.)
+**Original Pack files are NEVER written/mutated by load.** (Migration output is a separate explicit `pack migrate --out` later — not in W4.)
 
 ### validate.rs
 - `check_references(pack) -> Vec<PackError>`: every character/location/flag/number/string/item/event id referenced in conditions/effects exists; duplicate ids flagged; `ConditionExpr` refs resolve. Use `story-core`'s condition types (they're already `Serialize`/tagged; reuse, don't re-eval here — just structural id resolution).
 - `check_reachability(pack) -> Vec<PackError>`: warn (not error) on unreachable required events/locations from the initial state; error on impossible location transitions not covered by adjacency or event `force_location`.
-- `check_content(pack) -> Vec<PackError>`: if `rating == teen`, require `all_major_characters_safe == true` AND every major character `age >= Some(18)` (age present and ≥18). Else ⇒ `PackError::ContentPolicyViolation`.
+- `check_rating(pack) -> Vec<PackError>`: only `general` and `teen` are supported; other values fail during DTO conversion.
 
 ### migrate.rs
 - `migrate_in_memory(dto, target_major) -> Result<Dto, PackError>`: for same-major, fill missing optional fields with documented defaults; reject cross-major.
@@ -120,8 +119,8 @@ pub enum PackError {
     Reference { detail: String },
     #[error("도달 불가: {detail}")]
     Unreachable { detail: String },
-    #[error("모든 인물 Pack 정책 위반: {detail}")]
-    ContentPolicyViolation { detail: String },
+    #[error("지원하지 않는 Pack 등급: {detail}")]
+    UnsupportedRating { detail: String },
     #[error("팩 오류 {count}건:\n{items}")]
     Multiple { count: usize, items: String },
     #[error(transparent)]
@@ -139,11 +138,11 @@ Author the Pack under `stories/rainy-reunion/` with all required files. **Use th
 - **W4.2 (story-persistence):** DTOs + converters + `PackError`. Round-trip DTO↔canonical. Commit `feat(story-persistence): Story Pack TOML DTOs and converters`.
 - **W4.3:** `loader.rs` happy path (load a hand-built valid Pack dir from a tempdir) + file/encoding/path-traversal error tests. Commit `feat(story-persistence): Story Pack loader with safety checks`.
 - **W4.4:** `migrate.rs` + schema-major test (same-major ok, future-major rejected). Commit `feat(story-persistence): Pack schema version and in-memory migration`.
-- **W4.5:** `validate.rs` referential integrity + reachability + teen metadata; bad fixtures for each error code. Commit `feat(story-persistence): Pack referential integrity, reachability, teen validation`.
+- **W4.5:** `validate.rs` referential integrity + reachability + supported rating; bad fixtures for each error code. Commit `feat(story-persistence): Pack referential integrity, reachability, and rating validation`.
 - **W4.6:** `rainy-reunion` Pack fixture (from example doc) + integration test `load("stories/rainy-reunion")` → 0 errors/0 warnings. Commit `feat(stories): rainy-reunion example Story Pack`.
 
 ## Completion gate (ST-011..015)
 - `cargo test --workspace` green; `cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo fmt --check` clean.
 - `./scripts/check-core-deps.sh` OK; `story-persistence` does NOT pull UI crates (it may pull std::fs, toml, sha2 — that's allowed; only story-core/story-model are FS-free).
-- Good Pack loads to canonical `StoryPack`; each bad fixture fails with the expected error code (missing file, malformed TOML, path traversal, unsupported major, missing ref, duplicate id, teen-violation).
+- Good Pack loads to canonical `StoryPack`; each bad fixture fails with the expected error code (missing file, malformed TOML, path traversal, unsupported major, missing ref, duplicate id, unsupported rating).
 - `rainy-reunion` validates with 0 errors / 0 warnings; loader executes no arbitrary code (no `eval`, no script execution — only TOML/Markdown parse).

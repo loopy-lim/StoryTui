@@ -8,7 +8,9 @@
 
 use story_model::uuid::Uuid;
 use story_model::{ProviderError, ProviderHealth};
-use story_provider::{LlmProvider, MockProvider, MockResponse, parse_generated_turn};
+use story_provider::{
+    LlmProvider, MockProvider, MockResponse, parse_generated_choices, parse_generated_turn,
+};
 
 // ---------------------------------------------------------------------------
 // 12 fixtures
@@ -66,6 +68,40 @@ fn fixture_01_valid_parses_with_zero_repairs() {
 }
 
 #[test]
+fn missing_choice_label_uses_player_facing_intent() {
+    let mut raw: story_model::serde_json::Value =
+        story_model::serde_json::from_str(F01_VALID).expect("valid fixture");
+    let first = raw["choices"][0]
+        .as_object_mut()
+        .expect("choice must be an object");
+    first.remove("label");
+    first.insert(
+        "intent".to_string(),
+        story_model::serde_json::Value::String("우산을 유나에게 건넨다".to_string()),
+    );
+
+    let outcome = parse_generated_turn(&raw.to_string(), GID).expect("label should recover");
+    assert_eq!(outcome.repairs, ["normalized compatible response fields"]);
+    assert_eq!(outcome.draft.choices[0].label, "우산을 유나에게 건넨다");
+}
+
+#[test]
+fn scene_string_alias_is_normalized_to_narration() {
+    let mut raw: story_model::serde_json::Value =
+        story_model::serde_json::from_str(F01_VALID).expect("valid fixture");
+    let object = raw.as_object_mut().expect("turn must be an object");
+    let narration = object.remove("narration").expect("narration");
+    object.insert("scene".to_string(), narration);
+
+    let outcome = parse_generated_turn(&raw.to_string(), GID).expect("scene alias should recover");
+    assert_eq!(outcome.repairs, ["normalized compatible response fields"]);
+    assert_eq!(
+        outcome.draft.narration,
+        "비가 그쳤다. 유나가 찻잔을 내려놓는다."
+    );
+}
+
+#[test]
 fn fixture_02_fenced_parses_with_one_repair() {
     let d = expect_ok(F02_FENCED, 1);
     assert_eq!(d.choices.len(), 1);
@@ -75,6 +111,58 @@ fn fixture_02_fenced_parses_with_one_repair() {
 fn fixture_03_trailing_comma_repairs() {
     let d = expect_ok(F03_TRAILING_COMMA, 1);
     assert_eq!(d.narration, "비가 그쳤다. 유나가 찻잔을 내려놓는다.");
+}
+
+#[test]
+fn choice_only_response_maps_to_safe_compatibility_draft() {
+    let raw = r#"{
+      "choices": [
+        {"id":"c1","label":"손을 잡고 묻는다","intent":"동의를 다시 확인한다","tone":"gentle","target":null,"risk":"safe","hidden_requirements":[],"preview":"대답에 따라 거리가 달라진다"},
+        {"id":"c2","label":"문을 잠그자고 제안한다","intent":"둘만의 공간을 만든다","tone":"bold","target":null,"risk":"medium","hidden_requirements":[],"preview":"머물지 떠날지 바로 결정된다"},
+        {"id":"c3","label":"숨긴 욕망을 고백한다","intent":"관계를 걸고 솔직해진다","tone":"intense","target":null,"risk":"high","hidden_requirements":[],"preview":"서로의 경계가 분명해진다"}
+      ]
+    }"#;
+    let outcome = parse_generated_choices(raw, GID).expect("choice-only parse");
+    assert_eq!(outcome.draft.generation_id, GID);
+    assert_eq!(outcome.draft.narration, "선택지 갱신 전용");
+    assert_eq!(outcome.draft.choices.len(), 3);
+    assert!(outcome.draft.proposed_patch.affection_delta.is_empty());
+    assert!(outcome.draft.summary.facts.is_empty());
+}
+
+#[test]
+fn choice_only_compact_shape_and_numeric_ids_are_normalized() {
+    let raw = r#"{
+      "choices": [
+        {"id":1,"label":"전시회 표를 탁자에 놓는다","intent":"과거 약속을 직접 다룬다","risk":"high","preview":"유나가 표를 받을지 밀어낼지 드러난다"},
+        {"label":"마감 시간을 직원에게 확인한다","intent":"남은 대화 시간을 확보한다","risk":"low","preview":"둘에게 정확한 시한이 생긴다"},
+        {"label":"함께 우산을 고르자고 제안한다","intent":"카페 밖 다음 행동을 정한다","risk":"medium","preview":"같이 나갈지 여기서 헤어질지 갈린다"}
+      ]
+    }"#;
+    let outcome = parse_generated_choices(raw, GID).expect("compact choices should recover");
+    assert_eq!(outcome.draft.choices[0].id, "choice-1");
+    assert_eq!(outcome.draft.choices[1].id, "choice-2");
+    assert!(
+        outcome
+            .draft
+            .choices
+            .iter()
+            .all(|choice| choice.tone.is_none())
+    );
+    assert!(
+        outcome
+            .draft
+            .choices
+            .iter()
+            .all(|choice| choice.hidden_requirements.is_empty())
+    );
+}
+
+#[test]
+fn choice_only_response_rejects_unknown_top_level_fields() {
+    let error = parse_generated_choices(r#"{"choices":[],"narration":"ignored"}"#, GID)
+        .expect_err("unknown field must remain a hard error");
+    assert!(matches!(error, ProviderError::InvalidGeneration(_)));
 }
 
 #[test]

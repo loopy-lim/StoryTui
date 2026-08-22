@@ -1,5 +1,4 @@
-//! Pack validation: referential integrity, reachability, teen metadata
-//! (W4, ST-014).
+//! Pack validation: referential integrity and reachability (W4, ST-014).
 //!
 //! Each `check_*` walks the canonical [`StoryPack`] and collects errors.
 //! [`validate_all`] is the top-level entry the loader calls; it dispatches
@@ -7,9 +6,9 @@
 //! missing reference produces a [`PackError::Reference`] but does not
 //! short-circuit the remaining checks.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 
-use story_model::{CharacterId, ConditionExpr, LocationId, PackRating, StoryPack};
+use story_model::{CharacterId, ConditionExpr, LocationId, StoryPack};
 
 #[cfg(test)]
 use std::collections::BTreeMap;
@@ -20,7 +19,6 @@ use crate::error::PackError;
 pub fn validate_all(pack: &StoryPack, errs: &mut Vec<PackError>) {
     errs.extend(check_references(pack));
     errs.extend(check_reachability(pack));
-    errs.extend(check_content(pack));
 }
 
 /// Allow-lists of every id the loader knows about. Built once per pack and
@@ -268,46 +266,38 @@ fn check_condition(
 /// runtime. We keep the function as a seam so future static reachability
 /// analysis (e.g. unreachable required events) can land without changing
 /// the loader's call sites.
-pub fn check_reachability(_pack: &StoryPack) -> Vec<PackError> {
-    Vec::new()
-}
+pub fn check_reachability(pack: &StoryPack) -> Vec<PackError> {
+    if !pack
+        .rules
+        .locations
+        .contains_key(&pack.metadata.initial_state.location)
+    {
+        // `check_references` owns the clearer missing-initial-location error.
+        return Vec::new();
+    }
 
-/// teen-metadata pass.
-///
-/// If `rating == teen`, requires:
-/// - `all_major_characters_safe == true`, AND
-/// - every character `age` present and `>= 18`.
-///
-/// Any character lacking `age` is flagged.
-pub fn check_content(pack: &StoryPack) -> Vec<PackError> {
-    let mut errs = Vec::new();
-    if pack.metadata.rating != PackRating::teen {
-        return errs;
-    }
-    if !pack.metadata.all_major_characters_safe {
-        errs.push(PackError::ContentPolicyViolation {
-            detail: "rating=teen 이지만 all_major_characters_safe=false 입니다".to_string(),
-        });
-    }
-    // MVP: every character in the `characters` map is treated as major.
-    for (id, def) in &pack.characters {
-        match def.age {
-            Some(a) if a >= 18 => {}
-            Some(a) => {
-                errs.push(PackError::ContentPolicyViolation {
-                    detail: format!("모든 인물 Pack 의 주요 캐릭터 {id} 나이가 18 미만입니다: {a}"),
-                });
-            }
-            None => {
-                errs.push(PackError::ContentPolicyViolation {
-                    detail: format!(
-                        "모든 인물 Pack 의 주요 캐릭터 {id} 나이(age)가 선언되지 않았습니다"
-                    ),
-                });
-            }
+    let mut reachable = BTreeSet::new();
+    let mut queue = VecDeque::from([pack.metadata.initial_state.location.clone()]);
+    while let Some(location) = queue.pop_front() {
+        if !reachable.insert(location.clone()) {
+            continue;
+        }
+        if let Some(definition) = pack.rules.locations.get(&location) {
+            queue.extend(definition.adjacent.iter().cloned());
         }
     }
-    errs
+
+    pack.rules
+        .locations
+        .keys()
+        .filter(|location| !reachable.contains(*location))
+        .map(|location| PackError::Unreachable {
+            detail: format!(
+                "초기 위치 {}에서 인접 경로로 도달할 수 없는 location: {location}",
+                pack.metadata.initial_state.location
+            ),
+        })
+        .collect()
 }
 
 /// Helper used by tests to build a minimal canonical pack from parts.
@@ -338,11 +328,11 @@ pub(crate) fn minimal_pack(
 mod tests {
     use super::*;
     use story_model::{
-        CharacterDef, EventDef, EventEffects, EventId, LocationDef, PackContentPolicy,
-        PackInitialState, PackMetadata, RelationshipStage, TimeSlot,
+        EventDef, EventEffects, EventId, LocationDef, PackContentPolicy, PackInitialState,
+        PackMetadata, PackRating, TimeSlot,
     };
 
-    fn md(rating: PackRating, teens: bool) -> PackMetadata {
+    fn md(rating: PackRating) -> PackMetadata {
         PackMetadata {
             schema_version: semver::Version::new(1, 0, 0),
             story_id: "t".into(),
@@ -352,7 +342,6 @@ mod tests {
             language: "ko-KR".into(),
             genres: Vec::new(),
             rating,
-            all_major_characters_safe: teens,
             default_choice_count: 3,
             initial_state: PackInitialState {
                 chapter: "c1".into(),
@@ -361,37 +350,9 @@ mod tests {
                 time_slot: TimeSlot::Evening,
             },
             content: PackContentPolicy {
-                safe_content: "none".into(),
                 violence: "none".into(),
             },
         }
-    }
-
-    fn char(id: &str, age: Option<u32>) -> (CharacterId, CharacterDef) {
-        (
-            CharacterId(id.into()),
-            CharacterDef {
-                id: CharacterId(id.into()),
-                name: id.into(),
-                age,
-                pronouns: None,
-                personality: Vec::new(),
-                appearance: Vec::new(),
-                values: Vec::new(),
-                likes: Vec::new(),
-                dislikes: Vec::new(),
-                secrets: Vec::new(),
-                initial_player_relationship: RelationshipStage::Acquaintance,
-                speech_style: String::new(),
-                honorific_rule: String::new(),
-                frequent_phrases: Vec::new(),
-                avoid_phrases: Vec::new(),
-                known_facts: Vec::new(),
-                unknown_facts: Vec::new(),
-                current_goal: String::new(),
-                long_term_desire: String::new(),
-            },
-        )
     }
 
     fn rules_with_loc1() -> story_model::StoryRules {
@@ -409,18 +370,14 @@ mod tests {
 
     #[test]
     fn empty_pack_no_refs_no_errors() {
-        let pack = minimal_pack(
-            md(PackRating::General, false),
-            BTreeMap::new(),
-            rules_with_loc1(),
-        );
+        let pack = minimal_pack(md(PackRating::General), BTreeMap::new(), rules_with_loc1());
         let errs = check_references(&pack);
         assert!(errs.is_empty(), "{errs:?}");
     }
 
     #[test]
     fn initial_state_missing_location_is_reference_error() {
-        let mut metadata = md(PackRating::General, false);
+        let mut metadata = md(PackRating::General);
         metadata.initial_state.location = LocationId("nope".into());
         let pack = minimal_pack(
             metadata,
@@ -439,7 +396,7 @@ mod tests {
         let mut rules = rules_with_loc1();
         let loc = rules.locations.get_mut(&LocationId("loc1".into())).unwrap();
         loc.adjacent.insert(LocationId("nope".into()));
-        let mut metadata = md(PackRating::General, false);
+        let mut metadata = md(PackRating::General);
         metadata.initial_state.location = LocationId("loc1".into());
         let pack = minimal_pack(metadata, BTreeMap::new(), rules);
         let errs = check_references(&pack);
@@ -467,7 +424,7 @@ mod tests {
                 route_lock: None,
             },
         );
-        let mut metadata = md(PackRating::General, false);
+        let mut metadata = md(PackRating::General);
         metadata.initial_state.location = LocationId("loc1".into());
         let pack = minimal_pack(metadata, BTreeMap::new(), rules);
         let errs = check_references(&pack);
@@ -475,82 +432,6 @@ mod tests {
             errs.iter()
                 .any(|e| matches!(e, PackError::Reference { .. }))
         );
-    }
-
-    #[test]
-    fn teen_pack_requires_teens_flag_true() {
-        let pack = minimal_pack(
-            md(PackRating::teen, false),
-            BTreeMap::new(),
-            rules_with_loc1(),
-        );
-        let errs = check_content(&pack);
-        assert!(
-            errs.iter()
-                .any(|e| matches!(e, PackError::ContentPolicyViolation { .. }))
-        );
-    }
-
-    #[test]
-    fn teen_pack_rejects_under_18_age() {
-        let mut characters = BTreeMap::new();
-        let (id, def) = char("yuna", Some(17));
-        characters.insert(id, def);
-        let pack = minimal_pack(
-            md(PackRating::teen, true),
-            characters,
-            story_model::StoryRules::minimal(),
-        );
-        let errs = check_content(&pack);
-        assert!(
-            errs.iter()
-                .any(|e| matches!(e, PackError::ContentPolicyViolation { .. }))
-        );
-    }
-
-    #[test]
-    fn teen_pack_rejects_missing_age() {
-        let mut characters = BTreeMap::new();
-        let (id, def) = char("yuna", None);
-        characters.insert(id, def);
-        let pack = minimal_pack(
-            md(PackRating::teen, true),
-            characters,
-            story_model::StoryRules::minimal(),
-        );
-        let errs = check_content(&pack);
-        assert!(
-            errs.iter()
-                .any(|e| matches!(e, PackError::ContentPolicyViolation { .. }))
-        );
-    }
-
-    #[test]
-    fn teen_pack_with_18_plus_is_ok() {
-        let mut characters = BTreeMap::new();
-        let (id, def) = char("yuna", Some(29));
-        characters.insert(id, def);
-        let pack = minimal_pack(
-            md(PackRating::teen, true),
-            characters,
-            story_model::StoryRules::minimal(),
-        );
-        let errs = check_content(&pack);
-        assert!(errs.is_empty(), "{errs:?}");
-    }
-
-    #[test]
-    fn general_pack_ignores_age_policy() {
-        let mut characters = BTreeMap::new();
-        let (id, def) = char("kid", Some(8));
-        characters.insert(id, def);
-        let pack = minimal_pack(
-            md(PackRating::General, false),
-            characters,
-            story_model::StoryRules::minimal(),
-        );
-        let errs = check_content(&pack);
-        assert!(errs.is_empty());
     }
 
     #[test]
@@ -577,7 +458,7 @@ mod tests {
                 route_lock: None,
             },
         );
-        let mut metadata = md(PackRating::General, false);
+        let mut metadata = md(PackRating::General);
         metadata.initial_state.location = LocationId("loc1".into());
         let pack = minimal_pack(metadata, BTreeMap::new(), rules);
         let errs = check_references(&pack);
@@ -585,5 +466,21 @@ mod tests {
             errs.iter()
                 .any(|e| matches!(e, PackError::Reference { .. }))
         );
+    }
+
+    #[test]
+    fn disconnected_location_is_unreachable() {
+        let mut rules = rules_with_loc1();
+        rules.locations.insert(
+            LocationId("isolated".into()),
+            LocationDef {
+                id: LocationId("isolated".into()),
+                display_name: "고립".into(),
+                adjacent: BTreeSet::new(),
+            },
+        );
+        let pack = minimal_pack(md(PackRating::General), BTreeMap::new(), rules);
+        let errors = check_reachability(&pack);
+        assert!(matches!(errors.as_slice(), [PackError::Unreachable { .. }]));
     }
 }

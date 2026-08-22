@@ -159,7 +159,6 @@ fn pack_with_route_premise(premise: &str) -> StoryPack {
             language: "ko-KR".to_string(),
             genres: vec![],
             rating: PackRating::General,
-            all_major_characters_safe: true,
             default_choice_count: 3,
             initial_state: PackInitialState {
                 chapter: "ch-1".to_string(),
@@ -168,7 +167,6 @@ fn pack_with_route_premise(premise: &str) -> StoryPack {
                 time_slot: TimeSlot::Evening,
             },
             content: PackContentPolicy {
-                safe_content: "none".to_string(),
                 violence: "none".to_string(),
             },
         },

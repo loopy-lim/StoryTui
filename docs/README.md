@@ -14,11 +14,9 @@ StoryTUI의 제품 요구사항, 설계 결정, 기술 명세, 구현 순서와 
 - [기술 명세](./StoryTUI_Technical_Spec_KO.md) — crate 경계, 상태 모델, provider, 저장, TUI, 테스트 계약
 - [아키텍처 결정 기록(ADR)](./StoryTUI_ADR_KO.md) — 변경하지 말아야 할 설계 결정과 재검토 조건
 
-## 예제와 배포 산출물
+## 예제와 원본 문서
 
 - [예제 Story Pack](./StoryTUI_Example_Story_Pack_KO.md) — `rainy-reunion` 콘텐츠와 Mock fixture
-- [전체 문서 DOCX](./StoryTUI_All_Documents_KO.docx)
-- [전체 문서 PDF](./StoryTUI_All_Documents_KO.pdf)
 
 ## 권장 읽기 순서
 

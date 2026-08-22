@@ -12,6 +12,9 @@ pub struct FileConfig {
     /// Optional model override for the Director (planning & choice generation) step.
     #[serde(default)]
     pub director_model: Option<String>,
+    /// Optional lightweight model used only when rejected choices are rewritten.
+    #[serde(default)]
+    pub choice_model: Option<String>,
     /// Optional model override for the Writer (narration & prose stream) step.
     #[serde(default)]
     pub writer_model: Option<String>,
@@ -47,6 +50,8 @@ pub struct UserSettings {
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub director_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub choice_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub writer_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -161,6 +166,7 @@ impl Default for FileConfig {
         Self {
             provider: ProviderConfig::defaults(),
             director_model: None,
+            choice_model: None,
             writer_model: None,
             save_dir: default_save_dir(),
             player: PlayerProfile::default(),
@@ -173,6 +179,20 @@ fn default_save_dir() -> PathBuf {
     PathBuf::from("saves")
 }
 
+fn preferred_config_path(local: &Path, public: &Path) -> PathBuf {
+    if local.exists() {
+        local.to_path_buf()
+    } else {
+        public.to_path_buf()
+    }
+}
+
+fn preferred_default_config_path() -> PathBuf {
+    let local = PathBuf::from("config/storytui.local.toml");
+    let public = PathBuf::from("config/storytui.toml");
+    preferred_config_path(&local, &public)
+}
+
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
     pub provider: ProviderConfig,
@@ -180,6 +200,7 @@ pub struct RuntimeConfig {
     /// is no longer advertised by the local server.
     pub fallback_model: String,
     pub director_model: Option<String>,
+    pub choice_model: Option<String>,
     pub writer_model: Option<String>,
     pub save_dir: PathBuf,
     pub player: PlayerProfile,
@@ -231,7 +252,7 @@ pub fn load(cli: &CliOptions) -> Result<RuntimeConfig, String> {
     let config_path = cli
         .provider_config
         .clone()
-        .or_else(|| Some(PathBuf::from("config/storytui.toml")));
+        .or_else(|| Some(preferred_default_config_path()));
     let (mut file, source_path) = match config_path.filter(|p| p.exists()) {
         Some(path) => {
             let text = fs::read_to_string(&path)
@@ -255,6 +276,9 @@ pub fn load(cli: &CliOptions) -> Result<RuntimeConfig, String> {
     if let Some(dm) = &settings.director_model {
         file.director_model = Some(dm.clone());
     }
+    if let Some(cm) = &settings.choice_model {
+        file.choice_model = Some(cm.clone());
+    }
     if let Some(wm) = &settings.writer_model {
         file.writer_model = Some(wm.clone());
     }
@@ -267,7 +291,7 @@ pub fn load(cli: &CliOptions) -> Result<RuntimeConfig, String> {
     }
     if let Some(value) = &cli.api_key_env {
         file.provider.api_key_env = Some(value.clone());
-        // An safe environment credential must be able to replace a stale
+        // An explicit environment credential must be able to replace a stale
         // or missing file credential from the base profile.
         file.provider.api_key_file = None;
         file.provider.api_key = None;
@@ -317,6 +341,7 @@ pub fn load(cli: &CliOptions) -> Result<RuntimeConfig, String> {
         provider: file.provider,
         fallback_model,
         director_model: file.director_model,
+        choice_model: file.choice_model,
         writer_model: file.writer_model,
         save_dir: file.save_dir,
         player: file.player,
@@ -332,7 +357,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        CliOptions, FileConfig, UserSettings, load, save_user_settings, user_settings_path,
+        CliOptions, FileConfig, UserSettings, load, preferred_config_path, save_user_settings,
+        user_settings_path,
     };
 
     fn test_dir(label: &str) -> PathBuf {
@@ -346,6 +372,21 @@ mod tests {
         ));
         fs::create_dir_all(&dir).expect("create test directory");
         dir
+    }
+
+    #[test]
+    fn ignored_local_profile_is_preferred_over_public_template() {
+        let dir = test_dir("preferred-local-profile");
+        let public = dir.join("storytui.toml");
+        let local = dir.join("storytui.local.toml");
+        fs::write(&public, "[provider]\n").expect("public profile");
+
+        assert_eq!(preferred_config_path(&local, &public), public);
+
+        fs::write(&local, "[provider]\n").expect("local profile");
+        assert_eq!(preferred_config_path(&local, &public), local);
+
+        fs::remove_dir_all(dir).expect("clean test directory");
     }
 
     #[test]
@@ -380,6 +421,7 @@ mod tests {
             &UserSettings {
                 model: Some("saved-model".to_string()),
                 director_model: None,
+                choice_model: Some("saved-choice-model".to_string()),
                 writer_model: None,
                 max_tokens: Some(300),
                 context_budget_tokens: Some(400),
@@ -400,6 +442,7 @@ mod tests {
         assert_eq!(runtime.provider.max_tokens, 300);
         assert_eq!(runtime.provider.context_budget_tokens, 400);
         assert_eq!(runtime.provider.temperature, 0.7);
+        assert_eq!(runtime.choice_model.as_deref(), Some("saved-choice-model"));
         fs::remove_dir_all(dir).expect("clean test directory");
     }
 
@@ -409,6 +452,7 @@ mod tests {
         let settings = UserSettings {
             model: Some("qwen-local".to_string()),
             director_model: None,
+            choice_model: Some("qwen-choice".to_string()),
             writer_model: None,
             max_tokens: Some(1_800),
             context_budget_tokens: None,
@@ -427,6 +471,7 @@ mod tests {
         assert!(text.contains("model = \"qwen-local\""));
         assert!(text.contains("max_tokens = 1800"));
         assert!(text.contains("temperature = 0.2"));
+        assert!(text.contains("choice_model = \"qwen-choice\""));
         assert!(!text.contains("context_budget_tokens"));
         assert!(!text.contains("base_url"));
         assert_eq!(

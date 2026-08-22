@@ -73,18 +73,20 @@ pub fn collect_known_secrets() -> Vec<String> {
 /// read from the environment by the HTTP provider — but this is the structural
 /// guarantee the diagnostic bundle relies on).
 pub fn provider_config_safe(cfg: &ProviderConfig) -> ProviderConfigSafe {
-    provider_config_safe_with_models(cfg, None, None)
+    provider_config_safe_with_models(cfg, None, None, None)
 }
 
 pub fn provider_config_safe_with_models(
     cfg: &ProviderConfig,
     director_model: Option<String>,
+    choice_model: Option<String>,
     writer_model: Option<String>,
 ) -> ProviderConfigSafe {
     ProviderConfigSafe {
         base_url: cfg.base_url.clone(),
         model: cfg.model.clone(),
         director_model,
+        choice_model,
         writer_model,
         structured_output: match cfg.structured_output {
             StructuredOutputMode::Auto => "auto",

@@ -41,11 +41,12 @@ The workspace builds six crates:
 
 ## Run
 
-The checked-in profile targets the local OMLX instance at `127.0.0.1:8000`
-and selects the configured model. At startup StoryTUI checks `/v1/models` with
-a short probe timeout. If a saved model is no longer advertised, it falls back
-to the checked-in model (or the first advertised model) and repairs
-`saves/user-settings.toml` before generation.
+The checked-in profile contains no machine-specific model ID. Copy it to the
+ignored `config/storytui.local.toml`, add the local model selections there,
+and run normally; StoryTUI automatically prefers that file. At startup it
+checks `/v1/models` with a short probe timeout. If a saved model is no longer
+advertised, it falls back to the private local profile model (or the first
+advertised model) and repairs `saves/user-settings.toml` before generation.
 
 ```sh
 cargo run -p storytui
@@ -55,13 +56,28 @@ The TUI starts in the Story screen. Use `1..9` or `Enter` to choose, `j/k` or
 arrow keys to move, `c` to cancel a generation, `Esc` to dismiss an error, and
 `q`/`Ctrl+C` to quit. Press `o`, then `p`, to open the server-advertised model
 picker; `Enter` selects the main model, while `d` and `w` select the optional
-Director and Writer models.
+Director and Writer models. `c` selects the lightweight model used only for a
+rejected/manual choice rewrite.
+
+To run the live model contract gates (they remain ignored in normal CI):
+
+```sh
+STORYTUI_MLX_URL=http://127.0.0.1:8000 \
+STORYTUI_MLX_MODEL='<writer-model-id>' \
+STORYTUI_MLX_CHOICE_MODEL='<choice-model-id>' \
+cargo test -p story-provider --test mlx_smoke -- --ignored --nocapture
+```
+
+The gates verify advertised model IDs, Korean generation, the exact StoryTUI
+JSON contracts, a compact three-choice response, distinct active choices and
+risk levels, previews, and a supported all-ages scene. They do not
+replace the longer human-scored release gates.
 
 CLI overrides are available for one-off runs:
 
 ```sh
 cargo run -p storytui -- \
-  --provider-config ./config/storytui.toml \
+  --provider-config ./config/storytui.local.toml \
   --pack ./stories/rainy-reunion \
   --model local-model-id \
   --base-url http://127.0.0.1:8000

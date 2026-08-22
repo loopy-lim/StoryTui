@@ -113,7 +113,11 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                         .map_err(|e| format!("대체 provider를 만들지 못했습니다: {e}"))?,
                 );
             }
-            for stage_model in [&mut config.director_model, &mut config.writer_model] {
+            for stage_model in [
+                &mut config.director_model,
+                &mut config.choice_model,
+                &mut config.writer_model,
+            ] {
                 if let Some(current) = stage_model.clone()
                     && !advertised.iter().any(|model| model == &current)
                 {
@@ -161,6 +165,7 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
         &provider_config,
         health,
         config.director_model.clone(),
+        config.choice_model.clone(),
         config.writer_model.clone(),
     );
     app.show_home();
@@ -170,6 +175,7 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
     }
     if repaired_stage_models {
         user_settings.director_model = config.director_model.clone();
+        user_settings.choice_model = config.choice_model.clone();
         user_settings.writer_model = config.writer_model.clone();
     }
     if repaired_main_model || repaired_stage_models {
@@ -374,6 +380,10 @@ async fn handle_ui_requests(
         )
         .await?;
     }
+    if let Some(model) = app.take_selected_choice_model() {
+        settings::apply_choice_model(app, model, config, provider_config, provider, user_settings)
+            .await?;
+    }
     if let Some(model) = app.take_selected_writer_model() {
         settings::apply_writer_model(app, model, config, provider_config, provider, user_settings)
             .await?;
@@ -455,7 +465,7 @@ fn apply_player_profile(pack: &mut StoryPack, profile: &storytui::config::Player
     }
 }
 
-#[allow(clippy::too_many_arguments)] // host adapter keeps all effect-owned handles safe
+#[allow(clippy::too_many_arguments)] // host adapter keeps all effect-owned handles explicit
 async fn dispatch(
     command: EngineCommand,
     engine: &mut EngineState,
@@ -491,7 +501,7 @@ async fn dispatch(
             EngineEffect::ShowRecoverableError(error) => app.view.error = Some(error),
             EngineEffect::RequestGeneration {
                 generation_id,
-                request,
+                mut request,
             } => {
                 if let Some((_, token)) = cancellation.take() {
                     token.cancel();
@@ -500,7 +510,24 @@ async fn dispatch(
                 *cancellation = Some((generation_id, token.clone()));
                 let tx = tx.clone();
                 let provider = Arc::clone(provider);
-                let model = provider.model_name().to_string();
+                let is_choice_refresh = engine.pending.as_ref().is_some_and(|pending| {
+                    pending.generation_id == generation_id && pending.choice_refresh
+                });
+                if is_choice_refresh && let Some(model) = &config.choice_model {
+                    request.model = model.clone();
+                }
+                let model = if request.model.is_empty() || request.model == "mock" {
+                    provider.model_name().to_string()
+                } else {
+                    request.model.clone()
+                };
+                tracing::info!(
+                    %generation_id,
+                    %model,
+                    choice_refresh = is_choice_refresh,
+                    max_tokens = request.max_tokens,
+                    "invoking generation"
+                );
                 tokio::spawn(async move {
                     let result = provider.generate_turn(request, token).await;
                     let _ = tx.send(HostMessage::Generation {

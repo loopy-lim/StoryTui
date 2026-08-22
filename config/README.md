@@ -10,11 +10,20 @@ MLX-LM, MLX-VLM, OMLX 또는 다른 호환 서버를 선택할 수 있다.
 cargo run -p storytui
 ```
 
-기본 프로필은 `storytui.toml`이며 현재 로컬 OMLX 주소와 모델을 예시로
-가리킨다. 서버가 인증을 요구하지 않으면 그대로 사용할 수 있다. 시작할
-때 `/v1/models`를 짧게 조회하며, 저장된 모델이 서버에서 사라졌으면 기본
-프로필 모델 또는 서버의 첫 모델로 자동 복구하고 `saves/user-settings.toml`에
-반영한다.
+실제 모델 ID는 Git에 추적되지 않는 `storytui.local.toml`에 둔다. 이 파일이
+있으면 별도 인자 없이 자동으로 우선 사용하고, 없을 때만 공개 템플릿인
+`storytui.toml`을 읽는다. 시작할 때 `/v1/models`를 짧게 조회하며, 저장된
+모델이 서버에서 사라졌으면 로컬 프로필 모델 또는 서버의 첫 모델로 자동
+복구하고 `saves/user-settings.toml`에 반영한다.
+
+```bash
+cp config/storytui.toml config/storytui.local.toml
+# storytui.local.toml의 provider.model과 선택 단계 모델을 로컬 값으로 설정
+cargo run -p storytui
+```
+
+`config/*.local.toml`과 `saves/`는 `.gitignore` 대상이다. 실제 모델 ID를
+공개 템플릿, 문서 또는 커밋 메시지에 복사하지 않는다.
 
 TUI에서는 `o` → `p`로 모델 목록을 열 수 있다. `Enter`는 메인 모델,
 `d`는 Director 모델, `w`는 Writer 모델로 선택하며 선택 결과는 현재

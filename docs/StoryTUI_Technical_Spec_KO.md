@@ -35,13 +35,16 @@ AppEvent <── 렌더 상태 ── validated GameState              로컬 ML
 
 ### 2.1 초기 모델에 대한 중요 주의
 
-후보 `local-model-id`의 현재 모델 카드는 이 모델이 `mlx-vlm 0.6.3`으로 변환된 MLX VLM이며 약 20.4GB의 4비트 아티팩트라고 설명한다. 따라서 M0의 1차 실행 명령은 `mlx_lm.server`가 아니라 **`mlx_vlm.server`일 가능성이 높다**. MLX-VLM 공식 서버는 `/v1/chat/completions`, `/health`, `top_k`, 스트리밍과 JSON Schema 구조 출력을 문서화하고 있다.
+실제 로컬 모델 ID와 모델 카드는 Git에 기록하지 않는다. 모델이 MLX VLM이면
+`mlx_vlm.server`, 텍스트 모델이면 `mlx_lm.server`를 선택한다. MLX-VLM 공식
+서버는 `/v1/chat/completions`, `/health`, `top_k`, 스트리밍과 JSON Schema
+구조 출력을 문서화하고 있다.
 
 Rust의 설계는 서버 이름에 결합하지 않는다. `OpenAiCompatibleProvider`는 URL과 capability만 보고 동작하며, `mlx_lm.server`와 `mlx_vlm.server`는 같은 provider adapter로 처리한다.
 
 M0 결정 절차:
 
-1. `mlx_vlm.server --host 127.0.0.1 --port 8080 --model aimeri/...`로 텍스트-only 요청을 검증한다.
+1. ignored 로컬 설정의 모델로 텍스트-only 요청을 검증한다.
 2. 모델·processor·chat template 로딩 실패 시 정확한 오류와 버전을 기록한다.
 3. 같은 모델을 `mlx_lm.server`에서 억지로 로드하지 않는다.
 4. 후보가 실패하면 Provider 구현은 유지하고 호환되는 MLX 텍스트 모델을 기준 fixture로 교체한다.
@@ -347,7 +350,6 @@ title = "비가 그친 뒤"
 language = "ko-KR"
 genres = ["modern-romance", "drama"]
 rating = "teen"
-all_major_characters_safe = true
 default_choice_count = 3
 
 [initial_state]
@@ -357,7 +359,6 @@ location = "cafe-namu"
 time_slot = "evening"
 
 [content]
-safe_content = "permitted_by_pack"
 violence = "mild"
 ```
 
@@ -400,7 +401,7 @@ long_term_desire = "일방적으로 사라지지 않는 관계"
 4. ID 유일성, 참조 무결성, 범위·enum 검사
 5. 이벤트·루트 조건식 컴파일
 6. 도달 불가능 장면·순환 전이 경고
-7. 모든 인물 Pack 메타데이터 검사
+7. 지원 등급 검사
 8. canonical `StoryPack`으로 변환
 
 같은 major의 minor 변화는 기본값을 채우는 in-memory migration으로 처리한다. major 변화는 명시적 `PackMigrator<V1,V2>`가 없으면 거부한다. 원본 Pack을 자동 덮어쓰지 않고 `storytui pack migrate --out <new-dir>` 같은 별도 명령으로 복사본을 생성하는 방식을 권장한다.
@@ -889,7 +890,7 @@ pub struct UserFacingError {
 
 - 전체 프롬프트, system prompt와 chat template
 - 자유 입력 원문
-- 생성 본문·대사·모든 인물 콘텐츠
+- 생성 본문과 대사
 - 세이브 payload와 캐릭터 비밀
 - 인증 header·API key
 
@@ -987,7 +988,5 @@ M1 Max의 “64GB에 들어간다”는 모델 파일 크기만으로 단정하�
 - [MLX-LM 공식 저장소](https://github.com/ml-explore/mlx-lm)
 - [MLX-LM HTTP 서버 문서](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/SERVER.md)
 - [MLX-VLM 공식 저장소와 서버 문서](https://github.com/Blaizzy/mlx-vlm)
-- [초기 후보 모델 카드](https://huggingface.co/local-model-id)
 
 이 문서의 버전·서버 capability는 변경될 수 있다. 구현 시작 시 `Cargo.lock`, Python lockfile, 실제 `--help` 출력과 smoke 결과를 저장해 다시 고정해야 한다.
-

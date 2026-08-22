@@ -34,3 +34,4 @@ futures-util.workspace = true
 [dev-dependencies]
 tokio-util.workspace = true
 sha2.workspace = true
+tempfile.workspace = true

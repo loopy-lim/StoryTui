@@ -36,6 +36,10 @@ pub enum PackError {
     #[error("지원하지 않는 Pack 스키마: {found} (지원 {supported})")]
     UnsupportedSchemaVersion { found: String, supported: String },
 
+    /// The Pack requires a newer StoryTUI engine than this build.
+    #[error("지원하지 않는 엔진 버전: Pack 요구 {required} (현재 {current})")]
+    UnsupportedEngineVersion { required: String, current: String },
+
     /// Referential-integrity failure: unknown character/location/flag/item/
     /// event/route id, duplicate id, or an unresolved `ConditionExpr` ref.
     #[error("참조 오류: {detail}")]
@@ -45,12 +49,6 @@ pub enum PackError {
     /// or a transition is impossible given adjacency / event overrides.
     #[error("도달 불가: {detail}")]
     Unreachable { detail: String },
-
-    /// teen Pack policy violation: `rating == "teen"` requires
-    /// `all_major_characters_safe == true` AND every major character age
-    /// present and `>= 18`.
-    #[error("모든 인물 Pack 정책 위반: {detail}")]
-    ContentPolicyViolation { detail: String },
 
     /// Aggregated bundle of every error collected during load. Use
     /// [`PackError::aggregate`] to build a single error from a `Vec`.
@@ -132,6 +130,11 @@ pub enum SaveError {
     /// The requested slot id has no save file. Nothing to read.
     #[error("저장 슬롯이 없습니다: {0}")]
     MissingSlot(String),
+
+    /// The caller supplied a slot identifier that cannot be represented as a
+    /// single safe filename under the save root.
+    #[error("안전하지 않은 저장 슬롯 id: {0}")]
+    InvalidSlotId(String),
 
     /// The save file exists but is not valid JSON (truncated mid-write,
     /// cat-ed garbage, encoding corruption). The detail carries the parser's

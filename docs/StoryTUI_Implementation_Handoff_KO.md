@@ -15,7 +15,6 @@
 - `StoryTUI_Backlog_KO.md`: ST-001~ST-036의 기능 티켓
 - `StoryTUI_Implementation_Plan_KO.md`: M0~M9 마일스톤 계획
 - `StoryTUI_Example_Story_Pack_KO.md`: `rainy-reunion` 예제와 Mock 응답 fixture
-- `StoryTUI_All_Documents_KO.docx`, `StoryTUI_All_Documents_KO.pdf`: 위 문서의 묶음 산출물
 
 현재 없는 것:
 
@@ -203,7 +202,7 @@ W1과 W2는 서로 독립적으로 시작할 수 있지만, W5부터는 반드�
 5. ID registry와 참조 무결성 검사
 6. schema major 호환 및 in-memory default migration
 7. 도달 가능성·장소 전이 검사
-8. teen metadata 검사
+8. 지원 등급 검사
 9. `rainy-reunion` 실제 fixture 작성
 
 완료 증거:

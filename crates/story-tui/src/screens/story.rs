@@ -19,6 +19,8 @@ use ratatui::widgets::{
 use story_model::{AppViewModel, RiskLevel, TimeSlot};
 use unicode_width::UnicodeWidthStr;
 
+use super::model_display_label;
+
 /// Minimum supported terminal size for the Story screen.
 pub const MIN_WIDTH: u16 = 60;
 pub const MIN_HEIGHT: u16 = 16;
@@ -82,7 +84,11 @@ pub fn render_model_picker(frame: &mut Frame, area: Rect, items: &[String], sele
             .map(|(index, item)| {
                 let active = index == selected.min(items.len().saturating_sub(1));
                 Line::styled(
-                    format!("{} {}", if active { "▶" } else { " " }, item),
+                    format!(
+                        "{} {}",
+                        if active { "▶" } else { " " },
+                        model_display_label(item)
+                    ),
                     if active {
                         Style::default()
                             .fg(Color::Yellow)
@@ -101,7 +107,7 @@ pub fn render_model_picker(frame: &mut Frame, area: Rect, items: &[String], sele
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::LightCyan))
-                .title("모델 선택 · ↑↓ 이동 · Enter 기본모델 · D 기획(Director) · W 서사(Writer) · R 새로고침 · Esc 닫기"),
+                .title("모델 선택 · ↑↓ 이동 · Enter 기본 · D 기획 · C 선택지 · W 본문 · R 새로고침 · Esc 닫기"),
         )
         .wrap(Wrap { trim: false });
     frame.render_widget(Clear, area);
@@ -115,7 +121,7 @@ pub fn model_picker_scroll(area: Rect, selected: usize) -> u16 {
 
 /// Render the Story screen for `view`, highlighting `selected` (clamped to the
 /// choice count). `selected` is an index into `view.choices`.
-#[allow(clippy::too_many_arguments)] // rendering inputs stay safe at the UI boundary
+#[allow(clippy::too_many_arguments)] // rendering inputs stay explicit at the UI boundary
 pub fn render_story(
     frame: &mut Frame,
     area: Rect,
@@ -394,7 +400,7 @@ fn story_stack_text(entries: &[StoryStackEntry]) -> Text<'static> {
         // joined by " · " on one subtle line.
         let mut meta: Vec<String> = Vec::new();
         if let Some(model) = &entry.model {
-            meta.push(format!("모델 · {model}"));
+            meta.push(format!("모델 · {}", model_display_label(model)));
         }
         if let Some(secs) = entry.generation_secs {
             meta.push(format!("생성 {}", fmt_duration(secs)));
@@ -493,7 +499,7 @@ fn markdown_lines(input: &str) -> Vec<Line<'static>> {
         .collect()
 }
 
-/// Recognize only the safe dialogue contract used in generated narration.
+/// Recognize only the explicit dialogue contract used in generated narration.
 ///
 /// Keeping this presentation-only and conservative avoids treating ordinary
 /// prose such as URLs or explanations with a colon as a speaker label.

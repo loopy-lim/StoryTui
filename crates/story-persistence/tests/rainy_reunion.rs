@@ -28,8 +28,7 @@ fn rainy_reunion_loads_with_zero_errors_and_zero_warnings() {
     assert_eq!(pack.metadata.story_id, "rainy-reunion");
     assert_eq!(pack.metadata.title, "비가 그친 뒤");
     assert_eq!(pack.metadata.language, "ko-KR");
-    assert_eq!(pack.metadata.rating, story_model::PackRating::teen);
-    assert!(pack.metadata.all_major_characters_safe);
+    assert_eq!(pack.metadata.rating, story_model::PackRating::Teen);
     assert_eq!(pack.metadata.default_choice_count, 3);
     assert_eq!(pack.metadata.schema_version.major, 1);
 

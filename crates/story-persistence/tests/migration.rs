@@ -124,10 +124,10 @@ fn load_v0_save_migrates_in_memory_and_leaves_disk_untouched() {
     // disk to exercise the load-time migration path).
     let env = envelope("slot-1", 0, 1);
     let bytes = serde_json::to_vec_pretty(&env).unwrap();
-    std::fs::write(store.slot_path("slot-1"), &bytes).unwrap();
+    std::fs::write(store.slot_path("slot-1").unwrap(), &bytes).unwrap();
 
     // Capture the on-disk bytes — they must not change after load.
-    let before = std::fs::read(store.slot_path("slot-1")).unwrap();
+    let before = std::fs::read(store.slot_path("slot-1").unwrap()).unwrap();
 
     let loaded = store.load("slot-1").expect("migrate then load");
     assert_eq!(
@@ -142,7 +142,7 @@ fn load_v0_save_migrates_in_memory_and_leaves_disk_untouched() {
     );
 
     // The on-disk file is byte-identical — migration is in-memory only.
-    let after = std::fs::read(store.slot_path("slot-1")).unwrap();
+    let after = std::fs::read(store.slot_path("slot-1").unwrap()).unwrap();
     assert_eq!(before, after, "migration MUST NOT mutate the original file");
 }
 
@@ -153,7 +153,7 @@ fn load_future_major_save_is_unsupported_version() {
 
     let env = envelope("slot-1", 99, 1);
     let bytes = serde_json::to_vec_pretty(&env).unwrap();
-    std::fs::write(store.slot_path("slot-1"), &bytes).unwrap();
+    std::fs::write(store.slot_path("slot-1").unwrap(), &bytes).unwrap();
 
     match store.load("slot-1") {
         Err(SaveError::UnsupportedVersion { found, supported }) => {
@@ -170,7 +170,7 @@ fn load_truncated_file_is_truncated_or_corrupt() {
     let store = SaveStore::open(dir.path()).unwrap();
     store.save(envelope("slot-1", 1, 1)).unwrap();
 
-    let path = store.slot_path("slot-1");
+    let path = store.slot_path("slot-1").unwrap();
     let original = std::fs::read(&path).unwrap();
     // Slice off the last 30% — guaranteed invalid JSON.
     let cut = (original.len() * 7) / 10;
@@ -186,7 +186,7 @@ fn load_truncated_file_is_truncated_or_corrupt() {
 fn load_garbage_file_is_truncated_or_corrupt() {
     let dir = tempdir().unwrap();
     let store = SaveStore::open(dir.path()).unwrap();
-    std::fs::write(store.slot_path("slot-1"), b"not json at all {{{{").unwrap();
+    std::fs::write(store.slot_path("slot-1").unwrap(), b"not json at all {{{{").unwrap();
     match store.load("slot-1") {
         Err(SaveError::TruncatedOrCorrupt(_)) => (),
         other => panic!("expected TruncatedOrCorrupt, got {other:?}"),

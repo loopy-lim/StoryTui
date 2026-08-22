@@ -28,7 +28,6 @@ title = "데모"
 language = "ko-KR"
 genres = ["drama"]
 rating = "general"
-all_major_characters_safe = false
 default_choice_count = 3
 
 [initial_state]
@@ -38,7 +37,6 @@ location = "loc1"
 time_slot = "evening"
 
 [content]
-safe_content = "none"
 violence = "mild"
 "#;
 
@@ -190,6 +188,27 @@ fn path_traversal_in_files_section_is_unsafe_path() {
     assert!(err.is_unsafe_path(), "expected UnsafePath, got: {err}");
 }
 
+#[cfg(unix)]
+#[test]
+fn symlink_escape_is_rejected_before_external_file_is_read() {
+    use std::os::unix::fs::symlink;
+
+    let dir = build_valid_pack();
+    let outside = TempDir::new().unwrap();
+    let external = outside.path().join("external-secret.md");
+    fs::write(&external, "Pack 밖의 민감한 내용").unwrap();
+    let world = dir.path().join("world.md");
+    fs::remove_file(&world).unwrap();
+    symlink(&external, &world).unwrap();
+
+    let err = PackLoader::load(dir.path()).expect_err("escape symlink must fail closed");
+    assert!(err.is_unsafe_path(), "expected UnsafePath, got: {err}");
+    assert!(
+        !format!("{err}").contains("민감한 내용"),
+        "diagnostic must not echo external file content"
+    );
+}
+
 #[test]
 fn root_not_a_directory_is_missing_file() {
     let dir = build_valid_pack();
@@ -236,4 +255,35 @@ fn forward_minor_within_same_major_loads() {
     let pack = PackLoader::load(dir.path()).expect("forward minor loads");
     assert_eq!(pack.metadata.schema_version.minor, 7);
     assert_eq!(pack.metadata.schema_version.patch, 3);
+}
+
+#[test]
+fn future_engine_requirement_is_rejected() {
+    let dir = build_valid_pack();
+    let future = STORY_TOML.replace(
+        "min_engine_version = \"0.1.0\"",
+        "min_engine_version = \"99.0.0\"",
+    );
+    write(dir.path(), "story.toml", &future);
+    let err = PackLoader::load(dir.path()).expect_err("future engine requirement");
+    let message = format!("{err}");
+    assert!(message.contains("엔진 버전"), "unexpected error: {message}");
+    assert!(message.contains("99.0.0"));
+}
+
+#[test]
+fn choice_count_outside_provider_contract_is_rejected() {
+    for invalid in [0, 7] {
+        let dir = build_valid_pack();
+        let story = STORY_TOML.replace(
+            "default_choice_count = 3",
+            &format!("default_choice_count = {invalid}"),
+        );
+        write(dir.path(), "story.toml", &story);
+        let err = PackLoader::load(dir.path()).expect_err("invalid choice count");
+        assert!(
+            format!("{err}").contains("default_choice_count"),
+            "unexpected error for {invalid}: {err}"
+        );
+    }
 }

@@ -102,6 +102,7 @@ pub struct App {
     pub model_selected: usize,
     selected_model: Option<String>,
     selected_director_model: Option<String>,
+    selected_choice_model: Option<String>,
     selected_writer_model: Option<String>,
     model_reload_requested: bool,
     mouse_command: Option<EngineCommand>,
@@ -150,6 +151,7 @@ impl App {
             model_selected: 0,
             selected_model: None,
             selected_director_model: None,
+            selected_choice_model: None,
             selected_writer_model: None,
             model_reload_requested: false,
             mouse_command: None,
@@ -214,6 +216,10 @@ impl App {
         self.selected_writer_model.take()
     }
 
+    pub fn take_selected_choice_model(&mut self) -> Option<String> {
+        self.selected_choice_model.take()
+    }
+
     /// Consume a model-picker request to refresh the server list.
     pub fn take_model_reload_requested(&mut self) -> bool {
         std::mem::take(&mut self.model_reload_requested)
@@ -252,7 +258,7 @@ impl App {
         }
     }
 
-    /// Show the launcher. Kept safe so headless Story-screen consumers
+    /// Show the launcher. Kept explicit so headless Story-screen consumers
     /// can still construct an `App` directly without a launcher transition.
     pub fn show_home(&mut self) {
         self.home_visible = true;
@@ -493,6 +499,10 @@ impl App {
                 KeyCode::Char('d' | 'ㅇ') if self.list_mode == Some(ListMode::ModelPicker) => {
                     self.selected_director_model =
                         self.model_items.get(self.model_selected).cloned();
+                    self.list_mode = None;
+                }
+                KeyCode::Char('c' | 'ㅊ') if self.list_mode == Some(ListMode::ModelPicker) => {
+                    self.selected_choice_model = self.model_items.get(self.model_selected).cloned();
                     self.list_mode = None;
                 }
                 KeyCode::Char('w' | 'ㅈ') if self.list_mode == Some(ListMode::ModelPicker) => {
@@ -1343,6 +1353,7 @@ mod tests {
                 base_url: "http://127.0.0.1:8000".to_string(),
                 model: "a".to_string(),
                 director_model: None,
+                choice_model: None,
                 writer_model: None,
                 structured_output: "auto".to_string(),
                 request_timeout_ms: 1_000,
@@ -1369,6 +1380,10 @@ mod tests {
         app.refresh_models(vec!["a".to_string(), "b".to_string(), "c".to_string()], "a");
         app.handle_key(key(KeyCode::Enter), None);
         assert_eq!(app.take_selected_model().as_deref(), Some("b"));
+
+        app.handle_key(key(KeyCode::Char('p')), None);
+        app.handle_key(key(KeyCode::Char('c')), None);
+        assert_eq!(app.take_selected_choice_model().as_deref(), Some("b"));
     }
 
     #[test]
@@ -1379,6 +1394,7 @@ mod tests {
                 base_url: "http://127.0.0.1:8000".to_string(),
                 model: "a".to_string(),
                 director_model: None,
+                choice_model: None,
                 writer_model: None,
                 structured_output: "auto".to_string(),
                 request_timeout_ms: 1_000,

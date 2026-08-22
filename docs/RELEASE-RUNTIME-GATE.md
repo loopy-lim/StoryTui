@@ -24,6 +24,25 @@ Each item below is bounded by something code cannot deliver on its own:
 
 ## Gate checklist
 
+### G0 — Per-model Korean / structured / safe-content smoke
+
+**Goal:** reject a model configuration before a long playtest if either the
+Writer or lightweight choice model is missing, cannot satisfy StoryTUI's JSON
+contract, emits no Korean, violates the all-ages story policy, or
+collapses the three choices into duplicate/passive variants.
+
+```sh
+STORYTUI_MLX_URL=http://127.0.0.1:8000 \
+STORYTUI_MLX_MODEL='<writer-model-id>' \
+STORYTUI_MLX_CHOICE_MODEL='<choice-model-id>' \
+cargo test -p story-provider --test mlx_smoke -- --ignored --nocapture
+```
+
+**Pass criterion:** health/model-list/basic chat, compact choice-model gate,
+and full Writer turn gate all pass. Record model revisions, profile settings,
+wall time, token usage, and whether speculative decoding actually loaded (a
+silent native-engine fallback is not a DFlash pass).
+
 ### G1 — Real 100-turn session + server-kill / app-restart
 
 **Goal:** prove the engine survives a full 100-turn playthrough against a
@@ -63,6 +82,11 @@ triggered.
 `crates/story-core/tests/soak.rs` runs a 100-turn synthetic soak with the
 `MockProvider`; `crates/story-persistence/tests/save_round_trip.rs` runs a
 100-iteration save round-trip. Neither touches a real server.
+
+During the run, also inspect the long-context behavior described in
+[`CONTEXT-MANAGEMENT.md`](./CONTEXT-MANAGEMENT.md): the newest two turns remain
+raw, earlier turns use semantic digests, old choices/scene descriptions do not
+reappear as if new, and latency does not jump when the summary FIFO reaches 12.
 
 ### G2 — Clean-machine install repro
 

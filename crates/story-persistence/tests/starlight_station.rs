@@ -29,7 +29,7 @@ fn starlight_station_loads_with_zero_errors_and_zero_warnings() {
     assert_eq!(pack.metadata.story_id, "starlight-station");
     assert_eq!(pack.metadata.title, "별빛 정거장");
     assert_eq!(pack.metadata.language, "ko-KR");
-    assert!(pack.metadata.all_major_characters_safe);
+    assert_eq!(pack.metadata.rating, story_model::PackRating::Teen);
     assert_eq!(pack.metadata.default_choice_count, 3);
 
     assert_eq!(

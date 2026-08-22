@@ -4,7 +4,7 @@
 //! file into the DTOs in [`super::dto`], runs safety checks (file existence,
 //! UTF-8, per-file size limit, path safety), and assembles a canonical
 //! [`story_model::StoryPack`]. Schema-major compatibility and full
-//! referential / reachability / teen-metadata validation live in
+//! referential and reachability validation live in
 //! [`super::migrate`] and [`super::validate`] respectively; the loader calls
 //! them in the right order.
 //!
@@ -55,7 +55,8 @@ impl PackLoader {
 /// the public API stays a single function.
 struct LoadCtx<'a> {
     root: &'a Path,
-    /// Canonicalized absolute root, used for diagnostics.
+    /// Canonicalized absolute root, used both for diagnostics and as the
+    /// containment boundary for every Pack file read.
     canon_root: PathBuf,
     /// Resolved file paths (after `[files]` overrides + safety checks).
     paths: FilePaths,
@@ -89,9 +90,10 @@ impl<'a> LoadCtx<'a> {
                 detail: "Pack 루트 디렉터리가 없습니다".to_string(),
             });
         }
-        // Canonicalize for diagnostics; fall back to the raw path on failure
-        // (e.g. some sandboxes disallow canonicalize).
-        let canon_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        // A non-canonical root cannot safely anchor child containment checks,
+        // so fail closed instead of falling back to a potentially relative
+        // path.
+        let canon_root = root.canonicalize().map_err(PackError::Io)?;
         Ok(Self {
             root,
             canon_root,
@@ -149,6 +151,7 @@ impl<'a> LoadCtx<'a> {
         // Cross-major is rejected via UnsupportedSchemaVersion; same-major
         // continues with in-memory default-fill.
         crate::pack::migrate::check_schema_compat(&story_dto, &mut self.errors);
+        crate::pack::migrate::check_engine_compat(&story_dto, &mut self.errors);
         let story_dto = match crate::pack::migrate::migrate_in_memory(&story_dto) {
             Ok(d) => d,
             Err(e) => {
@@ -243,7 +246,7 @@ impl<'a> LoadCtx<'a> {
             pack_root: self.canon_root.clone(),
         };
 
-        // Phase 7: referential integrity + reachability + teen policy.
+        // Phase 7: referential integrity + reachability.
         crate::pack::validate::validate_all(&pack, &mut self.errors);
 
         // Phase 8: hand the assembled pack to the caller via finish().
@@ -330,14 +333,30 @@ impl<'a> LoadCtx<'a> {
     /// Read `path` as UTF-8 text. Maps low-level problems into `self.errors`
     /// and returns `None` when no usable string is available.
     fn read_text(&mut self, label: &str, path: &Path) -> Option<String> {
-        if !path.exists() {
-            self.errors.push(PackError::missing_file(
-                label,
-                format!("경로: {}", path.display()),
-            ));
+        // Resolve symlinks before reading and then read the canonical target.
+        // This prevents an in-Pack path from escaping the Pack root through a
+        // file or parent-directory symlink.
+        let canonical = match path.canonicalize() {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.errors.push(PackError::missing_file(
+                    label,
+                    format!("경로: {}", path.display()),
+                ));
+                return None;
+            }
+            Err(error) => {
+                self.errors.push(PackError::Io(error));
+                return None;
+            }
+        };
+        if !canonical.starts_with(&self.canon_root) {
+            self.errors.push(PackError::UnsafePath {
+                path: path.display().to_string(),
+            });
             return None;
         }
-        let bytes = match std::fs::read(path) {
+        let bytes = match std::fs::read(&canonical) {
             Ok(b) => b,
             Err(e) => {
                 self.errors.push(PackError::Io(e));

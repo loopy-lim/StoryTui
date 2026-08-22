@@ -5,7 +5,7 @@ Status: Approved (brainstorming complete)
 
 ## Problem
 
-Weaker local models (e.g. `private-local-model`) replay earlier beats: a new scene
+Weaker local models can replay earlier beats: a new scene
 appears without error but reuses an old mood/image/plot point. Root cause
 established in the prior debugging pass:
 

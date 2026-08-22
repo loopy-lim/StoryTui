@@ -160,7 +160,7 @@ fn delete_missing_slot_is_ok() {
 fn slot_path_is_root_slash_slot_id_json() {
     let dir = tempdir().unwrap();
     let store = SaveStore::open(dir.path()).unwrap();
-    let p = store.slot_path("autosave");
+    let p = store.slot_path("autosave").unwrap();
     assert_eq!(p.file_name().unwrap(), "autosave.json");
     assert_eq!(p.parent().unwrap(), dir.path());
 }
@@ -183,7 +183,7 @@ fn load_diagnoses_truncated_json() {
     store.save(envelope("slot-1", 1)).unwrap();
 
     // Truncate the file.
-    let path = store.slot_path("slot-1");
+    let path = store.slot_path("slot-1").unwrap();
     let original = std::fs::read(&path).unwrap();
     let half = &original[..original.len() / 2];
     std::fs::write(&path, half).unwrap();
@@ -202,7 +202,7 @@ fn load_diagnoses_checksum_mismatch_and_leaves_file_untouched() {
 
     // Tamper with the on-disk JSON: flip one character in the narration-ish
     // payload region. Find a digit in the JSON and bump it.
-    let path = store.slot_path("slot-1");
+    let path = store.slot_path("slot-1").unwrap();
     let mut bytes = std::fs::read(&path).unwrap();
     // Find a numeric character in the payload section (after "payload").
     let payload_idx = bytes
@@ -230,4 +230,22 @@ fn load_diagnoses_checksum_mismatch_and_leaves_file_untouched() {
     // mutates). Re-tampering back would still mismatch by construction.
     let still_tampered = std::fs::read(&path).unwrap();
     assert_eq!(still_tampered, bytes);
+}
+
+#[test]
+fn unsafe_slot_ids_are_rejected_before_filesystem_access() {
+    let dir = tempdir().unwrap();
+    let store = SaveStore::open(dir.path()).unwrap();
+    for invalid in ["", "../outside", "nested/slot", "slot.json", "슬롯"] {
+        assert!(store.slot_path(invalid).is_err(), "must reject {invalid:?}");
+        assert!(matches!(
+            store.load(invalid),
+            Err(SaveError::InvalidSlotId(id)) if id == invalid
+        ));
+        assert!(store.delete(invalid).is_err());
+        assert!(store.save(envelope(invalid, 1)).is_err());
+    }
+    let too_long = "a".repeat(story_persistence::json_store::MAX_SLOT_ID_LEN + 1);
+    assert!(store.slot_path(&too_long).is_err());
+    assert!(dir.path().read_dir().unwrap().next().is_none());
 }

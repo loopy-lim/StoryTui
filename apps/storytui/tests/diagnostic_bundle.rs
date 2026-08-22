@@ -97,6 +97,7 @@ fn build_diagnostic_bundle_from_safe_value() {
         base_url: "http://192.168.0.5:8080".to_string(),
         model: "mlx-community/x".to_string(),
         director_model: None,
+        choice_model: None,
         writer_model: None,
         structured_output: "off".to_string(),
         request_timeout_ms: 60_000,

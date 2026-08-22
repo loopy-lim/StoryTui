@@ -2408,6 +2408,7 @@ dependencies = [
  "story-persistence",
  "story-provider",
  "story-tui",
+ "tempfile",
  "tokio",
  "tokio-util",
  "toml",

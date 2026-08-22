@@ -137,6 +137,33 @@ async fn generation_uses_sampling_values_from_provider_config() {
 }
 
 #[tokio::test]
+async fn generation_honors_request_model_and_smaller_output_cap() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(envelope(VALID_TURN)))
+        .mount(&server)
+        .await;
+
+    let mut config = cfg_for(&server);
+    config.model = "writer-27b".to_string();
+    config.max_tokens = 8_192;
+    let provider = OpenAiCompatibleProvider::new(config).expect("provider");
+    let mut request = turn_request();
+    request.model = "choice-4b".to_string();
+    request.max_tokens = 700;
+    provider
+        .generate_turn(request, CancellationToken::new())
+        .await
+        .expect("valid response");
+
+    let requests = server.received_requests().await.expect("recorded request");
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("JSON body");
+    assert_eq!(body["model"], "choice-4b");
+    assert_eq!(body["max_tokens"], 700);
+}
+
+#[tokio::test]
 async fn short_valid_scene_gets_one_best_effort_expansion_without_becoming_an_error() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

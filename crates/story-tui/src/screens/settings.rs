@@ -19,6 +19,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use story_model::{ProviderConfigSafe, ProviderHealth};
 
 use crate::screens::keymap::keymap_lines;
+use crate::screens::model_display_label;
 
 /// Minimum supported terminal size for the Settings screen.
 pub const MIN_WIDTH: u16 = 80;
@@ -125,22 +126,24 @@ fn render_provider_block(frame: &mut Frame, area: Rect, view: &SettingsView<'_>)
     ]));
     lines.push(Line::from(vec![
         Span::raw("model      : "),
-        Span::raw(if view.provider.model.is_empty() {
-            "(미지정)".to_string()
-        } else {
-            view.provider.model.clone()
-        }),
+        Span::raw(model_display_label(&view.provider.model)),
     ]));
     if let Some(dm) = &view.provider.director_model {
         lines.push(Line::from(vec![
             Span::styled("director   : ", Style::default().fg(Color::Yellow)),
-            Span::raw(dm.clone()),
+            Span::raw(model_display_label(dm)),
+        ]));
+    }
+    if let Some(cm) = &view.provider.choice_model {
+        lines.push(Line::from(vec![
+            Span::styled("choice     : ", Style::default().fg(Color::Cyan)),
+            Span::raw(model_display_label(cm)),
         ]));
     }
     if let Some(wm) = &view.provider.writer_model {
         lines.push(Line::from(vec![
             Span::styled("writer     : ", Style::default().fg(Color::Green)),
-            Span::raw(wm.clone()),
+            Span::raw(model_display_label(wm)),
         ]));
     }
     lines.push(Line::from(vec![
@@ -282,6 +285,7 @@ mod tests {
             base_url: "http://127.0.0.1:8080".to_string(),
             model: "m".to_string(),
             director_model: None,
+            choice_model: None,
             writer_model: None,
             structured_output: "auto".to_string(),
             request_timeout_ms: 180_000,

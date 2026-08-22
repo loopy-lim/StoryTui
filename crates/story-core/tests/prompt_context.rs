@@ -31,8 +31,7 @@ fn sample_metadata() -> PackMetadata {
         title: "비가 그친 뒤".to_string(),
         language: "ko-KR".to_string(),
         genres: vec!["modern-romance".to_string()],
-        rating: PackRating::teen,
-        all_major_characters_safe: true,
+        rating: PackRating::Teen,
         default_choice_count: 3,
         initial_state: PackInitialState {
             chapter: "chapter-1".to_string(),
@@ -41,7 +40,6 @@ fn sample_metadata() -> PackMetadata {
             time_slot: TimeSlot::Evening,
         },
         content: PackContentPolicy {
-            safe_content: "permitted_by_pack".to_string(),
             violence: "mild".to_string(),
         },
     }
@@ -314,6 +312,12 @@ fn prompt_carries_character_canon_event_rules_and_progress_state() {
     state
         .occurred_events
         .insert("event.first_meeting".to_string());
+    state
+        .characters
+        .get_mut(&CharacterId("yuna".to_string()))
+        .expect("live yuna state")
+        .known_facts
+        .insert("플레이어가 반송 편지를 발견했다".to_string());
 
     let bundle = build_prompt(&pack, &state, &recent, None);
     assert!(bundle.user.contains("감정을 단정하지 않고 증거를 확인한다"));
@@ -335,10 +339,38 @@ fn prompt_carries_character_canon_event_rules_and_progress_state() {
     );
     assert!(bundle.user.contains("\"active_route\":\"reconciliation\""));
     assert!(bundle.user.contains("event.first_meeting"));
+    assert!(bundle.user.contains("# Live character knowledge"));
+    assert!(bundle.user.contains("플레이어가 반송 편지를 발견했다"));
     assert!(
         bundle
             .user
             .contains("\"current_scene_id\":\"cafe-reunion\"")
+    );
+}
+
+#[test]
+fn pack_owned_context_is_a_stable_prefix_before_dynamic_state() {
+    let (pack, state, recent) = fixture(false);
+    let bundle = build_prompt(&pack, &state, &recent, None);
+    let position = |heading: &str| {
+        bundle
+            .user
+            .find(heading)
+            .unwrap_or_else(|| panic!("missing prompt heading: {heading}"))
+    };
+
+    assert!(position("# World") < position("# Character canon and voice"));
+    assert!(
+        position("# Character canon and voice") < position("# Story progression rules"),
+        "character canon and progression rules form the stable pack prefix"
+    );
+    assert!(
+        position("# Story progression rules") < position("# Current state"),
+        "turn-varying state must not split the stable pack prefix"
+    );
+    assert!(
+        position("# Current state") < position("# Live character knowledge"),
+        "live knowledge belongs with dynamic engine state"
     );
 }
 
@@ -451,6 +483,69 @@ fn earlier_turns_beyond_the_window_appear_as_a_recap() {
         .nth(1)
         .unwrap_or_default();
     assert!(!recent_section.contains("오래전 첫 만남"));
+}
+
+#[test]
+fn earlier_recap_prefers_semantic_summaries_over_raw_prose() {
+    let (pack, mut state, _) = fixture(false);
+    let recent = (1..=6)
+        .map(|turn| recap_history_entry(turn, &format!("원문 장면 {turn}은 재생하지 않는다.")))
+        .collect::<Vec<_>>();
+    state
+        .recent_summaries
+        .extend((1..=6).map(|turn| format!("의미 요약 {turn}: 관계에서 확인된 변화")));
+
+    let bundle = build_prompt(&pack, &state, &recent, None);
+    let recap = bundle
+        .user
+        .split("# Earlier story")
+        .nth(1)
+        .unwrap_or_default()
+        .split("# Current state")
+        .next()
+        .unwrap_or_default();
+
+    assert!(recap.contains("의미 요약 1"));
+    assert!(recap.contains("의미 요약 4"));
+    assert!(!recap.contains("원문 장면 1"));
+    assert!(!recap.contains("원문 장면 4"));
+}
+
+#[test]
+fn bounded_summary_fifo_stays_aligned_with_long_history_tail() {
+    let (pack, mut state, _) = fixture(false);
+    let recent = (1..=15)
+        .map(|turn| recap_history_entry(turn, &format!("원문-{turn}")))
+        .collect::<Vec<_>>();
+    // Production keeps only the newest 12 summaries: turns 4 through 15.
+    state
+        .recent_summaries
+        .extend((4..=15).map(|turn| format!("요약-{turn}")));
+
+    let bundle = build_prompt(&pack, &state, &recent, None);
+    let recap = bundle
+        .user
+        .split("# Earlier story")
+        .nth(1)
+        .unwrap_or_default()
+        .split("# Current state")
+        .next()
+        .unwrap_or_default();
+    let arc = bundle
+        .user
+        .split("# Recent arc")
+        .nth(1)
+        .unwrap_or_default()
+        .split("# Engine-owned choice design")
+        .next()
+        .unwrap_or_default();
+
+    assert!(recap.contains("요약-4"));
+    assert!(recap.contains("요약-13"));
+    assert!(!recap.contains("원문-13"));
+    assert!(arc.contains("요약-14"));
+    assert!(arc.contains("요약-15"));
+    assert!(!arc.contains("원문-14"));
 }
 
 #[test]

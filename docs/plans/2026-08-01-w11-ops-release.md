@@ -51,7 +51,7 @@ This satisfies "benchmark reproduces identical prompt bundles" at the code level
 ## Part E — release docs (docs/)
 - `docs/INSTALL.md`: prerequisites (macOS 15+, Rust, Python venv, MLX server), build, run, the loopback provider default + non-loopback warning, the `--ignored` real-MLX smoke.
 - `docs/RELEASE-RUNTIME-GATE.md`: the OPEN runtime gate checklist (real 100-turn + server-kill/restart, clean-machine install repro, blind Korean eval ≥3.8/5, Apple Silicon binary + checksum, second-Pack swap) — explicitly NOT done, with the exact reproduction commands a future operator runs.
-- `docs/KNOWN-LIMITATIONS.md`: model-license/teen-pack principles, the `apps/storytui` interactive host loop not yet wired (library-tested via integration tests + 3-turn Mock E2E), MVP quality metrics pending real model.
+- `docs/KNOWN-LIMITATIONS.md`: model-license/safe-pack principles, the `apps/storytui` interactive host loop not yet wired (library-tested via integration tests + 3-turn Mock E2E), MVP quality metrics pending real model.
 - Update root `README.md` with a status section: milestones W0–W11 code-complete; runtime gates open.
 
 ## Tasks (TDD)

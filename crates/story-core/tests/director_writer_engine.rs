@@ -40,7 +40,6 @@ fn sample_pack() -> StoryPack {
         language: "ko-KR".to_string(),
         genres: vec!["drama".to_string()],
         rating: PackRating::General,
-        all_major_characters_safe: true,
         default_choice_count: 3,
         initial_state: PackInitialState {
             chapter: "chapter-1".to_string(),
@@ -49,7 +48,6 @@ fn sample_pack() -> StoryPack {
             time_slot: TimeSlot::Morning,
         },
         content: PackContentPolicy {
-            safe_content: "none".to_string(),
             violence: "none".to_string(),
         },
     };
@@ -125,9 +123,9 @@ fn valid_draft(generation_id: uuid::Uuid) -> GeneratedTurnDraft {
         generation_id,
         narration: "비가 그쳤다.".to_string(),
         choices: vec![
-            choice("choice-0", "다시 만난다", RiskLevel::Low),
-            choice("choice-1", "돌아선다", RiskLevel::Medium),
-            choice("choice-2", "기다린다", RiskLevel::Safe),
+            choice("choice-0", "떠난 이유를 솔직하게 묻는다", RiskLevel::High),
+            choice("choice-1", "탁자의 편지를 꺼내 읽어본다", RiskLevel::Low),
+            choice("choice-2", "대화를 위해 복도로 이동한다", RiskLevel::Medium),
         ],
         proposed_patch: patch,
         summary: TurnSummary {
@@ -158,7 +156,7 @@ fn valid_plan() -> DirectorPlan {
         must_not_reveal_fact_ids: vec![],
         proposed_patch: patch,
         choices: vec![
-            choice("next-0", "솔직하게 묻는다", RiskLevel::High),
+            choice("next-0", "전시회 약속을 먼저 사과한다", RiskLevel::High),
             choice("next-1", "구체적인 단서를 확인한다", RiskLevel::Low),
             choice("next-2", "다른 장소로 이동한다", RiskLevel::Medium),
         ],

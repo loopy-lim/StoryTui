@@ -232,6 +232,16 @@ fn build_user(
     s.push_str(&pack.world_md);
     s.push_str("\n\n# Style\n");
     s.push_str(&pack.style_md);
+
+    // Keep pack-owned, turn-invariant material at the front of the user
+    // message. Local runtimes can reuse this stable prefix across turns while
+    // all state-, history-, and recall-dependent material stays below it.
+    s.push_str("\n\n# Character canon and voice (pack-owned)\n");
+    s.push_str(&character_canon_context(pack));
+
+    s.push_str("\n# Story progression rules (engine-authoritative)\n");
+    s.push_str(&progression_context(pack));
+
     if recent.is_empty() {
         s.push_str("\n\n# Opening (first turn only)\n");
         s.push_str(&pack.opening_md);
@@ -248,7 +258,7 @@ fn build_user(
     // numbers, and tends to repeat or regress earlier beats — especially weaker
     // local models. The recap is bounded; the provider applies its final context
     // bound afterwards.
-    s.push_str(&earlier_recap(earlier));
+    s.push_str(&earlier_recap(full, earlier.len(), &state.recent_summaries));
 
     s.push_str("\n\n# Current state\n");
     s.push_str(&state_snapshot_json(state));
@@ -256,11 +266,8 @@ fn build_user(
     s.push_str("\n\n# Relationship ledger (engine-owned)\n");
     s.push_str(&relationship_ledger(state));
 
-    s.push_str("\n# Character canon and voice (pack-owned)\n");
-    s.push_str(&character_context(pack, state));
-
-    s.push_str("\n# Story progression rules (engine-authoritative)\n");
-    s.push_str(&progression_context(pack));
+    s.push_str("\n# Live character knowledge (engine-owned)\n");
+    s.push_str(&character_live_context(pack, state));
 
     s.push_str("\n# Current dramatic beat\n");
     s.push_str(&dramatic_brief(state, &recall.included));
@@ -286,7 +293,7 @@ fn build_user(
     }
 
     // Compact semantic digest of the recent arc (model interpretation when
-    // stored, else narration first clause) plus an safe repetition flag.
+    // stored, else narration first clause) plus an explicit repetition flag.
     // Replaces the earlier surface-level anti-repeat phrase list — strictly
     // richer.
     s.push_str(&recent_arc_block(state, full));
@@ -339,13 +346,12 @@ fn build_user(
     s
 }
 
-fn character_context(pack: &StoryPack, state: &GameState) -> String {
+fn character_canon_context(pack: &StoryPack) -> String {
     let mut out = String::new();
     out.push_str(
-        "Treat voice, knowledge, goals, and boundaries below as canon. Unknown facts and secrets are private: do not reveal or let a character act on them unless the live state or an authorized event has established that knowledge.\n",
+        "Treat voice, canonical knowledge, goals, and boundaries below as canon. Unknown facts and secrets are private: do not reveal or let a character act on them unless the live state or an authorized event has established that knowledge.\n",
     );
     for (id, def) in &pack.characters {
-        let live = state.characters.get(id);
         out.push_str(&format!("## {} ({})\n", def.name, id.0));
         if let Some(age) = def.age {
             out.push_str(&format!("age: {age}\n"));
@@ -362,19 +368,40 @@ fn character_context(pack: &StoryPack, state: &GameState) -> String {
         append_value(&mut out, "current_goal", &def.current_goal);
         append_value(&mut out, "long_term_desire", &def.long_term_desire);
         append_list(&mut out, "canonical_known_facts", &def.known_facts);
-        if let Some(live) = live {
-            let known: Vec<String> = live.known_facts.iter().cloned().collect();
-            append_list(&mut out, "live_known_facts", &known);
-            if !live.address_form_overrides.is_empty() {
-                out.push_str(&format!(
-                    "live_address_forms: {}\n",
-                    serde_json::to_string(&live.address_form_overrides)
-                        .unwrap_or_else(|_| "{}".to_string())
-                ));
-            }
-        }
         append_list(&mut out, "PRIVATE_unknown_facts", &def.unknown_facts);
         append_list(&mut out, "PRIVATE_secrets", &def.secrets);
+    }
+    out
+}
+
+fn character_live_context(pack: &StoryPack, state: &GameState) -> String {
+    let mut out = String::from(
+        "These are facts and forms of address established during play. They override neither private canon nor the relationship ledger.\n",
+    );
+    let mut included = 0_usize;
+    for (id, live) in &state.characters {
+        if live.known_facts.is_empty() && live.address_form_overrides.is_empty() {
+            continue;
+        }
+        included += 1;
+        let name = pack
+            .characters
+            .get(id)
+            .map(|character| character.name.as_str())
+            .unwrap_or(id.0.as_str());
+        out.push_str(&format!("## {name} ({})\n", id.0));
+        let known: Vec<String> = live.known_facts.iter().cloned().collect();
+        append_list(&mut out, "live_known_facts", &known);
+        if !live.address_form_overrides.is_empty() {
+            out.push_str(&format!(
+                "live_address_forms: {}\n",
+                serde_json::to_string(&live.address_form_overrides)
+                    .unwrap_or_else(|_| "{}".to_string())
+            ));
+        }
+    }
+    if included == 0 {
+        out.push_str("(no additional live character knowledge)\n");
     }
     out
 }
@@ -549,15 +576,23 @@ const EARLIER_RECAP_MAX_ENTRIES: usize = 12;
 /// Per-entry narration cap. The recap is continuity, not replay: one beat per
 /// earlier turn is enough to prevent regression/repetition.
 const EARLIER_RECAP_PER_NARRATION: usize = 160;
+/// Semantic digests can carry a little more detail than raw prose because they
+/// are already condensed to the consequence of the turn.
+const EARLIER_RECAP_PER_SUMMARY: usize = 240;
 
 /// Render a compact, bounded recap of the turns before the recent window.
 /// Returns an empty string when there is nothing earlier (keeps the prompt
 /// byte-identical for short sessions, so the golden snapshot is unaffected).
-fn earlier_recap(earlier: &[HistoryEntry]) -> String {
-    if earlier.is_empty() {
+fn earlier_recap(
+    full: &[HistoryEntry],
+    earlier_len: usize,
+    summaries: &std::collections::VecDeque<String>,
+) -> String {
+    if earlier_len == 0 {
         return String::new();
     }
-    let start = earlier.len().saturating_sub(EARLIER_RECAP_MAX_ENTRIES);
+    let earlier = &full[..earlier_len];
+    let start = earlier_len.saturating_sub(EARLIER_RECAP_MAX_ENTRIES);
     let mut s = String::from(
         "\n\n# Earlier story (recap — continuity only; do not reproduce these lines)\n",
     );
@@ -568,9 +603,13 @@ fn earlier_recap(earlier: &[HistoryEntry]) -> String {
             earlier[start].turn
         ));
     }
-    for h in &earlier[start..] {
+    for (index, h) in earlier.iter().enumerate().skip(start) {
         s.push_str(&format!("## turn {} ({})\n", h.turn, h.scene_id));
-        s.push_str(&truncate_prose(&h.narration, EARLIER_RECAP_PER_NARRATION));
+        let digest = stored_summary_for_history_index(summaries, full.len(), index)
+            .filter(|summary| !summary.trim().is_empty())
+            .map(|summary| truncate_prose(summary, EARLIER_RECAP_PER_SUMMARY))
+            .unwrap_or_else(|| truncate_prose(&h.narration, EARLIER_RECAP_PER_NARRATION));
+        s.push_str(&digest);
         s.push('\n');
         if let Some(act) = &h.player_action {
             s.push_str(&format!("action: {}\n", act.content));
@@ -606,12 +645,11 @@ fn recent_arc_block(state: &GameState, full: &[HistoryEntry]) -> String {
         return String::new();
     }
     let stored = &state.recent_summaries;
-    let aligned = stored.len() == full.len();
-    // Digest for the i-th full-history turn: the stored summary when aligned
-    // and non-empty, else the narration's first clause (covers old saves whose
-    // `recent_summaries` is empty).
+    // `recent_summaries` is a bounded FIFO, so after its cap is reached it
+    // aligns with the tail of full history rather than having the same length.
+    // Fall back to narration for old saves without a digest at this index.
     let digest_for = |i: usize| -> String {
-        let stored_entry = if aligned { stored.get(i) } else { None };
+        let stored_entry = stored_summary_for_history_index(stored, full.len(), i);
         if let Some(entry) = stored_entry {
             let trimmed = entry.trim();
             if !trimmed.is_empty() {
@@ -643,6 +681,25 @@ fn recent_arc_block(state: &GameState, full: &[HistoryEntry]) -> String {
         ));
     }
     s
+}
+
+/// Map a full-history index onto the bounded summary FIFO. Summaries are
+/// appended once per accepted turn and trimmed from the front, so a shorter
+/// queue always represents the newest `queue.len()` history entries.
+fn stored_summary_for_history_index(
+    summaries: &std::collections::VecDeque<String>,
+    history_len: usize,
+    history_index: usize,
+) -> Option<&str> {
+    if summaries.is_empty() || history_index >= history_len {
+        return None;
+    }
+    let stored_len = summaries.len().min(history_len);
+    let stored_start = history_len - stored_len;
+    history_index
+        .checked_sub(stored_start)
+        .and_then(|index| summaries.get(index))
+        .map(String::as_str)
 }
 
 /// Extract the opening clause of a narration: up to the first sentence ender
@@ -749,7 +806,6 @@ mod tests {
                 language: "ko-KR".to_string(),
                 genres: vec![],
                 rating: story_model::PackRating::General,
-                all_major_characters_safe: true,
                 default_choice_count: 3,
                 initial_state: story_model::PackInitialState {
                     chapter: "c".to_string(),
@@ -758,7 +814,6 @@ mod tests {
                     time_slot: story_model::TimeSlot::Morning,
                 },
                 content: story_model::PackContentPolicy {
-                    safe_content: "none".to_string(),
                     violence: "none".to_string(),
                 },
             },

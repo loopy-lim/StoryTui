@@ -6,7 +6,6 @@ title = "비가 그친 뒤"
 language = "ko-KR"
 genres = ["modern-romance", "drama"]
 rating = "teen"
-all_major_characters_safe = true
 default_choice_count = 3
 
 [initial_state]
@@ -16,5 +15,4 @@ location = "cafe-namu"
 time_slot = "evening"
 
 [content]
-safe_content = "permitted_by_pack"
 violence = "mild"

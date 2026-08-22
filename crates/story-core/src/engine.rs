@@ -27,7 +27,7 @@ use story_model::{
     ActionType, AppViewModel, CharacterId, CharacterState, ChoiceRef, DirectorPlan,
     DirectorRequest, DomainErrorView, Emotion, GameState, GeneratedTurnDraft, HistoryEntry,
     LoadingState, PackMetadata, ParsedAction, SavePayload, Screen, StateChangeLog, StatePatch,
-    StoryPack, StoryRules, TurnRequest, WriterFinish, WriterRequest,
+    StoryPack, StoryRules, TurnRequest, TurnSummary, WriterFinish, WriterRequest,
 };
 
 use crate::director::{ValidatedPlan, validate_plan};
@@ -155,6 +155,12 @@ pub struct PendingGeneration {
     /// `true` only for an internal choice refresh after an already accepted
     /// turn. Its response replaces choices but never applies narration/patch.
     pub choice_refresh: bool,
+    /// Bounded automatic attempt number for choice-only refreshes. Ordinary
+    /// turn generations use zero; refreshes use one and may retry once.
+    pub choice_refresh_attempt: u8,
+    /// Choice sets rejected during this refresh cycle. A retry receives and
+    /// validates against them so it cannot repeat the first failed rewrite.
+    pub choice_refresh_rejected: Vec<story_model::Choice>,
     /// Present only during the one engine-owned narration repair attempt.
     /// The single-pass variant retains the first draft as the authority for
     /// choices, patch, and summary; the Writer variant retains only the
@@ -325,6 +331,8 @@ fn reduce_start_new_game(state: &EngineState, pack: &StoryPack) -> Result<Transi
         player_action: None,
         validated_plan: None,
         choice_refresh: false,
+        choice_refresh_attempt: 0,
+        choice_refresh_rejected: Vec::new(),
         narration_repair: None,
     };
     let mut next = clone_state(state);
@@ -396,6 +404,8 @@ fn reduce_submit_choice(
         player_action: None,
         validated_plan: None,
         choice_refresh: false,
+        choice_refresh_attempt: 0,
+        choice_refresh_rejected: Vec::new(),
         narration_repair: None,
     };
     let request = build_turn_request(
@@ -450,6 +460,8 @@ fn reduce_submit_free_action(
         player_action: Some(action.clone()),
         validated_plan: None,
         choice_refresh: false,
+        choice_refresh_attempt: 0,
+        choice_refresh_rejected: Vec::new(),
         narration_repair: None,
     };
     let request = build_turn_request(generation_id, pack, &state.game, Some(&action), None);
@@ -494,6 +506,8 @@ fn reduce_regenerate(state: &EngineState, pack: &StoryPack) -> Transition {
         // 2-stage path the host will re-issue a new Director request.
         validated_plan: None,
         choice_refresh: pending.choice_refresh,
+        choice_refresh_attempt: if pending.choice_refresh { 1 } else { 0 },
+        choice_refresh_rejected: pending.choice_refresh_rejected.clone(),
         narration_repair: None,
     };
     let selected_choice = pending.checkpoint.history.last().and_then(|entry| {
@@ -511,7 +525,13 @@ fn reduce_regenerate(state: &EngineState, pack: &StoryPack) -> Transition {
     let request_effect = if pending.choice_refresh {
         EngineEffect::RequestGeneration {
             generation_id,
-            request: build_choice_refresh_request(generation_id, pack, &pending.checkpoint, None),
+            request: build_choice_refresh_request(
+                generation_id,
+                pack,
+                &pending.checkpoint,
+                None,
+                &pending.choice_refresh_rejected,
+            ),
         }
     } else if state.use_director_writer {
         EngineEffect::RequestDirector {
@@ -812,9 +832,11 @@ fn begin_choice_refresh(
         player_action: None,
         validated_plan: None,
         choice_refresh: true,
+        choice_refresh_attempt: 1,
+        choice_refresh_rejected: Vec::new(),
         narration_repair: None,
     };
-    let request = build_choice_refresh_request(generation_id, pack, &state.game, Some(report));
+    let request = build_choice_refresh_request(generation_id, pack, &state.game, Some(report), &[]);
     let mut next = clone_state(state);
     next.pending = Some(pending.clone());
     next.retry_pending = None;
@@ -848,42 +870,44 @@ fn reduce_accept_choice_refresh(
     state: &EngineState,
     pack: &StoryPack,
     pending: &PendingGeneration,
-    draft: story_model::GeneratedTurnDraft,
+    mut draft: story_model::GeneratedTurnDraft,
 ) -> Transition {
     // Provider recovery verifies the JSON shape. The engine owns whether the
     // replacement is actually playable and interesting.
-    let rejected_offers = pending
+    // The compact refresh contract has fixed dramatic slots; risk is metadata
+    // owned by those slots, not a reason to spend another model invocation.
+    for (index, choice) in draft.choices.iter_mut().enumerate() {
+        choice.risk = crate::choice_quality::risk_for_slot(&pending.checkpoint, pack, index);
+    }
+    let mut rejected_offers = pending
         .checkpoint
         .history
         .last()
-        .map(|entry| entry.choices.as_slice());
+        .map(|entry| entry.choices.clone())
+        .unwrap_or_default();
+    rejected_offers.extend(pending.choice_refresh_rejected.iter().cloned());
     let quality = crate::choice_quality::assess_choices(
         &pending.checkpoint,
         &draft.choices,
         pack.default_choice_count() as usize,
-        rejected_offers,
+        Some(&rejected_offers),
     );
-    if !quality.is_ok() {
-        return reduce_provider_failed(
-            state,
-            pack,
-            pending.generation_id,
-            DomainErrorView {
-                code: "choice_quality_failed".to_string(),
-                title_ko: "재미있는 선택지를 만들지 못했습니다".to_string(),
-                message_ko: format!(
-                    "새 선택지가 여전히 반복되거나 결과 차이가 부족해 기존 선택지를 유지했습니다. R로 선택지만 다시 만들 수 있습니다. ({})",
-                    quality.repair_instructions().replace('\n', " ")
-                ),
-                recoverable: true,
-            },
-        );
+    if !quality.is_playable() {
+        // One targeted retry is enough. Growing the rejected-offer pool across
+        // three attempts made later attempts less likely to pass and delayed a
+        // player even though the accepted scene and prior choices were valid.
+        if pending.choice_refresh_attempt < 2 {
+            return retry_choice_refresh(state, pack, pending, draft.choices, &quality);
+        }
+        return finish_choice_refresh_with_existing(state, pack, pending);
     }
     let mut next = clone_state(state);
     if let Some(entry) = next.game.history.last_mut() {
         entry.choices = draft.choices;
     }
     next.game.revision = next.game.revision.saturating_add(1);
+    let refreshed_game = next.game.clone();
+    upsert_current_checkpoint(&mut next.checkpoints, &refreshed_game);
     next.pending = None;
     next.retry_pending = None;
     next.lineage.clear();
@@ -898,6 +922,64 @@ fn reduce_accept_choice_refresh(
     Transition {
         state: next,
         effects,
+        audit: Vec::new(),
+    }
+}
+
+fn finish_choice_refresh_with_existing(
+    state: &EngineState,
+    pack: &StoryPack,
+    pending: &PendingGeneration,
+) -> Transition {
+    let mut next = clone_state(state);
+    next.game = pending.checkpoint.clone();
+    next.pending = None;
+    next.retry_pending = None;
+    next.lineage.clear();
+    let view = build_view(&next, pack, None, None);
+    Transition {
+        state: next,
+        effects: vec![EngineEffect::PublishView(Box::new(view))],
+        audit: Vec::new(),
+    }
+}
+
+fn retry_choice_refresh(
+    state: &EngineState,
+    pack: &StoryPack,
+    pending: &PendingGeneration,
+    rejected: Vec<story_model::Choice>,
+    report: &crate::choice_quality::ChoiceQualityReport,
+) -> Transition {
+    let generation_id = Uuid::new_v4();
+    let mut all_rejected = pending.choice_refresh_rejected.clone();
+    all_rejected.extend(rejected);
+    let mut retried = pending.clone();
+    retried.generation_id = generation_id;
+    retried.choice_refresh_attempt = pending.choice_refresh_attempt.saturating_add(1);
+    retried.choice_refresh_rejected = all_rejected.clone();
+
+    let request = build_choice_refresh_request(
+        generation_id,
+        pack,
+        &pending.checkpoint,
+        Some(report),
+        &all_rejected,
+    );
+    let mut next = clone_state(state);
+    next.pending = Some(retried.clone());
+    next.retry_pending = None;
+    next.lineage.push(generation_id);
+    let view = build_view(&next, pack, Some(&retried), None);
+    Transition {
+        state: next,
+        effects: vec![
+            EngineEffect::RequestGeneration {
+                generation_id,
+                request,
+            },
+            EngineEffect::PublishView(Box::new(view)),
+        ],
         audit: Vec::new(),
     }
 }
@@ -1045,6 +1127,8 @@ fn reduce_submit_choice_director(
         player_action: None,
         validated_plan: None,
         choice_refresh: false,
+        choice_refresh_attempt: 0,
+        choice_refresh_rejected: Vec::new(),
         narration_repair: None,
     };
     let request = build_director_request(generation_id, pack, &state.game, None, selected_choice);
@@ -1091,6 +1175,8 @@ fn reduce_submit_free_action_director(
         player_action: Some(action.clone()),
         validated_plan: None,
         choice_refresh: false,
+        choice_refresh_attempt: 0,
+        choice_refresh_rejected: Vec::new(),
         narration_repair: None,
     };
     let request = build_director_request(generation_id, pack, &state.game, Some(&action), None);
@@ -1142,7 +1228,7 @@ fn reduce_accept_director_plan(
                 pack.default_choice_count() as usize,
                 None,
             );
-            if !quality.is_ok() {
+            if !quality.is_playable() {
                 return Ok(reduce_provider_failed(
                     state,
                     pack,
@@ -1341,6 +1427,31 @@ pub fn turn_digest(narration: &str, interpretation: Option<&str>) -> String {
     crate::prompt_context::first_clause(narration, 120)
 }
 
+/// Accept a model-authored semantic digest only when every declared source id
+/// resolves to committed history. A summary with no explicit sources is
+/// anchored to the just-created current entry by the engine. Invalid
+/// provenance discards only the derived interpretation; the already validated
+/// narration remains authoritative.
+fn validated_turn_digest(
+    narration: &str,
+    summary: &TurnSummary,
+    history: &[HistoryEntry],
+) -> String {
+    let Some(current) = history.last() else {
+        return turn_digest(narration, None);
+    };
+    let mut anchored = summary.clone();
+    if anchored.source_history_ids.is_empty() {
+        anchored.source_history_ids.push(current.id);
+    }
+    let sources = history.iter().collect::<Vec<_>>();
+    if crate::summary::validate_summary(&anchored, &sources).is_ok() {
+        turn_digest(narration, anchored.interpretation.as_deref())
+    } else {
+        turn_digest(narration, None)
+    }
+}
+
 /// Push `digest` onto `game.recent_summaries`, keeping the most recent
 /// [`RECENT_SUMMARY_CAP`] entries in 1:1 alignment with `game.history`.
 fn push_recent_summary(game: &mut story_model::GameState, digest: String) {
@@ -1420,14 +1531,7 @@ fn assemble_accepted_2stage_turn(
     game.stable_generation_id = Some(pending.generation_id);
 
     let mut checkpoints = state.checkpoints.clone();
-    checkpoints.push(Checkpoint {
-        id: Uuid::new_v4(),
-        game: game.clone(),
-    });
-    if checkpoints.len() > CHECKPOINT_RING {
-        let drop_n = checkpoints.len() - CHECKPOINT_RING;
-        checkpoints.drain(0..drop_n);
-    }
+    upsert_current_checkpoint(&mut checkpoints, &game);
 
     let audit = validated.dry_run.change_log.clone();
     let next = EngineState {
@@ -1523,10 +1627,8 @@ fn assemble_accepted_turn(
         generation_id: draft.generation_id,
     };
     game.history.push(entry);
-    push_recent_summary(
-        &mut game,
-        turn_digest(&draft.narration, draft.summary.interpretation.as_deref()),
-    );
+    let digest = validated_turn_digest(&draft.narration, &draft.summary, &game.history);
+    push_recent_summary(&mut game, digest);
     crate::narrative::advance_after_accept(&mut game, pack, selected_choice.as_ref());
     crate::narrative::mark_recalled(&mut game, pack);
     game.stable_generation_id = Some(draft.generation_id);
@@ -1534,14 +1636,7 @@ fn assemble_accepted_turn(
     // Push the just-committed state onto the checkpoint ring (cap keeps the
     // most recent CHECKPOINT_RING entries).
     let mut checkpoints = state.checkpoints.clone();
-    checkpoints.push(Checkpoint {
-        id: Uuid::new_v4(),
-        game: game.clone(),
-    });
-    if checkpoints.len() > CHECKPOINT_RING {
-        let drop_n = checkpoints.len() - CHECKPOINT_RING;
-        checkpoints.drain(0..drop_n);
-    }
+    upsert_current_checkpoint(&mut checkpoints, &game);
 
     let next = EngineState {
         game,
@@ -1656,6 +1751,29 @@ fn extend_audit_tail(
         out.drain(0..drop_n);
     }
     out
+}
+
+/// Replace the checkpoint for the same committed state identity, or append a
+/// new bounded entry when the state came from a restored save that had no
+/// in-memory checkpoint ring. Choice-only refreshes use this to keep rewind
+/// state aligned with the currently visible choices.
+fn upsert_current_checkpoint(checkpoints: &mut Vec<Checkpoint>, game: &GameState) {
+    if let Some(existing) = checkpoints.iter_mut().rev().find(|checkpoint| {
+        checkpoint.game.session_id == game.session_id
+            && checkpoint.game.turn == game.turn
+            && checkpoint.game.stable_generation_id == game.stable_generation_id
+    }) {
+        existing.game = game.clone();
+        return;
+    }
+    checkpoints.push(Checkpoint {
+        id: Uuid::new_v4(),
+        game: game.clone(),
+    });
+    if checkpoints.len() > CHECKPOINT_RING {
+        let drop_n = checkpoints.len() - CHECKPOINT_RING;
+        checkpoints.drain(0..drop_n);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1812,44 +1930,146 @@ pub fn build_view(
 // request construction
 // ---------------------------------------------------------------------------
 
-/// Build a compatibility-safe choice-only repair request. Local providers
-/// currently share the full turn JSON contract, so the wire response still
-/// contains narration and a patch; `reduce_accept_choice_refresh` deliberately
-/// ignores them and commits only `choices`.
+/// Build a compact, compatibility-safe choice-only repair request.
+///
+/// Sending the entire story prompt made a three-choice rewrite cost almost as
+/// much as a new scene. This request therefore uses a choice-only JSON contract
+/// and carries only the current dramatic state, recent summaries, the committed
+/// scene tail, and rejected offers. The reducer deliberately commits only
+/// `choices`.
 fn build_choice_refresh_request(
     generation_id: Uuid,
     pack: &StoryPack,
     game: &GameState,
     report: Option<&crate::choice_quality::ChoiceQualityReport>,
+    additionally_rejected: &[story_model::Choice],
 ) -> TurnRequest {
-    let mut request = build_turn_request(generation_id, pack, game, None, None);
-    let previous = game
+    // Do not echo rejected text back to a small model. Exact negative examples
+    // anchor it to the very wording we are trying to escape, and each retry
+    // otherwise grows the prompt. The reducer still keeps all rejected offers
+    // for deterministic duplicate detection; the model only needs the reason
+    // and a clean positive design brief.
+    let rejected_count =
+        game.history.last().map_or(0, |entry| entry.choices.len()) + additionally_rejected.len();
+    let failed_rule_count = report.map_or(0, |report| report.issues.len());
+    let story_hooks = game
+        .characters
+        .iter()
+        .flat_map(|(id, state)| {
+            let name = pack
+                .characters
+                .get(id)
+                .map(|character| character.name.as_str())
+                .unwrap_or(id.0.as_str());
+            state
+                .known_facts
+                .iter()
+                .map(move |fact| format!("- {name}: {fact}"))
+        })
+        .take(6)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let allowed_locations = pack
+        .rules
+        .locations
+        .get(&game.location)
+        .map(|current| {
+            std::iter::once(current.display_name.as_str())
+                .chain(current.adjacent.iter().filter_map(|id| {
+                    pack.rules
+                        .locations
+                        .get(id)
+                        .map(|location| location.display_name.as_str())
+                }))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_else(|| game.location.0.clone());
+    let scene = game
         .history
         .last()
-        .map(|entry| {
-            entry
-                .choices
-                .iter()
-                .map(|choice| format!("- {} | {}", choice.label, choice.intent))
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default();
-    let reasons = report
-        .filter(|report| !report.is_ok())
-        .map(crate::choice_quality::ChoiceQualityReport::repair_instructions)
-        .unwrap_or_else(|| "플레이어가 현재 선택지와 다른 방향을 요청했다".to_string());
-    request.messages.push(story_model::ChatMessage {
-        role: "user".to_string(),
-        content: format!(
-            "# Choice-only dramatic rewrite\nThe narration and state are already committed. Return a full valid JSON envelope for compatibility, but only the `choices` array will be used.\nThe engine rejected the offers for these reasons:\n- {reasons}\nDo not repeat or paraphrase any rejected offer:\n{previous}\n{}\nPreserve player agency. This is the only automatic choice rewrite attempt.",
-            crate::choice_quality::design_prompt(game, pack, None)
-        ),
-    });
-    // A refresh needs only the envelope plus three concise choices, not a
-    // second long scene. This reduces latency on local models.
-    request.max_tokens = request.max_tokens.min(900);
-    request
+        .map(|entry| truncate_choice_context(&entry.narration, 1_000))
+        .unwrap_or_else(|| truncate_choice_context(&pack.opening_md, 1_000));
+    let choice_count = pack.default_choice_count() as usize;
+
+    TurnRequest {
+        generation_id,
+        model: "mock".to_string(),
+        temperature: 0.75,
+        top_p: 0.95,
+        top_k: 50,
+        max_tokens: 900,
+        json_schema: Some(generated_choices_json_schema(choice_count)),
+        messages: vec![
+            story_model::ChatMessage {
+                role: "system".to_string(),
+                content: format!(
+                    "전체 이용가 한국어 인터랙티브 소설의 선택지 {choice_count}개만 JSON으로 쓴다. 작품의 장르와 현재 장면에 맞추고 전체 이용가 범위를 지킨다. 플레이어 행동 강제는 금지한다. 장면·설명·생각·<think>는 쓰지 않는다. 각 항목은 label, intent, risk, preview만 쓴다. label은 20자 이내의 완결된 플레이어 행동, intent는 30자 이내의 실제 목적, preview는 45자 이내의 즉시 변화다. 모두 자연스러운 완결형 한국어다. 주어진 사실·장소·물건 밖의 방, 분실물, 과거 사건을 발명하지 않는다."
+                ),
+            },
+            story_model::ChatMessage {
+                role: "user".to_string(),
+                content: format!(
+                    "작품: {}\n현재 장소: {} / 허용 장소: {} / 시간: {:?} / 턴: {}\n핵심 사실:\n{}\n\n현재 장면 끝:\n{}\n\n이전 후보 {}개가 품질 규칙 {}개를 어겨 거절됐다. 문장은 보여 주지 않으니 복사하지 말고 새 행동을 만든다.\n\n{}\n각 label에 서로 다른 핵심 사실이나 장면 물건을 직접 쓴다. 반드시 플레이어가 지금 실행할 동사로 끝낸다. 상대 반응이나 새 사실 자체는 선택지가 아니다. 상대가 주어인 행동은 금지한다. JSON 외에는 출력하지 않는다.",
+                    pack.metadata.title,
+                    game.location.0,
+                    allowed_locations,
+                    game.time_slot,
+                    game.turn,
+                    if story_hooks.is_empty() {
+                        "- 없음"
+                    } else {
+                        &story_hooks
+                    },
+                    scene,
+                    rejected_count,
+                    failed_rule_count,
+                    crate::choice_quality::compact_design_prompt(game, pack)
+                ),
+            },
+        ],
+    }
+}
+
+fn generated_choices_json_schema(choice_count: usize) -> story_model::serde_json::Value {
+    story_model::serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["choices"],
+        "properties": {
+            "choices": {
+                "type": "array",
+                "minItems": choice_count,
+                "maxItems": choice_count,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["label", "intent", "risk", "preview"],
+                    "properties": {
+                        "label": {"type": "string", "minLength": 1, "maxLength": 36},
+                        "intent": {"type": "string", "minLength": 1, "maxLength": 72},
+                        "risk": {"type": "string", "enum": ["safe", "low", "medium", "high", "severe"]},
+                        "preview": {"type": "string", "minLength": 1, "maxLength": 72}
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn truncate_choice_context(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let tail = text
+        .chars()
+        .rev()
+        .take(max_chars)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("…{tail}")
 }
 
 /// Build a [`TurnRequest`] for one generation: deterministic system + user
@@ -1898,7 +2118,7 @@ fn generated_turn_json_schema(choice_count: usize) -> story_model::serde_json::V
         "additionalProperties": false,
         "required": ["narration", "choices", "state_patch", "summary"],
         "properties": {
-            "narration": {"type": "string"},
+            "narration": {"type": "string", "minLength": 1, "maxLength": 3600},
             "choices": {
                 "type": "array",
                 "minItems": choice_count,
@@ -1908,14 +2128,14 @@ fn generated_turn_json_schema(choice_count: usize) -> story_model::serde_json::V
                     "additionalProperties": false,
                     "required": ["id", "label", "intent", "tone", "target", "risk", "hidden_requirements", "preview"],
                     "properties": {
-                        "id": {"type": "string"},
-                        "label": {"type": "string"},
-                        "intent": {"type": "string"},
-                        "tone": {"type": ["string", "null"]},
-                        "target": {"type": ["string", "null"]},
+                        "id": {"type": "string", "minLength": 1, "maxLength": 40},
+                        "label": {"type": "string", "minLength": 1, "maxLength": 36},
+                        "intent": {"type": "string", "minLength": 1, "maxLength": 72},
+                        "tone": {"type": ["string", "null"], "maxLength": 20},
+                        "target": {"type": ["string", "null"], "maxLength": 40},
                         "risk": {"type": "string", "enum": ["safe", "low", "medium", "high", "severe"]},
-                        "hidden_requirements": {"type": "array", "items": {"type": "object"}},
-                        "preview": {"type": "string", "minLength": 1}
+                        "hidden_requirements": {"type": "array", "maxItems": 4, "items": {"type": "object"}},
+                        "preview": {"type": "string", "minLength": 1, "maxLength": 72}
                     }
                 }
             },
@@ -1924,18 +2144,18 @@ fn generated_turn_json_schema(choice_count: usize) -> story_model::serde_json::V
                 "additionalProperties": false,
                 "required": ["affection_delta", "trust_delta", "tension_delta", "relationship_transitions", "set_flags", "number_delta", "set_strings", "inventory_delta", "add_events", "next_location", "next_time_slot", "proposed_route"],
                 "properties": {
-                    "affection_delta": {"type": "object", "additionalProperties": {"type": "integer"}},
-                    "trust_delta": {"type": "object", "additionalProperties": {"type": "integer"}},
-                    "tension_delta": {"type": "object", "additionalProperties": {"type": "integer"}},
-                    "relationship_transitions": {"type": "object", "additionalProperties": {"type": "string"}},
-                    "set_flags": {"type": "object", "additionalProperties": {"type": "boolean"}},
-                    "number_delta": {"type": "object", "additionalProperties": {"type": "integer"}},
-                    "set_strings": {"type": "object", "additionalProperties": {"type": "string"}},
-                    "inventory_delta": {"type": "object", "additionalProperties": {"type": "integer"}},
-                    "add_events": {"type": "array", "items": {"type": "string"}},
-                    "next_location": {"type": ["string", "null"]},
-                    "next_time_slot": {"type": ["string", "null"]},
-                    "proposed_route": {"type": ["string", "null"]}
+                    "affection_delta": {"type": "object", "maxProperties": 12, "additionalProperties": {"type": "integer"}},
+                    "trust_delta": {"type": "object", "maxProperties": 12, "additionalProperties": {"type": "integer"}},
+                    "tension_delta": {"type": "object", "maxProperties": 12, "additionalProperties": {"type": "integer"}},
+                    "relationship_transitions": {"type": "object", "maxProperties": 12, "additionalProperties": {"type": "string", "maxLength": 40}},
+                    "set_flags": {"type": "object", "maxProperties": 12, "additionalProperties": {"type": "boolean"}},
+                    "number_delta": {"type": "object", "maxProperties": 12, "additionalProperties": {"type": "integer"}},
+                    "set_strings": {"type": "object", "maxProperties": 12, "additionalProperties": {"type": "string", "maxLength": 160}},
+                    "inventory_delta": {"type": "object", "maxProperties": 12, "additionalProperties": {"type": "integer"}},
+                    "add_events": {"type": "array", "maxItems": 8, "items": {"type": "string", "maxLength": 80}},
+                    "next_location": {"type": ["string", "null"], "maxLength": 80},
+                    "next_time_slot": {"type": ["string", "null"], "maxLength": 40},
+                    "proposed_route": {"type": ["string", "null"], "maxLength": 80}
                 }
             },
             "summary": {
@@ -1943,18 +2163,18 @@ fn generated_turn_json_schema(choice_count: usize) -> story_model::serde_json::V
                 "additionalProperties": false,
                 "required": ["facts", "unresolved", "relationship_changes", "knowledge_changes", "interpretation", "address_form_changes", "important_player_actions", "source_history_ids"],
                 "properties": {
-                    "facts": {"type": "array", "items": {"type": "string"}},
-                    "unresolved": {"type": "array", "items": {"type": "string"}},
-                    "relationship_changes": {"type": "array", "items": {"type": "string"}},
-                    "knowledge_changes": {"type": "array", "items": {"type": "string"}},
-                    "interpretation": {"type": ["string", "null"]},
-                    "address_form_changes": {"type": "array", "items": {"type": "string"}},
-                    "important_player_actions": {"type": "array", "items": {"type": "string"}},
+                    "facts": {"type": "array", "maxItems": 8, "items": {"type": "string", "maxLength": 240}},
+                    "unresolved": {"type": "array", "maxItems": 8, "items": {"type": "string", "maxLength": 240}},
+                    "relationship_changes": {"type": "array", "maxItems": 8, "items": {"type": "string", "maxLength": 240}},
+                    "knowledge_changes": {"type": "array", "maxItems": 8, "items": {"type": "string", "maxLength": 240}},
+                    "interpretation": {"type": ["string", "null"], "maxLength": 400},
+                    "address_form_changes": {"type": "array", "maxItems": 8, "items": {"type": "string", "maxLength": 240}},
+                    "important_player_actions": {"type": "array", "maxItems": 8, "items": {"type": "string", "maxLength": 240}},
                     // Provenance is advisory metadata. The recovery layer
                     // discards non-UUID values instead of rejecting a usable
                     // scene, so do not force every local server to implement
                     // UUID-pattern constrained decoding.
-                    "source_history_ids": {"type": "array", "items": {"type": "string"}}
+                    "source_history_ids": {"type": "array", "maxItems": 8, "items": {"type": "string", "maxLength": 80}}
                 }
             }
         }
@@ -2196,8 +2416,13 @@ fn clone_state(state: &EngineState) -> EngineState {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_resolved_ending, turn_digest};
-    use story_model::{ConditionExpr, EndingDef};
+    use super::{
+        Checkpoint, EngineState, apply_resolved_ending, reduce_restore_checkpoint, turn_digest,
+        upsert_current_checkpoint, validated_turn_digest,
+    };
+    use story_model::chrono::Utc;
+    use story_model::uuid::Uuid;
+    use story_model::{ConditionExpr, EndingDef, HistoryEntry, StatePatch, TurnSummary};
 
     #[test]
     fn turn_digest_prefers_interpretation_then_falls_back_to_first_clause() {
@@ -2237,5 +2462,75 @@ mod tests {
         );
         assert!(draft.narration.contains("[엔딩] 다시 시작되는 관계"));
         assert!(draft.choices.is_empty());
+    }
+
+    fn summary(interpretation: &str, sources: Vec<Uuid>) -> TurnSummary {
+        TurnSummary {
+            facts: vec!["현재 장면의 사실".to_string()],
+            unresolved: Vec::new(),
+            relationship_changes: Vec::new(),
+            knowledge_changes: Vec::new(),
+            interpretation: Some(interpretation.to_string()),
+            address_form_changes: Vec::new(),
+            important_player_actions: Vec::new(),
+            source_history_ids: sources,
+        }
+    }
+
+    fn history_entry(id: Uuid) -> HistoryEntry {
+        HistoryEntry {
+            id,
+            turn: 1,
+            scene_id: "scene".to_string(),
+            created_at: Utc::now(),
+            narration: "비가 그쳤다. 유나가 창밖을 본다.".to_string(),
+            player_action: None,
+            choices: Vec::new(),
+            applied_patch: StatePatch::default(),
+            generation_id: Uuid::new_v4(),
+        }
+    }
+
+    #[test]
+    fn summary_without_source_is_anchored_to_current_history() {
+        let history = [history_entry(Uuid::new_v4())];
+        let digest = validated_turn_digest(
+            &history[0].narration,
+            &summary("현재 장면의 의미", Vec::new()),
+            &history,
+        );
+        assert_eq!(digest, "현재 장면의 의미");
+    }
+
+    #[test]
+    fn unsourced_summary_is_discarded_from_recent_arc() {
+        let history = [history_entry(Uuid::new_v4())];
+        let digest = validated_turn_digest(
+            &history[0].narration,
+            &summary("오염된 장기 기억", vec![Uuid::new_v4()]),
+            &history,
+        );
+        assert_eq!(digest, "비가 그쳤다");
+    }
+
+    #[test]
+    fn checkpoint_upsert_makes_restore_use_refreshed_state() {
+        let pack = crate::tests_support::sample_pack();
+        let mut state = EngineState::initial(&pack);
+        let generation_id = Uuid::new_v4();
+        state.game.turn = 1;
+        state.game.stable_generation_id = Some(generation_id);
+        let checkpoint_id = Uuid::new_v4();
+        state.checkpoints.push(Checkpoint {
+            id: checkpoint_id,
+            game: state.game.clone(),
+        });
+
+        let mut refreshed = state.game.clone();
+        refreshed.revision = 7;
+        upsert_current_checkpoint(&mut state.checkpoints, &refreshed);
+        let restored = reduce_restore_checkpoint(&state, &pack, checkpoint_id);
+        assert_eq!(restored.state.game.revision, 7);
+        assert_eq!(restored.state.checkpoints.len(), 1);
     }
 }

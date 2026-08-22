@@ -22,6 +22,26 @@ use crate::error::{SAVE_SCHEMA_VERSION, SaveError};
 
 /// Default number of `.bak` generations kept per slot.
 pub const DEFAULT_BAK_GENERATIONS: usize = 3;
+/// Maximum ASCII characters accepted in a save slot identifier.
+pub const MAX_SLOT_ID_LEN: usize = 64;
+
+/// A slot id is a portable filename stem, not a path. Restricting it to this
+/// small alphabet keeps save/load/delete under the configured root on every
+/// supported platform.
+pub fn validate_slot_id(slot_id: &str) -> bool {
+    !slot_id.is_empty()
+        && slot_id.len() <= MAX_SLOT_ID_LEN
+        && slot_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn invalid_slot_id(slot_id: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("unsafe save slot id: {slot_id:?}"),
+    )
+}
 
 /// The save store. Owns the saves directory root and the `.bak` retention
 /// policy. Open via [`SaveStore::open`].
@@ -68,8 +88,11 @@ impl SaveStore {
     }
 
     /// Path on disk for a given slot id (`<root>/<slot_id>.json`).
-    pub fn slot_path(&self, slot_id: &str) -> PathBuf {
-        self.root.join(format!("{slot_id}.json"))
+    pub fn slot_path(&self, slot_id: &str) -> std::io::Result<PathBuf> {
+        if !validate_slot_id(slot_id) {
+            return Err(invalid_slot_id(slot_id));
+        }
+        Ok(self.root.join(format!("{slot_id}.json")))
     }
 
     /// Atomically write `envelope` to its slot. Computes the payload checksum
@@ -93,7 +116,7 @@ impl SaveStore {
         }
 
         let bytes = serde_json::to_vec_pretty(&env)?;
-        let path = self.slot_path(&env.slot_id);
+        let path = self.slot_path(&env.slot_id)?;
         atomic_write_json(&path, &bytes, self.bak_generations)?;
         Ok(())
     }
@@ -106,7 +129,10 @@ impl SaveStore {
     ///      older → routed through [`crate::migration`] in a later step).
     ///   5. Domain invariants (else [`SaveError::InvalidPayload`]).
     pub fn load(&self, slot_id: &str) -> Result<SaveEnvelope, SaveError> {
-        let path = self.slot_path(slot_id);
+        if !validate_slot_id(slot_id) {
+            return Err(SaveError::InvalidSlotId(slot_id.to_string()));
+        }
+        let path = self.slot_path(slot_id).map_err(SaveError::Io)?;
         let bytes = fs::read(&path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 SaveError::MissingSlot(slot_id.to_string())
@@ -184,7 +210,7 @@ impl SaveStore {
             let Some(ext) = path.extension().and_then(|s| s.to_str()) else {
                 continue;
             };
-            if ext != "json" {
+            if ext != "json" || !validate_slot_id(stem) {
                 continue;
             }
             // Skip our own backup files explicitly.
@@ -214,7 +240,7 @@ impl SaveStore {
     /// `.bak` files — those age out via future writes, or the player can
     /// manually recover.
     pub fn delete(&self, slot_id: &str) -> std::io::Result<()> {
-        let path = self.slot_path(slot_id);
+        let path = self.slot_path(slot_id)?;
         match fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),

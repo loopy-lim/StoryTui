@@ -1,6 +1,6 @@
 //! Integration tests that exercise the W4.5 validators end-to-end via the
-//! loader. Bad fixtures: missing reference, duplicate character id, teen
-//! age 17. Good fixture: complete valid teen pack with one major character.
+//! loader. Bad fixtures cover missing references and duplicate identifiers.
+//! The good fixture is a complete supported pack with one major character.
 
 use std::fs;
 use std::path::Path;
@@ -16,7 +16,7 @@ fn write(root: &Path, rel: &str, text: &str) {
     fs::write(p, text).unwrap();
 }
 
-const teen_STORY_TOML: &str = r#"schema_version = "1.0.0"
+const STORY_TOML: &str = r#"schema_version = "1.0.0"
 story_id = "demo"
 story_version = "0.1.0"
 min_engine_version = "0.1.0"
@@ -24,7 +24,6 @@ title = "데모"
 language = "ko-KR"
 genres = ["drama"]
 rating = "teen"
-all_major_characters_safe = true
 default_choice_count = 3
 
 [initial_state]
@@ -34,7 +33,6 @@ location = "cafe-namu"
 time_slot = "evening"
 
 [content]
-safe_content = "permitted_by_pack"
 violence = "mild"
 "#;
 
@@ -96,10 +94,10 @@ trigger = { kind = "all", children = [
 set_flags = { "apologized" = true }
 "#;
 
-fn base_teen_pack() -> TempDir {
+fn base_valid_pack() -> TempDir {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
-    write(root, "story.toml", teen_STORY_TOML);
+    write(root, "story.toml", STORY_TOML);
     write(
         root,
         "characters.toml",
@@ -128,10 +126,10 @@ long_term_desire = "관계"
 }
 
 #[test]
-fn good_teen_pack_loads_clean() {
-    let dir = base_teen_pack();
-    let pack = PackLoader::load(dir.path()).expect("valid teen pack");
-    assert_eq!(pack.metadata.rating, story_model::PackRating::teen);
+fn good_pack_loads_clean() {
+    let dir = base_valid_pack();
+    let pack = PackLoader::load(dir.path()).expect("valid pack");
+    assert_eq!(pack.metadata.rating, story_model::PackRating::Teen);
     assert_eq!(pack.characters.len(), 1);
     assert_eq!(pack.rules.locations.len(), 2);
     assert!(pack.rules.routes.contains_key("reconciliation"));
@@ -139,7 +137,7 @@ fn good_teen_pack_loads_clean() {
 
 #[test]
 fn unknown_flag_reference_is_caught() {
-    let dir = base_teen_pack();
+    let dir = base_valid_pack();
     // Replace the route's enter_condition flag with an unregistered one.
     let rules_path = dir.path().join("rules.toml");
     let s = fs::read_to_string(&rules_path).unwrap().replace(
@@ -157,7 +155,7 @@ fn unknown_flag_reference_is_caught() {
 
 #[test]
 fn unknown_event_effect_flag_is_caught() {
-    let dir = base_teen_pack();
+    let dir = base_valid_pack();
     // Inject an event in events.toml that references an unregistered flag.
     write(
         dir.path(),
@@ -182,7 +180,7 @@ set_flags = { "ghost_flag" = true }
 
 #[test]
 fn unknown_event_effect_trust_delta_character_is_caught() {
-    let dir = base_teen_pack();
+    let dir = base_valid_pack();
     // trust_delta on a character id that is not in characters.toml must be
     // flagged by the Pack referential-integrity pass on the new typed field
     // (previously the loader routed trust/tension into number_delta, masking
@@ -210,7 +208,7 @@ trust_delta = { "ghost_char" = 1 }
 
 #[test]
 fn unknown_event_effect_tension_delta_character_is_caught() {
-    let dir = base_teen_pack();
+    let dir = base_valid_pack();
     write(
         dir.path(),
         "events.toml",
@@ -234,7 +232,7 @@ tension_delta = { "ghost_char" = 1 }
 
 #[test]
 fn duplicate_character_id_is_caught() {
-    let dir = base_teen_pack();
+    let dir = base_valid_pack();
     let chars_path = dir.path().join("characters.toml");
     let mut s = fs::read_to_string(&chars_path).unwrap();
     // append a second yuna entry
@@ -256,41 +254,8 @@ long_term_desire = "x"
 }
 
 #[test]
-fn age_17_in_teen_pack_is_policy_violation() {
-    let dir = base_teen_pack();
-    let chars_path = dir.path().join("characters.toml");
-    let s = fs::read_to_string(&chars_path)
-        .unwrap()
-        .replace("age = 29", "age = 17");
-    fs::write(&chars_path, s).unwrap();
-    let err = PackLoader::load(dir.path()).expect_err("under 18");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("모든 인물 Pack 정책 위반"),
-        "expected teen policy violation: {msg}"
-    );
-}
-
-#[test]
-fn teens_flag_false_with_teen_rating_is_policy_violation() {
-    let dir = base_teen_pack();
-    let story_path = dir.path().join("story.toml");
-    let s = fs::read_to_string(&story_path).unwrap().replace(
-        "all_major_characters_safe = true",
-        "all_major_characters_safe = false",
-    );
-    fs::write(&story_path, s).unwrap();
-    let err = PackLoader::load(dir.path()).expect_err("teens flag false");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("모든 인물 Pack 정책 위반"),
-        "expected teen policy violation: {msg}"
-    );
-}
-
-#[test]
 fn unknown_location_in_initial_state_is_reference_error() {
-    let dir = base_teen_pack();
+    let dir = base_valid_pack();
     let story_path = dir.path().join("story.toml");
     let s = fs::read_to_string(&story_path)
         .unwrap()
@@ -299,4 +264,90 @@ fn unknown_location_in_initial_state_is_reference_error() {
     let err = PackLoader::load(dir.path()).expect_err("unknown init loc");
     let msg = format!("{err}");
     assert!(msg.contains("참조 오류"), "expected reference error: {msg}");
+}
+
+#[test]
+fn duplicate_location_id_is_rejected_instead_of_overwritten() {
+    let dir = base_valid_pack();
+    let rules_path = dir.path().join("rules.toml");
+    let mut rules = fs::read_to_string(&rules_path).unwrap();
+    rules.push_str(
+        r#"
+[[locations]]
+id = "cafe-namu"
+name = "덮어쓰면 안 되는 장소"
+connects_to = []
+"#,
+    );
+    fs::write(rules_path, rules).unwrap();
+    let err = PackLoader::load(dir.path()).expect_err("duplicate location");
+    let message = format!("{err}");
+    assert!(
+        message.contains("중복 location id"),
+        "unexpected: {message}"
+    );
+}
+
+#[test]
+fn duplicate_event_id_is_rejected_instead_of_overwritten() {
+    let dir = base_valid_pack();
+    write(
+        dir.path(),
+        "events.toml",
+        r#"
+schema_version = "1.0.0"
+[[events]]
+id = "event.same"
+trigger = { kind = "turn_at_least", value = 1 }
+[[events]]
+id = "event.same"
+trigger = { kind = "turn_at_least", value = 2 }
+"#,
+    );
+    let err = PackLoader::load(dir.path()).expect_err("duplicate event");
+    assert!(format!("{err}").contains("중복 event id"));
+}
+
+#[test]
+fn reversed_stat_range_is_rejected() {
+    let dir = base_valid_pack();
+    let rules_path = dir.path().join("rules.toml");
+    let rules = fs::read_to_string(&rules_path)
+        .unwrap()
+        .replace("affection_min = -30", "affection_min = 31");
+    fs::write(rules_path, rules).unwrap();
+    let err = PackLoader::load(dir.path()).expect_err("reversed range");
+    assert!(format!("{err}").contains("limits.affection 범위 오류"));
+}
+
+#[test]
+fn number_default_outside_range_is_rejected() {
+    let dir = base_valid_pack();
+    let rules_path = dir.path().join("rules.toml");
+    let rules = fs::read_to_string(&rules_path)
+        .unwrap()
+        .replace("default = 0\nmin = -30", "default = 31\nmin = -30");
+    fs::write(rules_path, rules).unwrap();
+    let err = PackLoader::load(dir.path()).expect_err("number default out of range");
+    assert!(format!("{err}").contains("default 31"));
+}
+
+#[test]
+fn disconnected_location_is_rejected() {
+    let dir = base_valid_pack();
+    let rules_path = dir.path().join("rules.toml");
+    let mut rules = fs::read_to_string(&rules_path).unwrap();
+    rules.push_str(
+        r#"
+[[locations]]
+id = "isolated-room"
+name = "고립된 방"
+connects_to = []
+"#,
+    );
+    fs::write(rules_path, rules).unwrap();
+    let err = PackLoader::load(dir.path()).expect_err("unreachable location");
+    let message = format!("{err}");
+    assert!(message.contains("도달 불가"), "unexpected: {message}");
+    assert!(message.contains("isolated-room"));
 }

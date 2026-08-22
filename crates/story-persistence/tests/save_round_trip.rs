@@ -307,7 +307,7 @@ fn slot_isolation_failed_save_does_not_appear_in_list_slots() {
         Err(SaveError::MissingSlot(_))
     ));
     // No stray file landed at the slot path.
-    assert!(!store.slot_path("slot-should-not-exist").exists());
+    assert!(!store.slot_path("slot-should-not-exist").unwrap().exists());
 }
 
 #[test]
@@ -319,7 +319,7 @@ fn slot_isolation_failed_overwrite_leaves_prior_save_byte_identical() {
 
     let first = payload_for(7);
     store.save(envelope_for("slot-1", first.clone())).unwrap();
-    let prior_bytes = std::fs::read(store.slot_path("slot-1")).unwrap();
+    let prior_bytes = std::fs::read(store.slot_path("slot-1").unwrap()).unwrap();
     assert_eq!(store.list_slots().len(), 1);
 
     // Revoke writes and try to overwrite.
@@ -341,7 +341,7 @@ fn slot_isolation_failed_overwrite_leaves_prior_save_byte_identical() {
     }
 
     // Byte-identical prior save.
-    let after_bytes = std::fs::read(store.slot_path("slot-1")).unwrap();
+    let after_bytes = std::fs::read(store.slot_path("slot-1").unwrap()).unwrap();
     assert_eq!(
         prior_bytes, after_bytes,
         "prior save must be byte-identical after failed overwrite"

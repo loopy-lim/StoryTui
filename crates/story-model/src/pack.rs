@@ -27,12 +27,11 @@ use crate::{CharacterId, LocationId, RelationshipStage, StoryRules, TimeSlot};
 /// Bumped on every incompatible change to the on-disk Pack layout. The W4
 /// loader compares the major component of a Pack's `schema_version` against
 /// this; same-major is loaded (with in-memory default migration for missing
-/// optional fields), cross-major is rejected unless an safe migrator
+/// optional fields), cross-major is rejected unless an explicit migrator
 /// exists (W8+, not in W4 scope).
 pub const PACK_SCHEMA_VERSION: &str = "1.0.0";
 
-/// Coarse content rating stamped onto a Pack. teen Packs must satisfy the
-/// teen-metadata policy in `story-persistence::pack::validate`.
+/// Coarse audience rating stamped onto a Pack.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PackRating {
@@ -40,9 +39,6 @@ pub enum PackRating {
     General,
     /// Teen and up.
     Teen,
-    /// teen — requires `all_major_characters_safe == true` and every
-    /// major character `age >= 18`.
-    teen,
 }
 
 /// Initial scene/location the engine drops the player into.
@@ -58,13 +54,9 @@ pub struct PackInitialState {
     pub time_slot: TimeSlot,
 }
 
-/// Structured content policy. Free-form strings (the engine does not
-/// enumerate every capability) but their presence lets the loader/teen
-/// validator reason about declared vs. undeclared content.
+/// Structured content policy for supported story themes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackContentPolicy {
-    /// Declared safe-content policy string (e.g. `"permitted_by_pack"`).
-    pub safe_content: String,
     /// Declared violence policy string (e.g. `"mild"`).
     pub violence: String,
 }
@@ -88,9 +80,6 @@ pub struct PackMetadata {
     pub genres: Vec<String>,
     /// Content rating.
     pub rating: PackRating,
-    /// Authoritative declaration that every major character is an teen.
-    /// Required `true` for [`PackRating::teen`].
-    pub all_major_characters_safe: bool,
     /// Default number of choices offered per turn (MVP = 3).
     pub default_choice_count: u8,
     /// Starting scene/location.
@@ -110,8 +99,7 @@ pub struct CharacterDef {
     pub id: CharacterId,
     /// Display name.
     pub name: String,
-    /// Stated age. `None` means "unspecified"; for major characters in an
-    /// teen Pack the loader requires `Some(age)` with `age >= 18`.
+    /// Stated age. `None` means "unspecified".
     pub age: Option<u32>,
     /// Optional pronouns / address-form hint string.
     pub pronouns: Option<String>,
@@ -202,8 +190,7 @@ mod tests {
             title: "비가 그친 뒤".to_string(),
             language: "ko-KR".to_string(),
             genres: vec!["modern-romance".to_string(), "drama".to_string()],
-            rating: PackRating::teen,
-            all_major_characters_safe: true,
+            rating: PackRating::Teen,
             default_choice_count: 3,
             initial_state: PackInitialState {
                 chapter: "chapter-1".to_string(),
@@ -212,7 +199,6 @@ mod tests {
                 time_slot: TimeSlot::Evening,
             },
             content: PackContentPolicy {
-                safe_content: "permitted_by_pack".to_string(),
                 violence: "mild".to_string(),
             },
         }
@@ -244,7 +230,7 @@ mod tests {
 
     #[test]
     fn pack_rating_serde_snake_case() {
-        let json = serde_json::to_string(&PackRating::teen).unwrap();
+        let json = serde_json::to_string(&PackRating::Teen).unwrap();
         assert_eq!(json, "\"teen\"");
         let g: PackRating = serde_json::from_str("\"general\"").unwrap();
         assert_eq!(g, PackRating::General);

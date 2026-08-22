@@ -37,19 +37,23 @@ its drafts are scripted. The code-level gates that ARE in place:
 - Deterministic prompt + patch hashes (`tests/bench.rs`).
 - 100-turn synthetic soak + 100-iteration save round-trip.
 
+The runtime trace records only structural provider metadata, never a raw model
+response excerpt, and is capped at 1 MiB. Pack file reads resolve canonical
+targets and reject paths outside the canonical Pack root. Save slot ids are
+portable filename stems (`[A-Za-z0-9_-]`, 1–64 characters), not paths.
+
 Closing the real-model quality gate is documented in
 `RELEASE-RUNTIME-GATE.md` (G3).
 
-## Model license and teen-pack principles
+## Model license and safe-pack principles
 
 StoryTUI is built for local, player-controlled fiction. The project itself
 ships no model weights and takes no position on which MLX model an operator
 chooses to load. Two principles the code enforces:
 
-1. **teen content only with safe pack opt-in.** A pack must declare
-   `all_major_characters_safe: true` and a non-`General` rating is the
-   pack author's responsibility. The loader validates the pack schema, not
-   the moral content.
+1. **Supported ratings only.** A pack must use `general` or `teen`. The
+   checked-in packs and prompts target an all-ages presentation, and the
+   loader rejects unsupported rating values before play starts.
 2. **Player sovereignty.** The system prompt (see
    `crates/story-core/src/prompt_context.rs`) instructs the model not to
    fix emotions, dialogue, physical contact, forgiveness, confessions, or
@@ -72,6 +76,12 @@ Two packs are committed: `stories/rainy-reunion` and
 `stories/starlight-station`. Both pass loader validation, while only
 `rainy-reunion` has been exercised through the app-level integration path.
 The 10-turn live-model swap to `starlight-station` remains runtime gate G5.
+
+Pack loading now fails closed for future `min_engine_version`, choice counts
+outside 1–6, duplicate identifiers, invalid numeric/stat ranges, and locations
+that cannot be reached from the initial location through declared adjacency.
+This is conservative structural validation, not a proof that every conditional
+event or ending will be reached in a real playthrough.
 
 ## Non-goal: cloud providers
 

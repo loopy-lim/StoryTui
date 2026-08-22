@@ -43,7 +43,6 @@ fn sample_pack() -> StoryPack {
         language: "ko-KR".to_string(),
         genres: vec!["drama".to_string()],
         rating: PackRating::General,
-        all_major_characters_safe: true,
         default_choice_count: 3,
         initial_state: PackInitialState {
             chapter: "chapter-1".to_string(),
@@ -52,7 +51,6 @@ fn sample_pack() -> StoryPack {
             time_slot: TimeSlot::Morning,
         },
         content: PackContentPolicy {
-            safe_content: "none".to_string(),
             violence: "none".to_string(),
         },
     };

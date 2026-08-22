@@ -1,5 +1,6 @@
 ---
 source: crates/story-core/tests/prompt_context.rs
+assertion_line: 256
 expression: combined
 ---
 === SYSTEM ===
@@ -51,6 +52,19 @@ Continue from the current state and the recent turns. Do not restart the opening
 # 문체
 짧고 정확한 문장.
 
+# Character canon and voice (pack-owned)
+Treat voice, canonical knowledge, goals, and boundaries below as canon. Unknown facts and secrets are private: do not reveal or let a character act on them unless the live state or an authorized event has established that knowledge.
+## ami (ami)
+age: 29
+## yuna (yuna)
+age: 29
+## zoe (zoe)
+age: 29
+
+# Story progression rules (engine-authoritative)
+`state_patch.add_events` only proposes an event. Propose an id only when its trigger is true after this turn's patch and its route lock matches. Rust re-checks every condition and records only fired events.
+
+
 # Opening reference
 The opening has already been shown. Do not reproduce its prose; continue from the current state and recent turns below.
 
@@ -63,17 +77,9 @@ The opening has already been shown. Do not reproduce its prose; continue from th
 - yuna: stage=Acquaintance; affection=11; trust=6; tension=1; emotion=Neutral
 - zoe: stage=Acquaintance; affection=12; trust=7; tension=2; emotion=Neutral
 
-# Character canon and voice (pack-owned)
-Treat voice, knowledge, goals, and boundaries below as canon. Unknown facts and secrets are private: do not reveal or let a character act on them unless the live state or an authorized event has established that knowledge.
-## ami (ami)
-age: 29
-## yuna (yuna)
-age: 29
-## zoe (zoe)
-age: 29
-
-# Story progression rules (engine-authoritative)
-`state_patch.add_events` only proposes an event. Propose an id only when its trigger is true after this turn's patch and its route lock matches. Rust re-checks every condition and records only fired events.
+# Live character knowledge (engine-owned)
+These are facts and forms of address established during play. They override neither private canon nor the relationship ledger.
+(no additional live character knowledge)
 
 # Current dramatic beat
 mode=Scene. Advance exactly one observable relationship or situation beat at cafe-namu. Do not restart the premise or repeat the last selected approach. End with a concrete new pressure, question, or consequence.
@@ -101,8 +107,8 @@ The engine assigned the dramatic job of each choice slot. Keep this order and do
 2. role=evidence; objective=현재 압력: 현재 관계의 미해결 질문. 이와 연결된 구체적인 말, 물건, 시간 또는 불일치를 확인해 새 정보를 얻거나 가능성 하나를 지운다; cost=지나치게 캐묻거나 본론을 피하는 사람으로 보일 수 있다; immediate_consequence=다음 장면에서 사용할 수 있는 구체적 단서 하나가 생기거나 기존 추측 하나가 틀렸음이 드러난다; risk=low 또는 medium
 3. role=situation; objective=사용 가능한 장면 변화 자원: 현재 장소의 시간 압력이나 제삼의 변수. 이동, 마감, 제삼자, 제안 또는 즉시 행동으로 장면 조건을 바꾼다; cost=현재 질문을 미뤄 오해를 남기거나 대화할 수 있는 시간을 잃을 수 있다; immediate_consequence=장소·시간·참여자·즉시 목표 중 하나가 달라져 다음 장면이 같은 대화의 반복이 되지 않는다; risk=medium 또는 high
 Recently chosen directions: none. Never offer the last selected action again, even as a paraphrase: (none).
-For every choice: write one concrete player action or line; make `intent` name its actual goal; make `preview` a non-empty, spoiler-free Korean hint about what it tests or changes. Do not use observation, waiting, silence, small talk, or atmosphere commentary unless it creates a new deadline, discovery, refusal, movement, or relationship consequence. The set must include both a lower-risk option and a medium-or-higher-risk option.
+For every choice: write one concrete player action or line; make `intent` name its actual goal; make `preview` a non-empty, spoiler-free Korean hint about what it tests or changes. Use a distinct person, promise, quoted claim, object, place, or time already present in the context as each option's hook. At most one option may be a pure question; the others must manipulate evidence or change the scene conditions. Do not use observation, waiting, silence, small talk, or atmosphere commentary unless it creates a new deadline, discovery, refusal, movement, or relationship consequence. The set must include both a lower-risk option and a medium-or-higher-risk option.
 
 
 === HASH ===
-f4df99b6fb2c43d1d1a9167a2794ae70bad2445f3d7ed98ca9393d949c2034a6
+8448cc41fad9f3fe526807f0c44cebf04ce40648a921ad2b1e78421b6478dc0d

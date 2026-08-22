@@ -41,6 +41,9 @@ remaining open items are live-model quality and release gates.
 
 For build / run / test instructions, see
 [`docs/INSTALL.md`](./docs/INSTALL.md).
+For the long-session memory tiers and the design comparison with established
+story applications, see
+[`docs/CONTEXT-MANAGEMENT.md`](./docs/CONTEXT-MANAGEMENT.md).
 
 ## CI commands
 
@@ -49,6 +52,8 @@ cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ./scripts/check-core-deps.sh
+./scripts/check-public-config.sh
 ```
 
 `scripts/check-core-deps.sh` enforces ADR-003 by failing if `story-core` ever pulls in `ratatui`, `crossterm`, or `reqwest`.
+`scripts/check-public-config.sh` rejects tracked private profiles, model assignments in the public profile, and blocked model labels.

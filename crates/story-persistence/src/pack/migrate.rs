@@ -7,13 +7,41 @@
 //!   documented defaults via [`migrate_in_memory`]. No file on disk is
 //!   mutated; migration is purely an in-DTO transformation.
 //! - Different major → reject with [`PackError::UnsupportedSchemaVersion`].
-//!   A future safe `pack migrate --out` command (W8+) may upgrade a
+//!   A future explicit `pack migrate --out` command (W8+) may upgrade a
 //!   cross-major pack into a new directory; that is out of scope here.
 
 use story_model::PACK_SCHEMA_VERSION;
 
 use crate::error::PackError;
 use crate::pack::dto::StoryToml;
+
+/// Reject a Pack that explicitly requires a newer engine build. This check is
+/// independent of the Pack schema version: a schema-compatible Pack may still
+/// rely on newer engine behavior.
+pub fn check_engine_compat(dto: &StoryToml, errs: &mut Vec<PackError>) {
+    let current = match semver::Version::parse(env!("CARGO_PKG_VERSION")) {
+        Ok(version) => version,
+        Err(_) => return,
+    };
+    let required = match semver::Version::parse(&dto.min_engine_version) {
+        Ok(version) => version,
+        Err(error) => {
+            errs.push(PackError::Parse {
+                file: "story.toml".to_string(),
+                line: 0,
+                col: 0,
+                detail: format!("min_engine_version 파싱 실패: {error}"),
+            });
+            return;
+        }
+    };
+    if required > current {
+        errs.push(PackError::UnsupportedEngineVersion {
+            required: required.to_string(),
+            current: current.to_string(),
+        });
+    }
+}
 
 /// Compare `dto.schema_version` major against the loader's supported major.
 /// Same-major is accepted (with optional in-memory default-fill via
@@ -75,16 +103,11 @@ pub fn migrate_in_memory(dto: &StoryToml) -> Result<StoryToml, PackError> {
         });
     }
 
-    // Same major: no v1.x migrations needed yet. This function is the
-    // seam where future minor-version upgrades (e.g. backfilling a new
-    // optional field with its documented default) will land.
-    let mut out = dto.clone();
-    if out.default_choice_count == 0 {
-        // Defensive: a Pack that explicitly set 0 is treated as "unset" and
-        // bumped to the canonical MVP default of 3.
-        out.default_choice_count = 3;
-    }
-    Ok(out)
+    // Same major: no v1.x migrations needed yet. Missing optional fields are
+    // already filled by serde defaults. Explicit invalid values are preserved
+    // so the canonical validation phase can reject them instead of silently
+    // changing author intent.
+    Ok(dto.clone())
 }
 
 #[cfg(test)]
@@ -102,7 +125,6 @@ mod tests {
             language: "ko-KR".into(),
             genres: Vec::new(),
             rating: "general".into(),
-            all_major_characters_safe: false,
             default_choice_count: 3,
             initial_state: InitialStateToml {
                 chapter: "c1".into(),
@@ -183,6 +205,18 @@ mod tests {
         let mut dto = dto_with_schema("1.0.0");
         dto.default_choice_count = 0;
         let out = migrate_in_memory(&dto).expect("migrates");
-        assert_eq!(out.default_choice_count, 3);
+        assert_eq!(out.default_choice_count, 0);
+    }
+
+    #[test]
+    fn future_engine_requirement_is_rejected() {
+        let mut dto = dto_with_schema("1.0.0");
+        dto.min_engine_version = "99.0.0".to_string();
+        let mut errs = Vec::new();
+        check_engine_compat(&dto, &mut errs);
+        assert!(matches!(
+            errs.as_slice(),
+            [PackError::UnsupportedEngineVersion { .. }]
+        ));
     }
 }

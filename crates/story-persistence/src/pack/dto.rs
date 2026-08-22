@@ -18,12 +18,10 @@ use story_model::{
 // story.toml
 // ---------------------------------------------------------------------------
 
-/// Raw `[content]` section of `story.toml`. The canonical
-/// [`PackContentPolicy`] only keeps the two MVP fields; extra keys (e.g.
-/// `romance`, `substance_use`, `notes`) are accepted and dropped.
+/// Raw `[content]` section of `story.toml`. Unsupported extra keys are
+/// accepted and dropped for forward compatibility.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ContentToml {
-    pub safe_content: Option<String>,
     pub violence: Option<String>,
 }
 
@@ -77,8 +75,6 @@ pub struct StoryToml {
     #[serde(default)]
     pub genres: Vec<String>,
     pub rating: String,
-    #[serde(default)]
-    pub all_major_characters_safe: bool,
     #[serde(default = "default_choice_count")]
     pub default_choice_count: u8,
     pub initial_state: InitialStateToml,
@@ -91,6 +87,9 @@ pub struct StoryToml {
 fn default_choice_count() -> u8 {
     3
 }
+
+const MIN_CHOICE_COUNT: u8 = 1;
+const MAX_CHOICE_COUNT: u8 = 6;
 
 // ---------------------------------------------------------------------------
 // characters.toml
@@ -328,7 +327,6 @@ pub fn parse_rating(s: &str) -> Result<PackRating, String> {
     match s {
         "general" => Ok(PackRating::General),
         "teen" => Ok(PackRating::Teen),
-        "teen" => Ok(PackRating::teen),
         other => Err(format!("알 수 없는 rating 값: {other:?}")),
     }
 }
@@ -370,6 +368,12 @@ pub fn story_to_metadata(dto: &StoryToml) -> Result<PackMetadata, String> {
         .map_err(|e| format!("min_engine_version 파싱 실패: {e}"))?;
     let rating = parse_rating(&dto.rating)?;
     let time_slot = parse_time_slot(&dto.initial_state.time_slot)?;
+    if !(MIN_CHOICE_COUNT..=MAX_CHOICE_COUNT).contains(&dto.default_choice_count) {
+        return Err(format!(
+            "default_choice_count 범위 오류: {} (허용 {}..={})",
+            dto.default_choice_count, MIN_CHOICE_COUNT, MAX_CHOICE_COUNT
+        ));
+    }
     Ok(PackMetadata {
         schema_version,
         story_id: dto.story_id.clone(),
@@ -379,7 +383,6 @@ pub fn story_to_metadata(dto: &StoryToml) -> Result<PackMetadata, String> {
         language: dto.language.clone(),
         genres: dto.genres.clone(),
         rating,
-        all_major_characters_safe: dto.all_major_characters_safe,
         default_choice_count: dto.default_choice_count,
         initial_state: PackInitialState {
             chapter: dto.initial_state.chapter.clone(),
@@ -388,7 +391,6 @@ pub fn story_to_metadata(dto: &StoryToml) -> Result<PackMetadata, String> {
             time_slot,
         },
         content: PackContentPolicy {
-            safe_content: dto.content.safe_content.clone().unwrap_or_default(),
             violence: dto.content.violence.clone().unwrap_or_default(),
         },
     })
@@ -399,6 +401,9 @@ pub fn story_to_metadata(dto: &StoryToml) -> Result<PackMetadata, String> {
 pub fn character_dto_to_canonical(
     dto: &CharacterToml,
 ) -> Result<story_model::CharacterDef, String> {
+    if dto.id.trim().is_empty() {
+        return Err("character id는 비어 있을 수 없습니다".to_string());
+    }
     Ok(story_model::CharacterDef {
         id: CharacterId(dto.id.clone()),
         name: dto.name.clone(),
@@ -432,9 +437,36 @@ pub fn rules_dto_to_canonical(dto: &RulesToml) -> Result<story_model::StoryRules
 
     let mut rules = StoryRules::minimal();
 
+    validate_unique_ids(
+        "location",
+        dto.locations.iter().map(|item| item.id.as_str()),
+    )?;
+    validate_unique_ids("flag", dto.flags.iter().map(|item| item.id.as_str()))?;
+    validate_unique_ids("number", dto.numbers.iter().map(|item| item.id.as_str()))?;
+    validate_unique_ids("string", dto.strings.iter().map(|item| item.id.as_str()))?;
+    validate_unique_ids("item", dto.items.iter().map(|item| item.id.as_str()))?;
+    validate_unique_ids("route", dto.routes.iter().map(|item| item.id.as_str()))?;
+    validate_unique_ids("ending", dto.endings.iter().map(|item| item.id.as_str()))?;
+
     // Delta limits
     let normal_min = dto.limits.normal_delta_min.unwrap_or(DEFAULT_DELTA_MIN);
     let normal_max = dto.limits.normal_delta_max.unwrap_or(DEFAULT_DELTA_MAX);
+    validate_i16_range("limits.normal_delta", normal_min, normal_max)?;
+    validate_i16_range(
+        "limits.affection",
+        dto.limits.affection_min.unwrap_or(DEFAULT_STAT_MIN),
+        dto.limits.affection_max.unwrap_or(DEFAULT_STAT_MAX),
+    )?;
+    validate_i16_range(
+        "limits.trust",
+        dto.limits.trust_min.unwrap_or(DEFAULT_STAT_MIN),
+        dto.limits.trust_max.unwrap_or(DEFAULT_STAT_MAX),
+    )?;
+    validate_i16_range(
+        "limits.tension",
+        dto.limits.tension_min.unwrap_or(DEFAULT_STAT_MIN),
+        dto.limits.tension_max.unwrap_or(DEFAULT_STAT_MAX),
+    )?;
     rules.delta_limits = DeltaLimits {
         affection: Int16Range {
             min: normal_min,
@@ -513,13 +545,25 @@ pub fn rules_dto_to_canonical(dto: &RulesToml) -> Result<story_model::StoryRules
 
     // Numbers
     for n in &dto.numbers {
+        let min = n.min.unwrap_or(i64::MIN);
+        let max = n.max.unwrap_or(i64::MAX);
+        let default = n.default.unwrap_or(0);
+        if min > max {
+            return Err(format!("number {} 범위 오류: min {min} > max {max}", n.id));
+        }
+        if !(min..=max).contains(&default) {
+            return Err(format!(
+                "number {} default {default}가 범위 {min}..={max} 밖입니다",
+                n.id
+            ));
+        }
         rules.numbers.insert(
             n.id.clone(),
             NumberVarDef {
                 id: n.id.clone(),
-                min: n.min.unwrap_or(i64::MIN),
-                max: n.max.unwrap_or(i64::MAX),
-                default: n.default.unwrap_or(0),
+                min,
+                max,
+                default,
             },
         );
     }
@@ -579,6 +623,7 @@ pub fn merge_events_into_rules(
     rules: &mut story_model::StoryRules,
 ) -> Result<(), String> {
     use story_model::{EventDef, EventEffects};
+    validate_unique_ids("event", dto.events.iter().map(|item| item.id.as_str()))?;
     for ev in &dto.events {
         let id = EventId(ev.id.clone());
 
@@ -626,6 +671,26 @@ pub fn merge_events_into_rules(
     Ok(())
 }
 
+fn validate_unique_ids<'a>(kind: &str, ids: impl Iterator<Item = &'a str>) -> Result<(), String> {
+    let mut seen = std::collections::BTreeSet::new();
+    for id in ids {
+        if id.trim().is_empty() {
+            return Err(format!("{kind} id는 비어 있을 수 없습니다"));
+        }
+        if !seen.insert(id) {
+            return Err(format!("중복 {kind} id: {id}"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_i16_range(label: &str, min: i16, max: i16) -> Result<(), String> {
+    if min > max {
+        return Err(format!("{label} 범위 오류: min {min} > max {max}"));
+    }
+    Ok(())
+}
+
 /// Parse a snake_case compare-operator string. Used by tests that build
 /// ConditionExpr via string tables.
 #[allow(dead_code)]
@@ -656,7 +721,6 @@ title = "비가 그친 뒤"
 language = "ko-KR"
 genres = ["modern-romance"]
 rating = "teen"
-all_major_characters_safe = true
 default_choice_count = 3
 
 [initial_state]
@@ -666,7 +730,6 @@ location = "cafe-namu"
 time_slot = "evening"
 
 [content]
-safe_content = "permitted_by_pack"
 violence = "mild"
 "#,
         )
@@ -678,16 +741,16 @@ violence = "mild"
         let dto = sample_story_toml();
         let md = story_to_metadata(&dto).expect("metadata");
         assert_eq!(md.story_id, "rainy-reunion");
-        assert_eq!(md.rating, PackRating::teen);
+        assert_eq!(md.rating, PackRating::Teen);
         assert_eq!(md.initial_state.location, LocationId("cafe-namu".into()));
         assert_eq!(md.initial_state.time_slot, TimeSlot::Evening);
-        assert_eq!(md.content.safe_content, "permitted_by_pack");
+        assert_eq!(md.content.violence, "mild");
     }
 
     #[test]
     fn bad_rating_is_error() {
         let mut dto = sample_story_toml();
-        dto.rating = "nc-17".to_string();
+        dto.rating = "restricted".to_string();
         let err = story_to_metadata(&dto).expect_err("error");
         assert!(err.contains("rating"));
     }
@@ -827,7 +890,7 @@ story_version = "0.1.0"
 min_engine_version = "0.1.0"
 title = "비가 그친 뒤"
 language = "ko-KR"
-rating = "teen"
+rating = "general"
 author = "StoryTUI Example"   # not modeled
 
 [content]

@@ -20,8 +20,9 @@ use futures_util::StreamExt;
 use reqwest::redirect::Policy;
 use reqwest::{Client, StatusCode};
 use story_model::{
-    DirectorPlan, DirectorRequest, GeneratedTurnDraft, ProviderCapabilities, ProviderError,
-    ProviderHealth, TokenUsage, TurnRequest, WriterEvent, WriterFinish, WriterRequest,
+    ChatMessage, DirectorPlan, DirectorRequest, GeneratedTurnDraft, ProviderCapabilities,
+    ProviderError, ProviderHealth, TokenUsage, TurnRequest, WriterEvent, WriterFinish,
+    WriterRequest,
 };
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
@@ -255,10 +256,22 @@ impl OpenAiCompatibleProvider {
         configured_request.temperature = temperature_override.unwrap_or(self.config.temperature);
         configured_request.top_p = self.config.top_p;
         configured_request.top_k = self.config.top_k;
-        configured_request.max_tokens = self.config.max_tokens;
+        // Engine-owned repair requests intentionally carry a smaller output
+        // cap. Respect that cap while retaining the operator's profile as the
+        // upper bound for ordinary turns.
+        configured_request.max_tokens = if request.max_tokens == 0 {
+            self.config.max_tokens
+        } else {
+            request.max_tokens.min(self.config.max_tokens)
+        };
         let bounded_request = bound_context(&configured_request, self.config.context_budget_tokens);
         let send_rf = !suppress_rf && self.structured_enabled() && request.json_schema.is_some();
-        let body = ChatCompletionRequest::from_turn(&bounded_request, &self.config.model, send_rf);
+        let model_name = if request.model.is_empty() || request.model == "mock" {
+            &self.config.model
+        } else {
+            &request.model
+        };
+        let body = ChatCompletionRequest::from_turn(&bounded_request, model_name, send_rf);
         let max_attempts = self.config.max_retries.saturating_add(1);
 
         for attempt in 0..max_attempts {
@@ -371,7 +384,12 @@ impl OpenAiCompatibleProvider {
                 usage.clone(),
             );
             let finish_reason = parsed.finish_reason().unwrap_or("missing").to_string();
-            return match parse_generated_turn(&content, request.generation_id) {
+            let parsed_content = if is_choice_only_request(request) {
+                crate::recovery::parse_generated_choices(&content, request.generation_id)
+            } else {
+                parse_generated_turn(&content, request.generation_id)
+            };
+            return match parsed_content {
                 Ok(outcome) => {
                     let mut draft = outcome.draft;
                     // Prefer the model's reported usage; fall back to the
@@ -400,6 +418,15 @@ impl OpenAiCompatibleProvider {
             "retry budget exhausted".to_string(),
         ))
     }
+}
+
+fn is_choice_only_request(request: &TurnRequest) -> bool {
+    request
+        .json_schema
+        .as_ref()
+        .and_then(|schema| schema.get("properties"))
+        .and_then(story_model::serde_json::Value::as_object)
+        .is_some_and(|properties| properties.len() == 1 && properties.contains_key("choices"))
 }
 
 /// Only envelope-level failures indicate that the server ignored constrained
@@ -454,36 +481,110 @@ struct ModelListItem {
     id: String,
 }
 
-/// Keep the input side of a request within the configured soft context budget.
+/// Keep the input side of a request within the configured hard context budget.
 /// The output reservation is `request.max_tokens`; the remaining budget is
 /// applied conservatively as a character count, which is intentionally safer
 /// for Korean text than assuming one token per whitespace-delimited word.
 fn bound_context(request: &TurnRequest, context_budget_tokens: u32) -> TurnRequest {
     let mut bounded = request.clone();
-    let output_reserve = request
-        .max_tokens
-        .min(context_budget_tokens.saturating_sub(1));
+    bounded.messages = bound_messages(&request.messages, request.max_tokens, context_budget_tokens);
+    bounded
+}
+
+/// Apply one strict aggregate character budget across every request message.
+/// The first system message and the last instruction receive higher weights;
+/// repair anchors in the middle are retained proportionally when space
+/// permits. The result always satisfies `sum(chars) <= input_budget`.
+fn bound_messages(
+    messages: &[ChatMessage],
+    max_tokens: u32,
+    context_budget_tokens: u32,
+) -> Vec<ChatMessage> {
+    let output_reserve = max_tokens.min(context_budget_tokens.saturating_sub(1));
     let input_budget = context_budget_tokens.saturating_sub(output_reserve).max(1) as usize;
-    let used = bounded
-        .messages
+    let used = messages
         .iter()
         .map(|message| message.content.chars().count())
         .sum::<usize>();
     if used <= input_budget {
-        return bounded;
+        return messages.to_vec();
+    }
+    if messages.is_empty() {
+        return Vec::new();
     }
 
-    let system_chars = bounded
-        .messages
+    let lengths = messages
         .iter()
-        .take(bounded.messages.len().saturating_sub(1))
         .map(|message| message.content.chars().count())
-        .sum::<usize>();
-    let user_budget = input_budget.saturating_sub(system_chars);
-    if let Some(last) = bounded.messages.last_mut() {
-        last.content = truncate_context(&last.content, user_budget);
+        .collect::<Vec<_>>();
+    let last = messages.len() - 1;
+    let weights = (0..messages.len())
+        .map(|index| if index == 0 || index == last { 3 } else { 1 })
+        .collect::<Vec<usize>>();
+    let mut caps = vec![0usize; messages.len()];
+    let mut active = vec![true; messages.len()];
+    let mut remaining = input_budget;
+
+    loop {
+        let total_weight = active
+            .iter()
+            .zip(&weights)
+            .filter_map(|(active, weight)| active.then_some(*weight))
+            .sum::<usize>();
+        if total_weight == 0 || remaining == 0 {
+            break;
+        }
+        let settled = (0..messages.len()).find(|&index| {
+            active[index]
+                && lengths[index] <= remaining.saturating_mul(weights[index]) / total_weight
+        });
+        if let Some(index) = settled {
+            caps[index] = lengths[index];
+            active[index] = false;
+            remaining = remaining.saturating_sub(lengths[index]);
+            continue;
+        }
+
+        for index in 0..messages.len() {
+            if active[index] {
+                caps[index] = remaining.saturating_mul(weights[index]) / total_weight;
+            }
+        }
+        let assigned = caps
+            .iter()
+            .enumerate()
+            .filter_map(|(index, cap)| active[index].then_some(*cap))
+            .sum::<usize>();
+        let mut leftover = remaining.saturating_sub(assigned);
+        let mut priority = vec![last];
+        if last != 0 {
+            priority.push(0);
+        }
+        priority.extend(1..last);
+        while leftover > 0 {
+            let mut progressed = false;
+            for &index in &priority {
+                if active[index] && caps[index] < lengths[index] && leftover > 0 {
+                    caps[index] += 1;
+                    leftover -= 1;
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+        break;
     }
-    bounded
+
+    messages
+        .iter()
+        .zip(caps)
+        .map(|(message, cap)| ChatMessage {
+            role: message.role.clone(),
+            content: truncate_context(&message.content, cap),
+        })
+        .collect()
 }
 
 fn truncate_context(input: &str, max_chars: usize) -> String {
@@ -697,6 +798,11 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
         // without this the plan is truncated mid-object and the parse fails
         // with `EOF`, surfacing as "모델 응답 형식을 이해하지 못했습니다".
         request.max_tokens = self.config.max_tokens;
+        request.messages = bound_messages(
+            &request.messages,
+            request.max_tokens,
+            self.config.context_budget_tokens,
+        );
         let model_name = if request.model.is_empty() || request.model == "mock" {
             &self.config.model
         } else {
@@ -773,19 +879,16 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
             match crate::recovery::parse_director_plan(&content) {
                 Ok(plan) => return Ok(plan),
                 Err(err) => {
-                    // Diagnostic: capture WHY the Director output is not a plan.
+                    // Diagnostic: capture only structural metadata about WHY
+                    // the Director output is not a plan. Model response text
+                    // can contain player input or story prose and must never
+                    // cross the no-leak log boundary.
                     // - send_rf: was response_format (guided JSON) actually sent?
                     // - finish_reason "length" => hit the token cap mid-generation;
                     //   "stop" => the model finished on its own without JSON.
-                    // - has_think / has_brace / head => is it a <think> block, pure
-                    //   prose, or malformed JSON? This is operator-facing tracing,
-                    //   never shown to the player.
+                    // - has_think / has_brace => is it a <think> block, pure
+                    //   prose, or malformed JSON?
                     let lower = content.to_ascii_lowercase();
-                    let head: String = content
-                        .chars()
-                        .take(160)
-                        .collect::<String>()
-                        .replace('\n', "\\n");
                     tracing::warn!(
                         target: "story_provider::openai_compatible",
                         generation_id = %request.generation_id,
@@ -796,8 +899,7 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
                         content_chars = content.chars().count(),
                         has_think = lower.contains("<think"),
                         has_brace = content.contains('{'),
-                        head = %head,
-                        "director plan parse failed; raw head captured for diagnosis"
+                        "director plan parse failed"
                     );
                     if attempt + 1 < max_attempts {
                         Self::sleep_or_cancel(attempt, &cancel).await?;
@@ -827,6 +929,11 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
         // Apply the operator's output budget so rich Korean narration is not
         // truncated by the request's low default.
         request.max_tokens = self.config.max_tokens;
+        request.messages = bound_messages(
+            &request.messages,
+            request.max_tokens,
+            self.config.context_budget_tokens,
+        );
         let model_name = if request.model.is_empty() || request.model == "mock" {
             &self.config.model
         } else {
@@ -1072,5 +1179,40 @@ mod tests {
         let bounded = bound_context(&request, 50);
         assert!(bounded.messages[1].content.chars().count() <= 48);
         assert!(bounded.messages[1].content.contains("중략"));
+    }
+
+    #[test]
+    fn context_budget_is_a_hard_bound_across_repair_messages() {
+        let messages = vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: "S".repeat(100),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: "U".repeat(100),
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "A".repeat(100),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: "R".repeat(100),
+            },
+        ];
+        let bounded = bound_messages(&messages, 10, 50);
+        let total = bounded
+            .iter()
+            .map(|message| message.content.chars().count())
+            .sum::<usize>();
+        assert!(total <= 40, "input budget must be hard: {total}");
+        assert!(!bounded[0].content.is_empty(), "system context retained");
+        assert!(
+            !bounded[3].content.is_empty(),
+            "repair instruction retained"
+        );
+        assert!(bounded[0].content.len() >= bounded[1].content.len());
+        assert!(bounded[3].content.len() >= bounded[2].content.len());
     }
 }

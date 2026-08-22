@@ -49,6 +49,18 @@ struct RawGeneratedTurn {
     usage: Option<TokenUsage>,
 }
 
+/// Compact wire shape used by the dedicated choice-refresh path. Keeping this
+/// separate from `RawGeneratedTurn` prevents a small model from spending most
+/// of its output budget fabricating narration, patch, and summary placeholders
+/// that the reducer discards anyway.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawGeneratedChoices {
+    choices: Vec<Choice>,
+    #[serde(default)]
+    usage: Option<TokenUsage>,
+}
+
 /// Parse a raw model response into a validated [`GeneratedTurnDraft`], applying
 /// limited recovery. See the module docs for the full pipeline.
 pub fn parse_generated_turn(raw: &str, generation_id: Uuid) -> Result<ParseOutcome, ProviderError> {
@@ -134,7 +146,7 @@ pub fn parse_generated_turn(raw: &str, generation_id: Uuid) -> Result<ParseOutco
     };
 
     // Scrub foreign-script contamination (cyrillic / kana / CJK ideographs) that
-    // merged "safe/private" local models occasionally bleed into Korean
+    // Some merged local models occasionally bleed unrelated tokens into Korean
     // prose. Korean modern narration does not use these inline; removing them is
     // safe and a no-op on already-clean text. Lets us keep a creative-but-leaky
     // model usable. Applied to player-facing text only.
@@ -178,6 +190,97 @@ pub fn parse_generated_turn(raw: &str, generation_id: Uuid) -> Result<ParseOutco
         usage: parsed.usage,
     };
     Ok(ParseOutcome { draft, repairs })
+}
+
+/// Parse a choice-only JSON response and adapt it to the existing engine draft
+/// boundary. Narration, patch, and summary are compatibility placeholders; the
+/// choice-refresh reducer commits only `choices`.
+pub fn parse_generated_choices(
+    raw: &str,
+    generation_id: Uuid,
+) -> Result<ParseOutcome, ProviderError> {
+    let mut repairs = Vec::new();
+    let work = {
+        let lead = raw.trim_start();
+        if lead.starts_with('"') {
+            match serde_json::from_str::<String>(lead) {
+                Ok(inner) => {
+                    repairs.push("unwrapped stringified JSON body".to_string());
+                    inner
+                }
+                Err(_) => raw.to_string(),
+            }
+        } else {
+            raw.to_string()
+        }
+    };
+    let stripped = strip_reasoning(&work);
+    if stripped != work {
+        repairs.push("stripped reasoning/thinking block".to_string());
+    }
+    let trimmed = stripped.trim();
+    let located = locate_json(trimmed)
+        .ok_or_else(|| InvalidGeneration(detail("json_extract: no JSON object found")))?;
+    if located != trimmed {
+        repairs.push("located JSON object (stripped prose/markdown fence)".to_string());
+    }
+    let normalized = normalize_common_wire_aliases(located);
+    let mut parsed = match serde_json::from_str::<RawGeneratedChoices>(&normalized) {
+        Ok(parsed) => parsed,
+        Err(_) => {
+            let quote_repaired = escape_unescaped_quotes(&normalized);
+            let ctrl_repaired = sanitize_json_control_characters(&quote_repaired);
+            let repaired = strip_trailing_commas(&ctrl_repaired);
+            if repaired != normalized {
+                repairs.push("repaired choice-only JSON strings/commas".to_string());
+            }
+            let repaired = normalize_common_wire_aliases(&repaired);
+            serde_json::from_str::<RawGeneratedChoices>(&repaired).map_err(|error| {
+                let stage = if serde_json::from_str::<Value>(&repaired).is_ok() {
+                    "schema"
+                } else {
+                    "json_syntax"
+                };
+                InvalidGeneration(detail(&format!("choice {stage}: {error}")))
+            })?
+        }
+    };
+
+    for choice in &mut parsed.choices {
+        choice.label = scrub_foreign_scripts(&choice.label);
+        choice.intent = scrub_foreign_scripts(&choice.intent);
+        if let Some(preview) = choice.preview.take() {
+            choice.preview = Some(scrub_foreign_scripts(&preview));
+        }
+    }
+    sanitize_choices(&mut parsed.choices);
+    let count = parsed.choices.len();
+    if !(1..=6).contains(&count) {
+        return Err(InvalidGeneration(detail(&format!(
+            "validation: choice count out of range [1, 6]: got {count}"
+        ))));
+    }
+
+    Ok(ParseOutcome {
+        draft: GeneratedTurnDraft {
+            generation_id,
+            narration: "선택지 갱신 전용".to_string(),
+            choices: parsed.choices,
+            proposed_patch: StatePatch::default(),
+            summary: TurnSummary {
+                facts: Vec::new(),
+                unresolved: Vec::new(),
+                relationship_changes: Vec::new(),
+                knowledge_changes: Vec::new(),
+                interpretation: None,
+                address_form_changes: Vec::new(),
+                important_player_actions: Vec::new(),
+                source_history_ids: Vec::new(),
+            },
+            usage: parsed.usage,
+        },
+        repairs,
+    })
 }
 
 /// Strict Director plan JSON parser with resilience and single-pass recovery.
@@ -436,6 +539,15 @@ fn normalize_common_wire_aliases(input: &str) -> String {
     let Value::Object(object) = &mut root else {
         return input.to_string();
     };
+    // A common local-writer alias. Accept it only when it is an actual prose
+    // string and the canonical field is absent; ambiguous or duplicate shapes
+    // remain strict errors.
+    if !object.contains_key("narration")
+        && object.get("scene").is_some_and(Value::is_string)
+        && let Some(scene) = object.remove("scene")
+    {
+        object.insert("narration".to_string(), scene);
+    }
     if let Some(Value::Array(choices)) = object.get_mut("choices") {
         for (index, choice) in choices.iter_mut().enumerate() {
             if let Value::Object(choice) = choice {
@@ -459,9 +571,23 @@ fn normalize_common_wire_aliases(input: &str) -> String {
                     choice.remove("text");
                     choice.remove("on_select");
                 }
-                choice
-                    .entry("id".to_string())
-                    .or_insert_with(|| Value::String(format!("choice-{}", index + 1)));
+                // Small local models occasionally satisfy the semantic part of
+                // the choice contract but omit the short display label. The
+                // intent is already player-facing Korean in that case, so use
+                // it as the cosmetic label instead of discarding an otherwise
+                // valid turn. If both are absent, strict deserialization still
+                // rejects the response.
+                if !choice.contains_key("label")
+                    && let Some(Value::String(intent)) = choice.get("intent").cloned()
+                {
+                    choice.insert("label".to_string(), Value::String(intent));
+                }
+                if !choice.get("id").is_some_and(Value::is_string) {
+                    choice.insert(
+                        "id".to_string(),
+                        Value::String(format!("choice-{}", index + 1)),
+                    );
+                }
                 choice.entry("tone".to_string()).or_insert(Value::Null);
                 choice.entry("target".to_string()).or_insert(Value::Null);
                 choice

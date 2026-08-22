@@ -45,7 +45,6 @@ fn sample_pack() -> StoryPack {
         language: "ko-KR".to_string(),
         genres: vec!["drama".to_string()],
         rating: PackRating::General,
-        all_major_characters_safe: true,
         default_choice_count: 3,
         initial_state: PackInitialState {
             chapter: "chapter-1".to_string(),
@@ -54,7 +53,6 @@ fn sample_pack() -> StoryPack {
             time_slot: TimeSlot::Morning,
         },
         content: PackContentPolicy {
-            safe_content: "none".to_string(),
             violence: "none".to_string(),
         },
     };
@@ -863,9 +861,42 @@ fn latest_live_uninteresting_fixture_is_refreshed_before_display() {
         .expect("choice-only request")
         .content
         .as_str();
-    assert!(repair_prompt.contains("preview가 비어 있다"));
-    assert!(repair_prompt.contains("위험도가 모두 비슷하다"));
-    assert!(repair_prompt.contains("관찰·기다리기·분위기 언급"));
+    assert!(repair_prompt.contains("# 세 슬롯 (이 순서 고정)"));
+    assert!(repair_prompt.contains("단서/low"));
+    assert!(repair_prompt.contains("품질 규칙"));
+    assert!(
+        !repair_prompt.contains(
+            fixture["choices"][0]["label"]
+                .as_str()
+                .expect("fixture label")
+        )
+    );
+    let repair_request = transition
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            EngineEffect::RequestGeneration { request, .. } => Some(request),
+            _ => None,
+        })
+        .expect("choice-only request");
+    assert_eq!(repair_request.max_tokens, 900);
+    assert_eq!(repair_request.messages.len(), 2);
+    assert!(repair_request.messages[0].content.contains("생각"));
+    assert!(
+        repair_request.messages[0]
+            .content
+            .contains("label, intent, risk, preview만")
+    );
+    assert!(repair_request.messages[0].content.contains("전체 이용가"));
+    assert!(
+        repair_request
+            .messages
+            .iter()
+            .map(|message| message.content.len())
+            .sum::<usize>()
+            < 6_000,
+        "choice repair prompt must remain compact"
+    );
 }
 
 #[test]
@@ -925,7 +956,8 @@ fn just_selected_action_is_rejected_even_before_last_choice_commits() {
         .expect("choice repair prompt")
         .content
         .as_str();
-    assert!(repair_prompt.contains("플레이어가 방금 고른 행동을 다시 제시한다"));
+    assert!(repair_prompt.contains("문장은 보여 주지 않으니 복사하지 말고"));
+    assert!(!repair_prompt.contains("시계와 코트 상태를 언급해 변화를 확인한다"));
 }
 
 #[test]
@@ -955,6 +987,9 @@ fn manual_choice_refresh_preserves_turn_and_accepts_a_new_designed_set() {
     let refresh_id = refreshing.state.pending.as_ref().unwrap().generation_id;
     let mut replacement = valid_draft(refresh_id, 0);
     replacement.choices = interesting_choices();
+    for choice in &mut replacement.choices {
+        choice.risk = RiskLevel::Safe;
+    }
     let complete = reduce(
         &refreshing.state,
         EngineCommand::AcceptGeneration {
@@ -973,7 +1008,7 @@ fn manual_choice_refresh_preserves_turn_and_accepts_a_new_designed_set() {
 }
 
 #[test]
-fn failed_choice_refresh_keeps_the_old_offers_and_exposes_retry() {
+fn failed_choice_refresh_keeps_the_old_offers_without_blocking_the_player() {
     let pack = sample_pack();
     let (opening_pending, opening_id) = start_and_pending_id(&pack);
     let stable = reduce(
@@ -996,29 +1031,66 @@ fn failed_choice_refresh_keeps_the_old_offers_and_exposes_retry() {
         choice.preview = Some("기존 제안을 표현만 바꿔 다시 시도한다".to_string());
     }
 
-    let rejected = reduce(
+    let retrying = reduce(
         &refreshing.state,
         EngineCommand::AcceptGeneration {
             draft: Box::new(repeated),
         },
         &pack,
     )
-    .expect("reject repeated refresh");
+    .expect("retry repeated refresh once");
 
-    assert_eq!(serde_json::to_vec(&rejected.state.game).unwrap(), before);
-    assert!(rejected.state.pending.is_none());
+    assert_eq!(serde_json::to_vec(&retrying.state.game).unwrap(), before);
+    let retry_pending = retrying
+        .state
+        .pending
+        .as_ref()
+        .expect("second refresh pending");
+    assert_eq!(retry_pending.choice_refresh_attempt, 2);
+    assert_eq!(retry_pending.choice_refresh_rejected.len(), 3);
+    let retry_request = retrying
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            EngineEffect::RequestGeneration { request, .. } => Some(request),
+            _ => None,
+        })
+        .expect("second choice request");
+    let retry_prompt = &retry_request.messages.last().unwrap().content;
+    assert!(retry_prompt.contains("문장은 보여 주지 않으니 복사하지 말고"));
+    assert!(!retry_prompt.contains(&stable.game.history.last().unwrap().choices[0].label));
+
+    let retry_id = retry_pending.generation_id;
+    let mut repeated_again = valid_draft(retry_id, 0);
+    repeated_again.choices = stable.game.history.last().unwrap().choices.clone();
+    for choice in &mut repeated_again.choices {
+        choice.intent = choice.label.clone();
+        choice.preview = Some("첫 실패와 같은 제안을 또 반복한다".to_string());
+    }
+    let finished = reduce(
+        &retrying.state,
+        EngineCommand::AcceptGeneration {
+            draft: Box::new(repeated_again),
+        },
+        &pack,
+    )
+    .expect("finish after one repeated retry");
+
+    assert_eq!(serde_json::to_vec(&finished.state.game).unwrap(), before);
+    assert!(finished.state.pending.is_none());
+    assert!(finished.state.retry_pending.is_none());
     assert!(
-        rejected
-            .state
-            .retry_pending
-            .as_ref()
-            .unwrap()
-            .choice_refresh
+        !finished
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, EngineEffect::ShowRecoverableError(_)))
     );
-    assert!(rejected.effects.iter().any(|effect| matches!(
-        effect,
-        EngineEffect::ShowRecoverableError(error) if error.code == "choice_quality_failed"
-    )));
+    assert!(
+        !finished
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, EngineEffect::RequestGeneration { .. }))
+    );
 }
 
 #[test]

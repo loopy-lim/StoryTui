@@ -2,14 +2,14 @@
 
 문서 버전: 1.0-draft  
 장르: 현대 로맨스·드라마  
-주요 등장인물: 모두 명백한 모든 인물  
+주요 등장인물: 오랜 친구 1명
 목적: MVP loader, prompt, Mock Provider, reducer와 save 테스트에 사용할 최소 Pack
 
 ## 1. 개요
 
 플레이어는 세 해 전 연락이 끊긴 대학 동아리 친구 한유나와 비 오는 저녁 카페에서 재회한다. 이야기는 “떠난 이유를 추궁할 것인가, 먼저 자신의 침묵을 설명할 것인가, 지금은 일상적인 대화로 거리를 잴 것인가”를 중심으로 진행된다.
 
-이 예제는 명시적 성적 장면을 포함하지 않는다. 다만 모든 인물 대상 Pack을 기술적으로 식별할 수 있도록 모든 주요 인물의 나이, `rating = "teen"`, `all_major_characters_safe = true`, 콘텐츠 capability를 구조적으로 선언한다. 콘텐츠의 실제 표현 범위는 모델·파인튜닝·chat template·prompt와 적용 법률·라이선스에 좌우되며 4bit/Q6_K 같은 정밀도가 정책을 결정하지 않는다.
+이 예제는 `teen` 등급의 전체 이용가 로맨스·드라마다. 기본 프롬프트와 사건은 관계 회복, 약속, 오해와 대화에 집중하며 가족과 함께 볼 수 있는 표현 범위를 지킨다.
 
 ## 2. 디렉터리
 
@@ -40,15 +40,13 @@ author = "StoryTUI Example"
 language = "ko-KR"
 genres = ["modern-romance", "drama"]
 rating = "teen"
-all_major_characters_safe = true
 default_choice_count = 3
 
 [content]
 romance = true
-safe_content = "permitted_by_pack"
 violence = "mild"
 substance_use = "social_only"
-notes = "모든 주요 등장인물은 모든 인물이다. 명시적 장면은 이 예제에 포함하지 않는다."
+notes = "전체 이용가 표현 범위를 지키는 관계 중심 이야기다."
 
 [files]
 characters = "characters.toml"
@@ -413,9 +411,9 @@ summary = "두 사람은 상대가 떠날까 두려웠던 마음을 각자의 �
 - 자유 입력 원문의 핵심 의도를 축소하거나 정반대로 바꾸지 않는다.
 
 콘텐츠:
-- 이 Pack의 주요 등장인물은 모두 모든 인물이다.
+- 전체 이용가 표현 범위를 지킨다.
 - Story Pack의 등급과 허용 범위 안에서만 작성한다.
-- 모델 자체 정책과 라이선스를 따른다. 출력 정밀도가 콘텐츠 허용 범위를 바꾼다고 가정하지 않는다.
+- 모델 자체 정책과 라이선스를 따른다.
 
 출력:
 - 요청된 JSON Schema 또는 명시된 JSON 필드만 반환한다.
@@ -694,7 +692,7 @@ MVP의 단일 호출 계약용 fixture다.
 - 모든 TOML이 파싱된다.
 - major schema version이 엔진과 호환된다.
 - character·location·flag·event·route ID가 유일하다.
-- teen metadata와 주요 인물 나이가 유효하다.
+- Pack 등급이 지원 범위에 있다.
 - 장소 전이가 3개 허용 장소만 사용한다.
 - normal delta는 -3~+3이다.
 - route와 ending은 Rust 조건으로만 확정된다.
@@ -702,4 +700,3 @@ MVP의 단일 호출 계약용 fixture다.
 - 유나의 해요체·호칭·unknown facts가 첫 장면에서 유지된다.
 - 허용 patch는 통과하고 거부 fixture는 전체 rollback한다.
 - Story Pack을 추가·수정해도 Rust 코드 재컴파일이 필요하지 않다.
-
