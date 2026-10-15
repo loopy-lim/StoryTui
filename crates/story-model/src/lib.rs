@@ -36,6 +36,7 @@ pub mod enums;
 pub mod error;
 pub mod history;
 pub mod id;
+pub mod lorebook;
 pub mod memory;
 pub mod pack;
 pub mod patch;
@@ -67,6 +68,10 @@ pub use enums::{
 pub use error::CoreError;
 pub use history::HistoryEntry;
 pub use id::{CharacterId, EventId, FlagId, ItemId, LocationId};
+pub use lorebook::{
+    DEFAULT_LOREBOOK_SCAN_DEPTH, DEFAULT_LOREBOOK_TOKEN_BUDGET, Lorebook, LorebookEntry,
+    LorebookLogic, LorebookPosition,
+};
 pub use memory::{MemoryEntry, MemoryFact};
 pub use pack::{
     CharacterDef, PACK_SCHEMA_VERSION, PackContentPolicy, PackInitialState, PackMetadata,

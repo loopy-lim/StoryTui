@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/story-model",
     "crates/story-core",
+    "crates/story-import",
     "crates/story-provider",
     "crates/story-persistence",
     "crates/story-tts",
@@ -25,6 +26,9 @@ thiserror = "2.0.19"
 anyhow = "1.0.104"
 toml = "1.1.4"
 tracing = "0.1.44"
+# Character-card PNG tEXt decoding/encoding for the importer's fixtures.
+png = "0.17"
+base64 = "0.22"
 tracing-subscriber = "0.3.23"
 async-trait = "0.1.91"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream"] }
@@ -50,6 +54,7 @@ insta = "1.48.0"
 wiremock = "0.6"
 story-model = { path = "crates/story-model" }
 story-core = { path = "crates/story-core" }
+story-import = { path = "crates/story-import" }
 story-provider = { path = "crates/story-provider" }
 story-persistence = { path = "crates/story-persistence" }
 story-tts = { path = "crates/story-tts" }

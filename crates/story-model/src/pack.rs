@@ -103,6 +103,14 @@ pub struct CharacterDef {
     pub age: Option<u32>,
     /// Optional pronouns / address-form hint string.
     pub pronouns: Option<String>,
+    /// Free-form description prose (imported card `description`). Native packs
+    /// leave this `None` and speak through the structured lists instead; it is
+    /// rendered into the canon block verbatim, so importers must keep it
+    /// within the token gate they apply at build time.
+    pub description_md: Option<String>,
+    /// Example dialogue blocks (imported card `mes_example`, split on
+    /// `<START>`), rendered as voice examples in the canon block.
+    pub dialogue_examples: Vec<String>,
     /// Personality bullet lines.
     pub personality: Vec<String>,
     /// Appearance bullet lines.
@@ -210,6 +218,8 @@ mod tests {
             name: "한유나".to_string(),
             age: Some(29),
             pronouns: Some("그녀".to_string()),
+            description_md: None,
+            dialogue_examples: Vec::new(),
             personality: vec!["관찰력이 좋다".to_string()],
             appearance: vec!["짧은 검은 머리".to_string()],
             values: vec!["솔직함".to_string()],

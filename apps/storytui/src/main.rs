@@ -4,6 +4,7 @@
 //! the real OpenAI-compatible provider are assembled here.
 
 mod host;
+mod import_cmd;
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -17,7 +18,17 @@ const MAX_RUNTIME_LOG_BYTES: u64 = 1024 * 1024;
 
 #[tokio::main]
 async fn main() {
-    let cli = match storytui::config::CliOptions::parse(std::env::args().skip(1).collect()) {
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    // The import subcommand never enters the TUI: it compiles a card into a
+    // pack directory and prints a report.
+    if raw_args.first().map(String::as_str) == Some("import") {
+        if let Err(message) = import_cmd::run(&raw_args[1..]) {
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
+        return;
+    }
+    let cli = match storytui::config::CliOptions::parse(raw_args) {
         Ok(cli) => cli,
         Err(message) if message == storytui::config::CliOptions::usage() => {
             println!("{message}");

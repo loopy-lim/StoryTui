@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 story-core.workspace = true
+story-import.workspace = true
 story-model.workspace = true
 story-provider.workspace = true
 story-persistence.workspace = true

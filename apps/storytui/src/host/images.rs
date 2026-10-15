@@ -172,6 +172,8 @@ mod tests {
                 name: "한유나".to_string(),
                 age: None,
                 pronouns: None,
+                description_md: None,
+                dialogue_examples: Vec::new(),
                 personality: vec![],
                 appearance: vec![],
                 values: vec![],

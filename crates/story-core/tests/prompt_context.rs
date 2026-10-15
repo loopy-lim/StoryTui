@@ -51,6 +51,8 @@ fn sample_character(id: &str) -> CharacterDef {
         name: id.to_string(),
         age: Some(29),
         pronouns: None,
+        description_md: None,
+        dialogue_examples: Vec::new(),
         personality: vec![],
         appearance: vec![],
         values: vec![],

@@ -356,6 +356,17 @@ fn character_canon_context(pack: &StoryPack) -> String {
         if let Some(age) = def.age {
             out.push_str(&format!("age: {age}\n"));
         }
+        if let Some(description) = def
+            .description_md
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            out.push_str("description: |\n");
+            for line in description.lines() {
+                out.push_str(&format!("  {line}\n"));
+            }
+        }
         append_list(&mut out, "personality", &def.personality);
         append_list(&mut out, "appearance", &def.appearance);
         append_list(&mut out, "values", &def.values);
@@ -365,6 +376,15 @@ fn character_canon_context(pack: &StoryPack) -> String {
         append_value(&mut out, "honorific_rule", &def.honorific_rule);
         append_list(&mut out, "frequent_phrases", &def.frequent_phrases);
         append_list(&mut out, "avoid_phrases", &def.avoid_phrases);
+        if !def.dialogue_examples.is_empty() {
+            out.push_str("dialogue_examples:\n");
+            for example in &def.dialogue_examples {
+                out.push_str("  - |\n");
+                for line in example.lines() {
+                    out.push_str(&format!("    {line}\n"));
+                }
+            }
+        }
         append_value(&mut out, "current_goal", &def.current_goal);
         append_value(&mut out, "long_term_desire", &def.long_term_desire);
         append_list(&mut out, "canonical_known_facts", &def.known_facts);

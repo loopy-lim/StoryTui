@@ -56,6 +56,8 @@ fn sample_pack() -> StoryPack {
         name: "나무".to_string(),
         age: Some(28),
         pronouns: None,
+        description_md: None,
+        dialogue_examples: Vec::new(),
         personality: vec![],
         appearance: vec![],
         values: vec![],

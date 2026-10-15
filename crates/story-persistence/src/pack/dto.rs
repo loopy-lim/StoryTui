@@ -108,6 +108,12 @@ pub struct CharacterToml {
     pub age: Option<u32>,
     #[serde(default)]
     pub pronouns: Option<String>,
+    /// Free-form description prose (imported card `description`).
+    #[serde(default)]
+    pub description_md: Option<String>,
+    /// Example dialogue blocks (imported card `mes_example`).
+    #[serde(default)]
+    pub dialogue_examples: Vec<String>,
     #[serde(default)]
     pub personality: Vec<String>,
     #[serde(default)]
@@ -409,6 +415,8 @@ pub fn character_dto_to_canonical(
         name: dto.name.clone(),
         age: dto.age,
         pronouns: dto.pronouns.clone(),
+        description_md: dto.description_md.clone(),
+        dialogue_examples: dto.dialogue_examples.clone(),
         personality: dto.personality.clone(),
         appearance: dto.appearance.clone(),
         values: dto.values.clone(),

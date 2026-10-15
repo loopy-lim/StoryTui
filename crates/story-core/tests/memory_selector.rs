@@ -132,6 +132,8 @@ fn pack_with_route_premise(premise: &str) -> StoryPack {
             name: "한유나".to_string(),
             age: Some(29),
             pronouns: Some("그녀".to_string()),
+            description_md: None,
+            dialogue_examples: Vec::new(),
             personality: vec!["관찰력".to_string()],
             appearance: vec![],
             values: vec!["솔직함".to_string()],
