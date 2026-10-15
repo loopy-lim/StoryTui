@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 ratatui.workspace = true
+ratatui-image.workspace = true
+image.workspace = true
 crossterm.workspace = true
 tokio.workspace = true
 unicode-width.workspace = true

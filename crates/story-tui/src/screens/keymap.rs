@@ -46,6 +46,18 @@ pub const KEYMAP: &[KeymapRow] = &[
         action_ko: "게임 중 설정 열기",
     },
     KeymapRow {
+        key: "v",
+        action_ko: "내레이션 낭독 켜기/끄기",
+    },
+    KeymapRow {
+        key: "e",
+        action_ko: "프로바이더 전환 (설정 화면)",
+    },
+    KeymapRow {
+        key: "i",
+        action_ko: "장면 이미지 켜기/끄기 (설정 화면)",
+    },
+    KeymapRow {
         key: "Home",
         action_ko: "시작 메뉴로 이동",
     },

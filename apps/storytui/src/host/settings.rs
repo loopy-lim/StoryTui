@@ -6,11 +6,13 @@ use std::sync::Arc;
 
 use story_model::ProviderHealth;
 use story_provider::{LlmProvider, OpenAiCompatibleProvider, ProviderConfig};
+use story_tts::{TtsService, TtsStatus};
 use story_tui::App;
 
 use storytui::config::{RuntimeConfig, UserSettings, save_user_settings};
 use storytui::diagnostic::provider_config_safe_with_models;
 
+#[allow(clippy::too_many_arguments)] // the projection stays explicit at the host boundary
 pub fn refresh_view(
     app: &mut App,
     provider_config: &ProviderConfig,
@@ -18,6 +20,9 @@ pub fn refresh_view(
     director_model: Option<String>,
     choice_model: Option<String>,
     writer_model: Option<String>,
+    tts: &TtsStatus,
+    images_enabled: bool,
+    image_backend: Option<String>,
 ) {
     app.set_settings(
         provider_config_safe_with_models(
@@ -31,7 +36,19 @@ pub fn refresh_view(
         provider_config.top_p,
         provider_config.top_k,
         provider_config.max_tokens,
+        storytui_tts_display(tts),
+        images_enabled,
+        image_backend,
     );
+}
+
+/// Map the service status onto the UI's plain display type.
+fn storytui_tts_display(tts: &TtsStatus) -> story_tui::app::TtsDisplay {
+    story_tui::app::TtsDisplay {
+        enabled: tts.enabled,
+        backend: tts.backend.as_str().to_string(),
+        voice: tts.voice.clone(),
+    }
 }
 
 pub async fn refresh_model_list(
@@ -78,6 +95,140 @@ pub fn reconcile_active_model(
     advertised.first().cloned()
 }
 
+/// Re-project the Settings screen after a model-stage activation: probe
+/// health, read back the persisted overrides, and refresh the display.
+async fn refresh_projection(
+    app: &mut App,
+    provider_config: &ProviderConfig,
+    provider: &OpenAiCompatibleProvider,
+    user_settings: &UserSettings,
+    tts: &TtsService,
+) {
+    let health = provider
+        .health()
+        .await
+        .unwrap_or(ProviderHealth::Unavailable);
+    let tts_status = tts.status().await;
+    refresh_view(
+        app,
+        provider_config,
+        health,
+        user_settings.director_model.clone(),
+        user_settings.choice_model.clone(),
+        user_settings.writer_model.clone(),
+        &tts_status,
+        app.images_enabled(),
+        app.image_backend_label(),
+    );
+}
+
+/// Activate a different configured provider profile at runtime.
+///
+/// Rebuilds the provider (fresh endpoint + credentials), re-probes health,
+/// repairs models that the new server does not advertise (mirroring the
+/// startup repair), persists the choice, and refreshes the picker + settings
+/// projection. The engine state is untouched — a provider swap is transparent
+/// to the story in progress.
+#[allow(clippy::too_many_arguments)] // mirrors the other apply_* activation signatures
+pub async fn apply_provider(
+    app: &mut App,
+    name: &str,
+    providers: &[ProviderConfig],
+    provider_config: &mut ProviderConfig,
+    provider: &mut Arc<OpenAiCompatibleProvider>,
+    user_settings: &mut UserSettings,
+    config: &mut RuntimeConfig,
+    tts: &TtsService,
+) -> Result<(), String> {
+    let Some(selected) = providers.iter().find(|entry| entry.name == name) else {
+        tracing::warn!(provider = %name, "requested provider is not configured");
+        return Ok(());
+    };
+    tracing::info!(
+        from = %provider_config.name,
+        to = %selected.name,
+        base_url = %selected.base_url,
+        "switching provider"
+    );
+    // Build before swapping any state: a failed construction (rare — client
+    // build) must leave the old provider fully in charge.
+    let rebuilt = Arc::new(
+        OpenAiCompatibleProvider::new(selected.clone())
+            .map_err(|e| format!("프로바이더 '{name}'를 적용하지 못했습니다: {e}"))?,
+    );
+    *provider_config = selected.clone();
+    config.provider = selected.clone();
+    *provider = rebuilt;
+
+    let health = provider
+        .health()
+        .await
+        .unwrap_or(ProviderHealth::Unavailable);
+    let advertised = provider.list_models().await.unwrap_or_default();
+
+    // Mirror the startup repair: a model the new server does not advertise
+    // falls back to the profile's own model, then to the first advertised id.
+    if !advertised.is_empty() {
+        let fallback = provider_config.model.clone();
+        if let Some(model) = reconcile_active_model(&provider_config.model, &fallback, &advertised)
+            && model != provider_config.model
+        {
+            tracing::warn!(
+                stale_model = %provider_config.model,
+                fallback_model = %model,
+                provider = %name,
+                "model is not advertised by the new provider; using an available one"
+            );
+            provider_config.model = model;
+            config.provider = provider_config.clone();
+        }
+        for stage in [
+            &mut config.director_model,
+            &mut config.choice_model,
+            &mut config.writer_model,
+        ] {
+            if let Some(current) = stage.clone()
+                && !advertised.iter().any(|model| model == &current)
+            {
+                tracing::warn!(
+                    stale_model = %current,
+                    provider = %name,
+                    "stage model is not advertised by the new provider; using the active model"
+                );
+                *stage = Some(provider_config.model.clone());
+            }
+        }
+    }
+
+    // Persist the provider choice and the (possibly repaired) models.
+    user_settings.provider = Some(name.to_string());
+    user_settings.model = Some(provider_config.model.clone());
+    user_settings.director_model = config.director_model.clone();
+    user_settings.choice_model = config.choice_model.clone();
+    user_settings.writer_model = config.writer_model.clone();
+    save_user_settings(&config.save_dir, user_settings)?;
+
+    let tts_status = tts.status().await;
+    refresh_view(
+        app,
+        provider_config,
+        health,
+        user_settings.director_model.clone(),
+        user_settings.choice_model.clone(),
+        user_settings.writer_model.clone(),
+        &tts_status,
+        app.images_enabled(),
+        app.image_backend_label(),
+    );
+    let roster: Vec<(String, String)> = providers
+        .iter()
+        .map(|entry| (entry.name.clone(), entry.base_url.clone()))
+        .collect();
+    app.set_providers(&roster, name);
+    refresh_model_list(app, provider, provider_config, false).await;
+    Ok(())
+}
+
 /// Persist and activate a newly selected model. This creates a fresh provider
 /// so later generation requests cannot retain the prior model configuration.
 pub async fn apply_model(
@@ -87,6 +238,7 @@ pub async fn apply_model(
     provider: &mut Arc<OpenAiCompatibleProvider>,
     user_settings: &mut UserSettings,
     save_dir: &Path,
+    tts: &TtsService,
 ) -> Result<(), String> {
     provider_config.model = model.clone();
     user_settings.model = Some(model);
@@ -95,18 +247,7 @@ pub async fn apply_model(
         OpenAiCompatibleProvider::new(provider_config.clone())
             .map_err(|e| format!("선택한 모델을 적용하지 못했습니다: {e}"))?,
     );
-    let health = provider
-        .health()
-        .await
-        .unwrap_or(ProviderHealth::Unavailable);
-    refresh_view(
-        app,
-        provider_config,
-        health,
-        user_settings.director_model.clone(),
-        user_settings.choice_model.clone(),
-        user_settings.writer_model.clone(),
-    );
+    refresh_projection(app, provider_config, provider, user_settings, tts).await;
     Ok(())
 }
 
@@ -118,22 +259,12 @@ pub async fn apply_director_model(
     provider_config: &ProviderConfig,
     provider: &OpenAiCompatibleProvider,
     user_settings: &mut UserSettings,
+    tts: &TtsService,
 ) -> Result<(), String> {
     config.director_model = Some(model.clone());
     user_settings.director_model = Some(model);
     save_user_settings(&config.save_dir, user_settings)?;
-    let health = provider
-        .health()
-        .await
-        .unwrap_or(ProviderHealth::Unavailable);
-    refresh_view(
-        app,
-        provider_config,
-        health,
-        user_settings.director_model.clone(),
-        user_settings.choice_model.clone(),
-        user_settings.writer_model.clone(),
-    );
+    refresh_projection(app, provider_config, provider, user_settings, tts).await;
     Ok(())
 }
 
@@ -145,22 +276,12 @@ pub async fn apply_choice_model(
     provider_config: &ProviderConfig,
     provider: &OpenAiCompatibleProvider,
     user_settings: &mut UserSettings,
+    tts: &TtsService,
 ) -> Result<(), String> {
     config.choice_model = Some(model.clone());
     user_settings.choice_model = Some(model);
     save_user_settings(&config.save_dir, user_settings)?;
-    let health = provider
-        .health()
-        .await
-        .unwrap_or(ProviderHealth::Unavailable);
-    refresh_view(
-        app,
-        provider_config,
-        health,
-        user_settings.director_model.clone(),
-        user_settings.choice_model.clone(),
-        user_settings.writer_model.clone(),
-    );
+    refresh_projection(app, provider_config, provider, user_settings, tts).await;
     Ok(())
 }
 
@@ -172,22 +293,12 @@ pub async fn apply_writer_model(
     provider_config: &ProviderConfig,
     provider: &OpenAiCompatibleProvider,
     user_settings: &mut UserSettings,
+    tts: &TtsService,
 ) -> Result<(), String> {
     config.writer_model = Some(model.clone());
     user_settings.writer_model = Some(model);
     save_user_settings(&config.save_dir, user_settings)?;
-    let health = provider
-        .health()
-        .await
-        .unwrap_or(ProviderHealth::Unavailable);
-    refresh_view(
-        app,
-        provider_config,
-        health,
-        user_settings.director_model.clone(),
-        user_settings.choice_model.clone(),
-        user_settings.writer_model.clone(),
-    );
+    refresh_projection(app, provider_config, provider, user_settings, tts).await;
     Ok(())
 }
 

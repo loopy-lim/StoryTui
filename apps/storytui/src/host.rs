@@ -1,7 +1,9 @@
 use std::io::{self, Stdout};
 use std::sync::Arc;
 
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyEventKind};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyEventKind, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -18,9 +20,11 @@ use story_tui::{App, HomeRequest};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio_util::sync::CancellationToken;
 
+use story_tts::TtsService;
 use storytui::config::{RuntimeConfig, UserSettings, load_user_settings, save_user_settings};
 
 mod diagnostics;
+mod images;
 mod saves;
 mod settings;
 
@@ -151,25 +155,66 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
 
     let (_guard, mut terminal) =
         TerminalGuard::enter().map_err(|e| format!("터미널을 초기화하지 못했습니다: {e}"))?;
+    // Terminal graphics query must happen before the input EventStream starts
+    // reading stdin. Failure just means text-only rendering.
+    let image_picker = match ratatui_image::picker::Picker::from_query_stdio() {
+        Ok(picker) => Some(picker),
+        Err(error) => {
+            tracing::info!(
+                %error,
+                "terminal graphics query failed; scene images stay disabled"
+            );
+            None
+        }
+    };
     let mut resume_engine = saves::restore_autosave(&save_store, &pack);
     let mut engine = EngineState::initial(&pack);
     engine.use_director_writer = config.use_director_writer;
     if let Some(restored) = resume_engine.as_mut() {
         restored.use_director_writer = config.use_director_writer;
     }
+    let mut scene_image_cache = images::SceneImageCache::default();
     let mut app = App::new(build_view(&engine, &pack, None, None));
+    app.set_image_picker(image_picker);
+    refresh_scene_images(&mut app, &pack, &engine, &mut scene_image_cache);
     app.set_lists(&engine.game.history, &engine.game.memories);
     app.set_can_continue(resume_engine.is_some());
-    settings::refresh_view(
-        &mut app,
-        &provider_config,
-        health,
-        config.director_model.clone(),
-        config.choice_model.clone(),
-        config.writer_model.clone(),
-    );
-    app.show_home();
+    {
+        // The roster is exactly the load()-assembled set: base profile first,
+        // then every `[[providers]]` entry — never prepended again, or the
+        // active profile would render twice.
+        let roster: Vec<(String, String)> = config
+            .providers
+            .iter()
+            .map(|entry| (entry.name.clone(), entry.base_url.clone()))
+            .collect();
+        app.set_providers(&roster, &provider_config.name);
+    }
     let mut user_settings = load_user_settings(&config.save_dir)?;
+    // The `v` toggle persists an explicit preference; absent means the [tts]
+    // profile's `enabled` default decides.
+    let tts_enabled = user_settings.tts_enabled.unwrap_or(config.tts.enabled);
+    config.tts.enabled = tts_enabled;
+    let images_enabled = user_settings.images_enabled.unwrap_or(true);
+    app.set_images_enabled(images_enabled);
+    let tts = Arc::new(TtsService::new(config.tts.clone()));
+    {
+        let status = tts.status().await;
+        let images_enabled = app.images_enabled();
+        let image_backend = app.image_backend_label();
+        settings::refresh_view(
+            &mut app,
+            &provider_config,
+            health,
+            config.director_model.clone(),
+            config.choice_model.clone(),
+            config.writer_model.clone(),
+            &status,
+            images_enabled,
+            image_backend,
+        );
+    }
+    app.show_home();
     if repaired_main_model {
         user_settings.model = Some(provider_config.model.clone());
     }
@@ -188,6 +233,8 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
     let mut frame_tick = tokio::time::interval(std::time::Duration::from_millis(16));
     frame_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut needs_redraw = true;
+    // Last elapsed-second value the loading overlay was drawn with (1 Hz gate).
+    let mut drawn_loading_second: Option<u64> = None;
 
     loop {
         tokio::select! {
@@ -197,12 +244,12 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
                         let pending = app.view.loading.as_ref().map(|v| v.generation_id);
                         if let Some(command) = app.handle_key(key, pending) {
-                            dispatch(command, &mut engine, &mut app, &pack, &provider, &config, &save_store, &tx, &mut cancellation).await?;
+                            dispatch(command, &mut engine, &mut app, &pack, &provider, &config, &save_store, &tts, &mut scene_image_cache, &tx, &mut cancellation).await?;
                         }
                         handle_ui_requests(
                             &mut app, &mut engine, &pack, &mut provider_config,
                             &mut provider, &mut user_settings, &mut config,
-                            &save_store, &tx, &mut cancellation, &mut resume_engine,
+                            &save_store, &tts, &mut scene_image_cache, &tx, &mut cancellation, &mut resume_engine,
                         ).await?;
                         needs_redraw = true;
                     }
@@ -217,6 +264,8 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                                 &provider,
                                 &config,
                                 &save_store,
+                                &tts,
+                                &mut scene_image_cache,
                                 &tx,
                                 &mut cancellation,
                             )
@@ -225,9 +274,21 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                         handle_ui_requests(
                             &mut app, &mut engine, &pack, &mut provider_config,
                             &mut provider, &mut user_settings, &mut config,
-                            &save_store, &tx, &mut cancellation, &mut resume_engine,
+                            &save_store, &tts, &mut scene_image_cache, &tx, &mut cancellation, &mut resume_engine,
                         ).await?;
-                        needs_redraw = true;
+                        // Movement carries no render state (hover is not
+                        // rendered): a full frame per move event starved the
+                        // loop while the cursor crossed the window. Clicks
+                        // already dispatched their command; the wheel changed
+                        // scroll — those redraw.
+                        if matches!(
+                            mouse.kind,
+                            MouseEventKind::Down(_)
+                                | MouseEventKind::ScrollUp
+                                | MouseEventKind::ScrollDown
+                        ) {
+                            needs_redraw = true;
+                        }
                     }
                     Event::Paste(text) => {
                         app.handle_paste(&text);
@@ -261,7 +322,7 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                                 }
                             }
                         };
-                        dispatch(command, &mut engine, &mut app, &pack, &provider, &config, &save_store, &tx, &mut cancellation).await?;
+                        dispatch(command, &mut engine, &mut app, &pack, &provider, &config, &save_store, &tts, &mut scene_image_cache, &tx, &mut cancellation).await?;
                         needs_redraw = true;
                     }
                     HostMessage::Director { generation_id, result } => {
@@ -284,7 +345,7 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                                 }
                             }
                         };
-                        dispatch(command, &mut engine, &mut app, &pack, &provider, &config, &save_store, &tx, &mut cancellation).await?;
+                        dispatch(command, &mut engine, &mut app, &pack, &provider, &config, &save_store, &tts, &mut scene_image_cache, &tx, &mut cancellation).await?;
                         needs_redraw = true;
                     }
                     HostMessage::Writer { generation_id, model, result } => {
@@ -299,7 +360,7 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                                 EngineCommand::ProviderFailed { generation_id, error: provider_error_view(error) }
                             }
                         };
-                        dispatch(command, &mut engine, &mut app, &pack, &provider, &config, &save_store, &tx, &mut cancellation).await?;
+                        dispatch(command, &mut engine, &mut app, &pack, &provider, &config, &save_store, &tts, &mut scene_image_cache, &tx, &mut cancellation).await?;
                         needs_redraw = true;
                     }
                     HostMessage::WriterChunk { generation_id, text } => {
@@ -309,9 +370,23 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                 }
             }
             _ = frame_tick.tick(), if needs_redraw || app.view.loading.is_some() => {
-                terminal
-                    .draw(|frame| app.render(frame, frame.area()))
-                    .map_err(|e| format!("화면을 그리지 못했습니다: {e}"))?;
+                // While a generation is pending, the only thing that changes
+                // is the elapsed-seconds label — 1 Hz. The 16 ms tick still
+                // wakes us, but redrawing at 60 fps for a 1 Hz label burned
+                // a measurable slice of a core (probe: 6.9 ms/frame on a
+                // 120-turn stack) and starved the terminal. Streaming chunks
+                // and events keep their own `needs_redraw`.
+                let loading_second = app
+                    .view
+                    .loading
+                    .as_ref()
+                    .and_then(|_| app.generation_elapsed_seconds());
+                if needs_redraw || loading_second != drawn_loading_second {
+                    terminal
+                        .draw(|frame| app.render(frame, frame.area()))
+                        .map_err(|e| format!("화면을 그리지 못했습니다: {e}"))?;
+                    drawn_loading_second = loading_second;
+                }
                 needs_redraw = false;
             }
         }
@@ -321,6 +396,21 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
         token.cancel();
     }
     Ok(())
+}
+
+/// Refresh the scene image cache and push its update into the view: set a new
+/// image, clear it, or leave the current pane untouched.
+fn refresh_scene_images(
+    app: &mut App,
+    pack: &StoryPack,
+    engine: &EngineState,
+    cache: &mut images::SceneImageCache,
+) {
+    match cache.refresh(pack, engine) {
+        images::SceneImageUpdate::Set(image) => app.set_scene_image(Some(image)),
+        images::SceneImageUpdate::Clear => app.set_scene_image(None),
+        images::SceneImageUpdate::Unchanged => {}
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // consumes all host-owned UI requests in one place
@@ -333,6 +423,8 @@ async fn handle_ui_requests(
     user_settings: &mut UserSettings,
     config: &mut RuntimeConfig,
     save_store: &SaveStore,
+    tts: &TtsService,
+    scene_images: &mut images::SceneImageCache,
     tx: &UnboundedSender<HostMessage>,
     cancellation: &mut Option<(story_model::uuid::Uuid, CancellationToken)>,
     resume_engine: &mut Option<EngineState>,
@@ -348,6 +440,8 @@ async fn handle_ui_requests(
                 provider,
                 config,
                 save_store,
+                tts,
+                scene_images,
                 tx,
                 cancellation,
             )
@@ -358,6 +452,22 @@ async fn handle_ui_requests(
     if app.take_model_reload_requested() {
         settings::refresh_model_list(app, provider, provider_config, true).await;
     }
+    if let Some(name) = app.take_selected_provider() {
+        // Clone the roster: the call also needs `config` mutably for the
+        // stale-model repair.
+        let roster = config.providers.clone();
+        settings::apply_provider(
+            app,
+            &name,
+            &roster,
+            provider_config,
+            provider,
+            user_settings,
+            config,
+            tts,
+        )
+        .await?;
+    }
     if let Some(model) = app.take_selected_model() {
         settings::apply_model(
             app,
@@ -366,6 +476,7 @@ async fn handle_ui_requests(
             provider,
             user_settings,
             &config.save_dir,
+            tts,
         )
         .await?;
     }
@@ -377,16 +488,33 @@ async fn handle_ui_requests(
             provider_config,
             provider,
             user_settings,
+            tts,
         )
         .await?;
     }
     if let Some(model) = app.take_selected_choice_model() {
-        settings::apply_choice_model(app, model, config, provider_config, provider, user_settings)
-            .await?;
+        settings::apply_choice_model(
+            app,
+            model,
+            config,
+            provider_config,
+            provider,
+            user_settings,
+            tts,
+        )
+        .await?;
     }
     if let Some(model) = app.take_selected_writer_model() {
-        settings::apply_writer_model(app, model, config, provider_config, provider, user_settings)
-            .await?;
+        settings::apply_writer_model(
+            app,
+            model,
+            config,
+            provider_config,
+            provider,
+            user_settings,
+            tts,
+        )
+        .await?;
     }
     if let Some(request) = app.take_home_request() {
         match request {
@@ -398,6 +526,7 @@ async fn handle_ui_requests(
                 app.set_lists(&engine.game.history, &engine.game.memories);
                 app.follow_story_end();
                 app.close_home();
+                refresh_scene_images(app, pack, engine, scene_images);
                 dispatch(
                     EngineCommand::StartNewGame,
                     engine,
@@ -406,6 +535,8 @@ async fn handle_ui_requests(
                     provider,
                     config,
                     save_store,
+                    tts,
+                    scene_images,
                     tx,
                     cancellation,
                 )
@@ -419,10 +550,30 @@ async fn handle_ui_requests(
                     app.set_lists(&engine.game.history, &engine.game.memories);
                     app.follow_story_end();
                     app.set_can_continue(false);
+                    refresh_scene_images(app, pack, engine, scene_images);
                 }
             }
             HomeRequest::ReturnToGame => app.close_home(),
         }
+    }
+    if app.take_images_toggle_request() {
+        let enabled = !app.images_enabled();
+        app.set_images_enabled(enabled);
+        user_settings.images_enabled = Some(enabled);
+        save_user_settings(&config.save_dir, user_settings)?;
+        app.update_settings_images(enabled, app.image_backend_label());
+    }
+    if app.take_tts_toggle_request() {
+        let enabled = !tts.enabled().await;
+        tts.set_enabled(enabled).await;
+        user_settings.tts_enabled = Some(enabled);
+        save_user_settings(&config.save_dir, user_settings)?;
+        let status = tts.status().await;
+        app.update_settings_tts(story_tui::TtsDisplay {
+            enabled: status.enabled,
+            backend: status.backend.as_str().to_string(),
+            voice: status.voice.clone(),
+        });
     }
     if let Some(request) = app.take_save_load_request() {
         saves::handle_request(
@@ -434,6 +585,7 @@ async fn handle_ui_requests(
             config.use_director_writer,
             cancellation,
         );
+        refresh_scene_images(app, pack, engine, scene_images);
     }
     Ok(())
 }
@@ -474,6 +626,8 @@ async fn dispatch(
     provider: &Arc<OpenAiCompatibleProvider>,
     config: &RuntimeConfig,
     save_store: &SaveStore,
+    tts: &TtsService,
+    scene_images: &mut images::SceneImageCache,
     tx: &UnboundedSender<HostMessage>,
     cancellation: &mut Option<(story_model::uuid::Uuid, CancellationToken)>,
 ) -> Result<(), String> {
@@ -497,7 +651,17 @@ async fn dispatch(
 
     for effect in transition.effects {
         match effect {
-            EngineEffect::PublishView(view) => app.set_view(*view),
+            EngineEffect::PublishView(view) => {
+                // Narration TTS: only a genuinely NEW turn speaks. Choice
+                // refreshes and error views republish the same turn number.
+                let turn_completed = view.status.turn > app.view.status.turn;
+                let narration = view.narration.clone();
+                app.set_view(*view);
+                if turn_completed && !narration.trim().is_empty() {
+                    tts.speak(narration).await;
+                }
+                refresh_scene_images(app, pack, engine, scene_images);
+            }
             EngineEffect::ShowRecoverableError(error) => app.view.error = Some(error),
             EngineEffect::RequestGeneration {
                 generation_id,

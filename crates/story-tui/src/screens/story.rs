@@ -16,8 +16,11 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
 };
+use ratatui_image::Image;
 use story_model::{AppViewModel, RiskLevel, TimeSlot};
 use unicode_width::UnicodeWidthStr;
+
+use crate::app::SceneImage;
 
 use super::model_display_label;
 
@@ -32,6 +35,7 @@ pub enum ListMode {
     History,
     Memory,
     ModelPicker,
+    ProviderPicker,
 }
 
 /// One immutable block in the chronological story transcript.
@@ -52,6 +56,7 @@ pub fn render_list(frame: &mut Frame, area: Rect, mode: ListMode, items: &[Strin
         ListMode::History => "이전 생성 기록",
         ListMode::Memory => "기억 목록",
         ListMode::ModelPicker => "모델 선택",
+        ListMode::ProviderPicker => "프로바이더 선택",
     };
     let rows: Vec<Line> = if items.is_empty() {
         vec![Line::from("아직 기록이 없습니다.")]
@@ -114,6 +119,52 @@ pub fn render_model_picker(frame: &mut Frame, area: Rect, items: &[String], sele
     frame.render_widget(paragraph, area);
 }
 
+/// Render the provider picker: the configured profiles by name, with the
+/// base_url hint so a name alone never forces a trip to the TOML file.
+pub fn render_provider_picker(
+    frame: &mut Frame,
+    area: Rect,
+    items: &[(String, String)],
+    selected: usize,
+) {
+    let rows: Vec<Line> = if items.is_empty() {
+        vec![Line::from("구성된 프로바이더가 없습니다.")]
+    } else {
+        items
+            .iter()
+            .enumerate()
+            .map(|(index, (name, base_url))| {
+                let active = index == selected.min(items.len().saturating_sub(1));
+                Line::styled(
+                    format!(
+                        "{indicator} {name}  ·  {base_url}",
+                        indicator = if active { "▶" } else { " " },
+                    ),
+                    if active {
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD)
+                            .add_modifier(Modifier::REVERSED)
+                    } else {
+                        Style::default().fg(Color::Gray)
+                    },
+                )
+            })
+            .collect()
+    };
+    let paragraph = Paragraph::new(rows)
+        .scroll((model_picker_scroll(area, selected), 0))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::LightCyan))
+                .title("프로바이더 선택 · ↑↓ 이동 · Enter 전환 · Esc 닫기"),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(Clear, area);
+    frame.render_widget(paragraph, area);
+}
+
 pub fn model_picker_scroll(area: Rect, selected: usize) -> u16 {
     let visible_rows = area.height.saturating_sub(2) as usize;
     selected.saturating_sub(visible_rows.saturating_sub(1)) as u16
@@ -130,9 +181,10 @@ pub fn render_story(
     narration_scroll: u16,
     input_mode: bool,
     input: &InputBuffer,
-    story_stack: &[StoryStackEntry],
+    narration_text: Text,
     streaming_narration: Option<&str>,
     generation_elapsed_secs: Option<u64>,
+    scene_image: Option<&SceneImage>,
 ) -> u16 {
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         render_min_size_warning(frame, area);
@@ -188,28 +240,30 @@ pub fn render_story(
         ])
         .split(body)
     };
-    let narration_text = if let Some(streaming) = streaming_narration {
-        let mut entries = story_stack.to_vec();
-        entries.push(StoryStackEntry {
-            turn: view.status.turn.saturating_add(1),
-            scene_id: "작성 중".to_string(),
-            model: None,
-            generation_secs: None,
-            player_action: None,
-            narration: streaming.to_string(),
-        });
-        story_stack_text(&entries)
-    } else if story_stack.is_empty() {
-        Text::from(markdown_lines(&view.narration))
+    // Scene image column: when the pack ships an image for the current
+    // location/character and the terminal is wide enough, the narration text
+    // shrinks to keep a readable minimum column.
+    let (narration_region, image_region): (Rect, Option<Rect>) = if let Some(image) = scene_image
+        && image.fits_beside_narration(chunks[0].width)
+        && chunks[0].height >= 4
+    {
+        let split = Layout::horizontal([Constraint::Fill(1), Constraint::Length(image.cols)])
+            .split(chunks[0]);
+        (split[0], Some(split[1]))
     } else {
-        story_stack_text(story_stack)
+        (chunks[0], None)
     };
-    let needs_scrollbar =
-        wrapped_line_count(&narration_text, chunks[0].width) > chunks[0].height as usize;
+    if let Some(image) = scene_image
+        && let Some(region) = image_region
+    {
+        frame.render_widget(Image::new(&image.protocol), region);
+    }
+    let needs_scrollbar = wrapped_line_count(&narration_text, narration_region.width)
+        > narration_region.height as usize;
     let narration_chunks = if needs_scrollbar {
-        Layout::horizontal([Constraint::Fill(1), Constraint::Length(1)]).split(chunks[0])
+        Layout::horizontal([Constraint::Fill(1), Constraint::Length(1)]).split(narration_region)
     } else {
-        [chunks[0], Rect::default()].into()
+        [narration_region, Rect::default()].into()
     };
     let narration_area = narration_chunks[0];
     let content_lines = wrapped_line_count(&narration_text, narration_area.width);
@@ -379,7 +433,31 @@ fn fmt_duration(secs: u64) -> String {
     }
 }
 
-fn story_stack_text(entries: &[StoryStackEntry]) -> Text<'static> {
+/// Lines for the live "작성 중" entry appended while a Writer stream is
+/// arriving. Mirrors the header/body shape of a committed stack entry.
+pub(crate) fn streaming_entry_lines(turn: u32, streaming: &str) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "────────────────────────────────────────",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("턴 {} · {}", turn.saturating_add(1), "작성 중"),
+            Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+    ];
+    lines.extend(markdown_lines(streaming));
+    lines
+}
+
+/// Compose the chronological stack into renderable lines. Exported to
+/// `crate::screens::story` so the App can cache the result per stack version
+/// instead of re-parsing markdown every frame.
+pub(crate) fn story_stack_text(entries: &[StoryStackEntry]) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for (index, entry) in entries.iter().enumerate() {
         if index > 0 {
@@ -426,10 +504,10 @@ fn story_stack_text(entries: &[StoryStackEntry]) -> Text<'static> {
         }
         lines.extend(markdown_lines(&entry.narration));
     }
-    Text::from(lines)
+    lines
 }
 
-fn markdown_lines(input: &str) -> Vec<Line<'static>> {
+pub(crate) fn markdown_lines(input: &str) -> Vec<Line<'static>> {
     input
         .lines()
         .map(|raw| {
@@ -970,8 +1048,158 @@ fn risk_color(r: RiskLevel) -> Color {
 
 #[cfg(test)]
 mod tests {
-    use super::{choice_lines, fmt_duration, speaker_dialogue_line};
-    use story_model::RiskLevel;
+    use super::{
+        SceneImage, choice_lines, fmt_duration, markdown_lines, render_story, speaker_dialogue_line,
+    };
+    use crate::input::InputBuffer;
+    use image::DynamicImage;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::text::Text;
+    use ratatui_image::picker::Picker;
+    use story_model::{AppViewModel, ChoiceView, RiskLevel, StatusLine, TimeSlot};
+    use unicode_width::UnicodeWidthStr;
+
+    fn sample_view() -> AppViewModel {
+        AppViewModel {
+            screen: story_model::Screen::Story,
+            story_title: "테스트".to_string(),
+            chapter: "chapter-1".to_string(),
+            location_display: "카페".to_string(),
+            time_slot: TimeSlot::Evening,
+            narration: "비가 그쳤다.\n\n그녀는 창밖을 보았다.".to_string(),
+            choices: vec![ChoiceView {
+                id: "c1".to_string(),
+                label: "사과한다".to_string(),
+                risk: RiskLevel::Low,
+                preview: None,
+            }],
+            status: StatusLine {
+                route: None,
+                affection: Some(0),
+                trust: Some(0),
+                tension: Some(0),
+                turn: 1,
+            },
+            loading: None,
+            error: None,
+        }
+    }
+
+    fn draw_terminal(
+        scene_image: Option<&SceneImage>,
+        width: u16,
+        height: u16,
+    ) -> Terminal<TestBackend> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let narration = Text::from(markdown_lines(&sample_view().narration));
+        terminal
+            .draw(|frame| {
+                render_story(
+                    frame,
+                    frame.area(),
+                    &sample_view(),
+                    0,
+                    0,
+                    false,
+                    &InputBuffer::new(200),
+                    narration,
+                    None,
+                    None,
+                    scene_image,
+                );
+            })
+            .expect("draw");
+        terminal
+    }
+
+    fn draw_with(scene_image: Option<&SceneImage>, width: u16, height: u16) -> String {
+        let terminal = draw_terminal(scene_image, width, height);
+        let buffer = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buffer.area.height {
+            // A double-width cell is followed by a literal " " spacer; skip
+            // it so Hangul sequences stay contiguous.
+            let mut previous_was_wide = false;
+            for x in 0..buffer.area.width {
+                let symbol = buffer[(x, y)].symbol();
+                if previous_was_wide && symbol == " " {
+                    previous_was_wide = false;
+                    continue;
+                }
+                previous_was_wide = symbol.width() == 2;
+                out.push_str(symbol);
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn scene_image_renders_beside_narration_when_wide_enough() {
+        let picker = Picker::halfblocks();
+        // A checkerboard forces distinct halfblock glyphs/colors; a uniform
+        // image would encode as background-colored spaces.
+        let mut raw = image::Rgb32FImage::new(64, 64);
+        for y in 0..64 {
+            for x in 0..64 {
+                let value = if (x + y) % 2 == 0 { 1.0 } else { 0.0 };
+                raw.put_pixel(x, y, image::Rgb([value, value, value]));
+            }
+        }
+        let pixels = DynamicImage::from(raw);
+        let scene = SceneImage::encode(&picker, pixels).expect("halfblocks encode");
+        assert!(scene.fits_beside_narration(100));
+        let out = draw_with(Some(&scene), 100, 30);
+        assert!(out.contains("비가 그쳤다"), "narration must remain: {out}");
+        assert!(out.contains("사과한다"), "choices must remain: {out}");
+
+        // The image column (rightmost `cols` cells) holds rendered image
+        // cells: either glyphs or non-default colors.
+        let terminal = draw_terminal(Some(&scene), 100, 30);
+        let buffer = terminal.backend().buffer();
+        let image_left = buffer.area.width - scene.cols;
+        let image_top = 2; // below the title rule
+        let image_bottom = (image_top + scene.rows).min(buffer.area.height);
+        let mut painted = 0usize;
+        for y in image_top..image_bottom {
+            for x in image_left..buffer.area.width {
+                let cell = &buffer[(x, y)];
+                if cell.symbol() != " "
+                    || cell.fg != ratatui::style::Color::Reset
+                    || cell.bg != ratatui::style::Color::Reset
+                {
+                    painted += 1;
+                }
+            }
+        }
+        assert!(
+            painted >= scene.cols as usize,
+            "image column must be painted (painted={painted}, cols={})",
+            scene.cols
+        );
+    }
+
+    #[test]
+    fn no_scene_image_keeps_plain_layout() {
+        let out = draw_with(None, 100, 30);
+        assert!(
+            out.contains("비가 그쳤다"),
+            "plain layout lost narration: {out}"
+        );
+        assert!(out.contains("사과한다"), "plain layout lost choices: {out}");
+    }
+
+    #[test]
+    fn narrow_terminal_skips_image_column() {
+        let picker = Picker::halfblocks();
+        let scene =
+            SceneImage::encode(&picker, DynamicImage::new_rgb8(64, 64)).expect("halfblocks encode");
+        // MIN_WIDTH is 60: the image would not fit beside a readable column.
+        let out = draw_with(Some(&scene), 60, 30);
+        assert!(out.contains("비가 그쳤다"), "text-only fallback: {out}");
+    }
 
     #[test]
     fn fmt_duration_renders_compact_korean_labels() {

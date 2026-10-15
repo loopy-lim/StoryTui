@@ -16,6 +16,11 @@ persona = ""
 
 [provider]
 kind = "openai_compatible"
+# OpenAI 호환 클라우드/게이트웨이는 base_url 교체만으로 연결된다.
+# base_url이 /v1으로 끝나면 요청 경로가 자동으로 맞춰진다:
+#   base_url = "https://openrouter.ai/api/v1"   # 또는 Groq·LM Studio·OpenAI 등
+#   model = "사용하려는-모델-ID"                 # 실제 모델 ID는 storytui.local.toml에
+#   api_key_env = "MY_COMPATIBLE_KEY"
 name = "omlx-local"
 base_url = "http://127.0.0.1:8000"
 chat_path = "/v1/chat/completions"

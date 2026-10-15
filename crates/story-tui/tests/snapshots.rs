@@ -64,8 +64,8 @@ fn base_view() -> AppViewModel {
 fn render_to_string(view: AppViewModel, w: u16, h: u16) -> String {
     let backend = TestBackend::new(w, h);
     let mut terminal = Terminal::new(backend).expect("terminal");
-    let app = App::new(view);
-    render_app_to_string(&mut terminal, &app)
+    let mut app = App::new(view);
+    render_app_to_string(&mut terminal, &mut app)
 }
 
 fn render_to_string_with_scroll(view: AppViewModel, w: u16, h: u16, scroll: u16) -> String {
@@ -73,10 +73,10 @@ fn render_to_string_with_scroll(view: AppViewModel, w: u16, h: u16, scroll: u16)
     let mut terminal = Terminal::new(backend).expect("terminal");
     let mut app = App::new(view);
     app.narration_scroll = scroll;
-    render_app_to_string(&mut terminal, &app)
+    render_app_to_string(&mut terminal, &mut app)
 }
 
-fn render_app_to_string(terminal: &mut Terminal<TestBackend>, app: &App) -> String {
+fn render_app_to_string(terminal: &mut Terminal<TestBackend>, app: &mut App) -> String {
     terminal
         .draw(|f| {
             app.render(f, f.area());

@@ -90,6 +90,11 @@ fn snapshot_settings_loopback_ready() {
         top_p: 0.92,
         top_k: 40,
         max_tokens: 1800,
+        tts_enabled: true,
+        tts_backend: "say".to_string(),
+        tts_voice: None,
+        images_enabled: true,
+        image_backend: Some("kitty".to_string()),
         theme_name: "default",
     };
     let out = render_to_string(view, 80, 24);
@@ -105,6 +110,11 @@ fn snapshot_settings_non_loopback_warning() {
         top_p: 0.9,
         top_k: 30,
         max_tokens: 1200,
+        tts_enabled: false,
+        tts_backend: "openai".to_string(),
+        tts_voice: Some("shimmer".to_string()),
+        images_enabled: false,
+        image_backend: None,
         theme_name: "default",
     };
     let out = render_to_string(view, 80, 24);
@@ -125,6 +135,11 @@ fn settings_below_min_size_renders_warning() {
         top_p: 0.92,
         top_k: 40,
         max_tokens: 1800,
+        tts_enabled: true,
+        tts_backend: "say".to_string(),
+        tts_voice: None,
+        images_enabled: true,
+        image_backend: Some("kitty".to_string()),
         theme_name: "default",
     };
     let out = render_to_string(view, MIN_WIDTH - 1, MIN_HEIGHT - 1);
@@ -161,6 +176,11 @@ fn settings_masked_secret_never_renders() {
         top_p: 0.92,
         top_k: 40,
         max_tokens: 1800,
+        tts_enabled: true,
+        tts_backend: "say".to_string(),
+        tts_voice: None,
+        images_enabled: true,
+        image_backend: Some("kitty".to_string()),
         theme_name: "default",
     };
     let out = render_to_string(view, 80, 24);

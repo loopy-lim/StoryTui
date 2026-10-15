@@ -63,6 +63,17 @@ pub struct SettingsView<'a> {
     pub top_k: u32,
     /// Maximum output tokens per turn.
     pub max_tokens: u32,
+    /// Whether narration TTS is currently on.
+    pub tts_enabled: bool,
+    /// Narration TTS backend name (`say` / `openai`).
+    pub tts_backend: String,
+    /// Configured TTS voice, when one is set.
+    pub tts_voice: Option<String>,
+    /// Whether scene images are currently shown.
+    pub images_enabled: bool,
+    /// Detected terminal graphics protocol (`kitty` 등). `None` = images
+    /// unsupported by the terminal.
+    pub image_backend: Option<String>,
     /// Theme name placeholder (no theme switcher yet).
     pub theme_name: &'a str,
 }
@@ -181,19 +192,57 @@ fn render_health_and_sampling(frame: &mut Frame, area: Rect, view: &SettingsView
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Span::styled(
-            "상태 · Health",
+            "상태 · Status",
             Style::default().add_modifier(Modifier::BOLD),
         ));
     let h_inner = h_block.inner(chunks[0]);
     frame.render_widget(h_block, chunks[0]);
     let HealthLabel(label, color) = health_label(view.health);
-    let health_lines = vec![Line::from(vec![
-        Span::raw("provider   : "),
-        Span::styled(
-            label,
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ),
-    ])];
+    let health_lines = vec![
+        Line::from(vec![
+            Span::raw("provider   : "),
+            Span::styled(
+                label,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("tts (v)    : "),
+            Span::styled(
+                if view.tts_enabled { "켜짐" } else { "꺼짐" },
+                Style::default()
+                    .fg(if view.tts_enabled {
+                        Color::Green
+                    } else {
+                        Color::DarkGray
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(" · {}", view.tts_backend)),
+        ]),
+        Line::from(vec![
+            Span::raw("tts voice  : "),
+            Span::raw(view.tts_voice.as_deref().unwrap_or("자동(기본 보이스)")),
+        ]),
+        Line::from(vec![
+            Span::raw("image (i)  : "),
+            Span::styled(
+                match (view.images_enabled, view.image_backend.as_deref()) {
+                    (true, Some(backend)) => format!("켜짐 · {backend}"),
+                    (true, None) => "터미널 미지원".to_string(),
+                    (false, Some(_)) => "꺼짐".to_string(),
+                    (false, None) => "꺼짐 (터미널 미지원)".to_string(),
+                },
+                Style::default()
+                    .fg(match (view.images_enabled, view.image_backend.as_deref()) {
+                        (true, Some(_)) => Color::Green,
+                        (true, None) => Color::Yellow,
+                        (false, _) => Color::DarkGray,
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+    ];
     frame.render_widget(
         Paragraph::new(health_lines).wrap(Wrap { trim: false }),
         h_inner,
@@ -258,7 +307,7 @@ fn render_keymap_block(frame: &mut Frame, area: Rect) {
 
 fn render_footer(frame: &mut Frame, area: Rect) {
     let para = Paragraph::new(Line::from(Span::styled(
-        "P 모델 선택 · Esc 시작 메뉴 · q 종료",
+        "P 모델 · E 프로바이더 · Esc 시작 메뉴 · q 종료",
         Style::default().fg(Color::DarkGray),
     )))
     .alignment(Alignment::Center);
@@ -314,6 +363,11 @@ mod tests {
             top_p: 0.92,
             top_k: 40,
             max_tokens: 1800,
+            tts_enabled: true,
+            tts_backend: "say".to_string(),
+            tts_voice: None,
+            images_enabled: true,
+            image_backend: Some("kitty".to_string()),
             theme_name: "default",
         };
         // Touch every field to ensure renaming/removal is intentional.
@@ -324,6 +378,9 @@ mod tests {
             v.top_p,
             v.top_k,
             v.max_tokens,
+            v.tts_enabled,
+            v.tts_backend,
+            v.tts_voice,
             v.theme_name,
         );
     }

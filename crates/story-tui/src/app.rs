@@ -13,8 +13,12 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use image::DynamicImage;
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use ratatui::text::{Line, Text};
+use ratatui_image::picker::Picker;
+use ratatui_image::protocol::Protocol;
 use story_core::engine_cmd::EngineCommand;
 use story_model::uuid::Uuid;
 use story_model::{ActionType, AppViewModel, ParsedAction};
@@ -27,8 +31,9 @@ use crate::screens::home::{menu_selection_at, render_home};
 use crate::screens::save_load::render_save_load;
 use crate::screens::settings::{SettingsView, render_settings};
 use crate::screens::story::{
-    ListMode, StoryStackEntry, choice_index_at, home_shortcut_at, model_picker_scroll, render_list,
-    render_model_picker, render_story,
+    ListMode, StoryStackEntry, choice_index_at, home_shortcut_at, markdown_lines,
+    model_picker_scroll, render_list, render_model_picker, render_provider_picker, render_story,
+    story_stack_text, streaming_entry_lines,
 };
 
 /// Which manual save manager the host should open.
@@ -46,6 +51,14 @@ pub enum HomeRequest {
     ReturnToGame,
 }
 
+/// The TTS slice of the Settings projection (plain display data).
+#[derive(Clone, Debug)]
+pub struct TtsDisplay {
+    pub enabled: bool,
+    pub backend: String,
+    pub voice: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 struct SettingsState {
     provider: ProviderConfigSafe,
@@ -54,6 +67,62 @@ struct SettingsState {
     top_p: f32,
     top_k: u32,
     max_tokens: u32,
+    tts: TtsDisplay,
+    images_enabled: bool,
+    image_backend: Option<String>,
+}
+
+/// A scene image pre-encoded for the detected terminal graphics protocol.
+/// Encoding happens once on `set_scene_image`; rendering is cheap per frame.
+#[derive(Clone)]
+pub struct SceneImage {
+    pub protocol: Protocol,
+    /// Encoded size in terminal cells (aspect-fit into the scene column).
+    pub cols: u16,
+    pub rows: u16,
+}
+
+impl std::fmt::Debug for SceneImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The encoded payload is opaque protocol bytes; only the cell geometry
+        // is meaningful in diagnostics.
+        f.debug_struct("SceneImage")
+            .field("cols", &self.cols)
+            .field("rows", &self.rows)
+            .finish()
+    }
+}
+
+/// Upper bound for the scene column so narration keeps the majority width.
+const SCENE_IMAGE_MAX_COLS: u16 = 26;
+const SCENE_IMAGE_MAX_ROWS: u16 = 14;
+/// Narrowest narration column we accept before giving up on the image.
+const SCENE_IMAGE_MIN_TEXT_COLS: u16 = 40;
+
+impl SceneImage {
+    /// Encode `image` fitted into the scene column bounds. `None` when the
+    /// protocol encode fails; the player then simply sees text only.
+    pub fn encode(picker: &Picker, image: DynamicImage) -> Option<Self> {
+        let protocol = picker
+            .new_protocol(
+                image,
+                ratatui::layout::Size::new(SCENE_IMAGE_MAX_COLS, SCENE_IMAGE_MAX_ROWS),
+                ratatui_image::Resize::Fit(None),
+            )
+            .ok()?;
+        let size = protocol.size();
+        Some(Self {
+            protocol,
+            cols: size.width.max(1),
+            rows: size.height.max(1),
+        })
+    }
+
+    /// Layout guard mirroring the renderer: does this image fit beside a
+    /// readable narration column in `width`?
+    pub fn fits_beside_narration(&self, width: u16) -> bool {
+        width.saturating_sub(self.cols) >= SCENE_IMAGE_MIN_TEXT_COLS
+    }
 }
 
 /// Filesystem work requested by the UI. The host owns all actual save I/O.
@@ -101,13 +170,37 @@ pub struct App {
     pub model_items: Vec<String>,
     pub model_selected: usize,
     selected_model: Option<String>,
+    /// Configured provider profiles (name + base_url hint) for the picker.
+    pub provider_items: Vec<(String, String)>,
+    pub provider_selected: usize,
+    selected_provider: Option<String>,
     selected_director_model: Option<String>,
     selected_choice_model: Option<String>,
     selected_writer_model: Option<String>,
     model_reload_requested: bool,
+    /// Set when the player pressed `v`; the host toggles narration TTS.
+    tts_toggle_requested: bool,
+    /// Terminal graphics capability detected at startup (None = images off).
+    image_picker: Option<Picker>,
+    /// Human-readable protocol name for the Settings screen (kitty 등).
+    image_backend: Option<&'static str>,
+    /// Player toggle from the Settings screen — rendering skips when off.
+    images_enabled: bool,
+    /// Set when the player toggled images in Settings (`i`).
+    images_toggle_requested: bool,
+    /// Current pre-encoded scene image, if the pack ships one.
+    scene_image: Option<SceneImage>,
     mouse_command: Option<EngineCommand>,
-    /// Chronological narration stack shown in the main story pane.
-    pub story_stack: Vec<StoryStackEntry>,
+    /// Chronological narration stack shown in the main story pane. Writes
+    /// MUST go through [`Self::replace_story_stack`] (or `set_lists`) so the
+    /// render cache is invalidated — the version field keys that cache.
+    pub(crate) story_stack: Vec<StoryStackEntry>,
+    /// Bumped on every `story_stack` replacement; keys the render cache.
+    story_stack_version: u64,
+    /// Composed stack lines for `story_stack_version` — building them means
+    /// markdown-parsing the whole transcript, which must not happen per frame.
+    stack_lines_cache: Option<(u64, Vec<Line<'static>>)>,
+
     /// Ephemeral Writer text while the internal Director → Writer path is
     /// streaming. It is never saved and is replaced by the accepted turn.
     streaming_narration: Option<String>,
@@ -150,12 +243,23 @@ impl App {
             model_items: Vec::new(),
             model_selected: 0,
             selected_model: None,
+            provider_items: Vec::new(),
+            provider_selected: 0,
+            selected_provider: None,
             selected_director_model: None,
             selected_choice_model: None,
             selected_writer_model: None,
             model_reload_requested: false,
+            tts_toggle_requested: false,
+            image_picker: None,
+            image_backend: None,
+            images_enabled: true,
+            images_toggle_requested: false,
+            scene_image: None,
             mouse_command: None,
             story_stack: Vec::new(),
+            story_stack_version: 0,
+            stack_lines_cache: None,
             streaming_narration: None,
             list_scroll: 0,
             save_load: None,
@@ -177,6 +281,21 @@ impl App {
                 None
             },
         }
+    }
+
+    /// Supply the provider profiles for the picker and highlight the active
+    /// one by name.
+    pub fn set_providers(&mut self, providers: &[(String, String)], current: &str) {
+        self.provider_items = providers.to_vec();
+        self.provider_selected = providers
+            .iter()
+            .position(|(name, _)| name == current)
+            .unwrap_or(0);
+    }
+
+    /// Consume a provider picked in the provider picker.
+    pub fn take_selected_provider(&mut self) -> Option<String> {
+        self.selected_provider.take()
     }
 
     pub fn set_models(&mut self, models: Vec<String>, current_model: &str) {
@@ -225,6 +344,11 @@ impl App {
         std::mem::take(&mut self.model_reload_requested)
     }
 
+    /// Whether the player asked to toggle narration TTS (`v`).
+    pub fn take_tts_toggle_request(&mut self) -> bool {
+        std::mem::take(&mut self.tts_toggle_requested)
+    }
+
     /// Consume an engine command requested through a mouse click.
     pub fn take_mouse_command(&mut self) -> Option<EngineCommand> {
         self.mouse_command.take()
@@ -232,6 +356,7 @@ impl App {
 
     /// Supply the redacted configuration and health details for the Settings
     /// screen. Secrets never enter this UI state.
+    #[allow(clippy::too_many_arguments)] // the projection stays explicit at the host boundary
     pub fn set_settings(
         &mut self,
         provider: ProviderConfigSafe,
@@ -240,6 +365,9 @@ impl App {
         top_p: f32,
         top_k: u32,
         max_tokens: u32,
+        tts: TtsDisplay,
+        images_enabled: bool,
+        image_backend: Option<String>,
     ) {
         self.settings = Some(SettingsState {
             provider,
@@ -248,7 +376,75 @@ impl App {
             top_p,
             top_k,
             max_tokens,
+            tts,
+            images_enabled,
+            image_backend,
         });
+    }
+
+    /// Record the terminal graphics capability. Call once at startup before
+    /// the first `set_scene_image`.
+    pub fn set_image_picker(&mut self, picker: Option<Picker>) {
+        self.image_backend = picker.as_ref().map(|picker| match picker.protocol_type() {
+            ratatui_image::picker::ProtocolType::Kitty => "kitty",
+            ratatui_image::picker::ProtocolType::Sixel => "sixel",
+            ratatui_image::picker::ProtocolType::Iterm2 => "iterm2",
+            ratatui_image::picker::ProtocolType::Halfblocks => "halfblocks",
+        });
+        self.image_picker = picker;
+    }
+
+    /// Settings-screen image toggle. The cached scene image is kept, so
+    /// re-enabling is instant — no re-decode.
+    pub fn set_images_enabled(&mut self, enabled: bool) {
+        self.images_enabled = enabled;
+    }
+
+    pub fn images_enabled(&self) -> bool {
+        self.images_enabled
+    }
+
+    /// Protocol name for display (`kitty` / `sixel` / `halfblocks` / …).
+    pub fn image_backend_label(&self) -> Option<String> {
+        self.image_backend.map(str::to_string)
+    }
+
+    /// Consume an image toggle request from the Settings screen.
+    pub fn take_images_toggle_request(&mut self) -> bool {
+        std::mem::take(&mut self.images_toggle_requested)
+    }
+
+    /// Replace the scene image. Decoding is host-owned; encoding happens here
+    /// once so per-frame rendering stays cheap. `None` clears the column.
+    pub fn set_scene_image(&mut self, image: Option<DynamicImage>) {
+        self.scene_image = match (image.as_ref(), self.image_picker.as_ref()) {
+            (Some(image), Some(picker)) => SceneImage::encode(picker, image.clone()),
+            _ => None,
+        };
+    }
+
+    pub fn scene_image(&self) -> Option<&SceneImage> {
+        if self.images_enabled {
+            self.scene_image.as_ref()
+        } else {
+            None
+        }
+    }
+
+    /// Patch only the TTS section of the Settings state (used by the `v`
+    /// toggle without a full provider re-projection).
+    pub fn update_settings_tts(&mut self, tts: TtsDisplay) {
+        if let Some(settings) = self.settings.as_mut() {
+            settings.tts = tts;
+        }
+    }
+
+    /// Patch only the image section of the Settings state (the `i` toggle).
+    pub fn update_settings_images(&mut self, images_enabled: bool, image_backend: Option<String>) {
+        if let Some(settings) = self.settings.as_mut() {
+            settings.images_enabled = images_enabled;
+            settings.image_backend = image_backend;
+        }
     }
 
     pub fn set_can_continue(&mut self, can_continue: bool) {
@@ -360,6 +556,13 @@ impl App {
         self.follow_story_end();
     }
 
+    /// Replace the whole story stack. The ONLY sanctioned write path: the
+    /// render line cache keys on `story_stack_version`, which this bumps.
+    pub fn replace_story_stack(&mut self, stack: Vec<StoryStackEntry>) {
+        self.story_stack_version = self.story_stack_version.wrapping_add(1);
+        self.story_stack = stack;
+    }
+
     /// Refresh the auxiliary list data from the host-owned engine state.
     pub fn set_lists(
         &mut self,
@@ -375,7 +578,7 @@ impl App {
                 format!("턴 {} · {} — {}", entry.turn, entry.scene_id, preview)
             })
             .collect();
-        self.story_stack = history
+        let stack = history
             .iter()
             .map(|entry| StoryStackEntry {
                 turn: entry.turn,
@@ -389,6 +592,7 @@ impl App {
                 narration: entry.narration.clone(),
             })
             .collect();
+        self.replace_story_stack(stack);
         // The host refreshes the chronological stack before it publishes the
         // next view. Following this concrete history change is more reliable
         // than inferring it solely from a turn number.
@@ -496,6 +700,24 @@ impl App {
                     self.selected_model = self.model_items.get(self.model_selected).cloned();
                     self.list_mode = None;
                 }
+                KeyCode::Up | KeyCode::Char('k' | 'ㅏ')
+                    if self.list_mode == Some(ListMode::ProviderPicker) =>
+                {
+                    self.provider_selected = self.provider_selected.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j' | 'ㅓ')
+                    if self.list_mode == Some(ListMode::ProviderPicker) =>
+                {
+                    self.provider_selected = (self.provider_selected + 1)
+                        .min(self.provider_items.len().saturating_sub(1));
+                }
+                KeyCode::Enter if self.list_mode == Some(ListMode::ProviderPicker) => {
+                    self.selected_provider = self
+                        .provider_items
+                        .get(self.provider_selected)
+                        .map(|(name, _)| name.clone());
+                    self.list_mode = None;
+                }
                 KeyCode::Char('d' | 'ㅇ') if self.list_mode == Some(ListMode::ModelPicker) => {
                     self.selected_director_model =
                         self.model_items.get(self.model_selected).cloned();
@@ -524,6 +746,14 @@ impl App {
                 }
                 KeyCode::Char('p' | 'ㅔ') => {
                     self.list_mode = Some(ListMode::ModelPicker);
+                }
+                // Same physical key under Korean 2-beolsik: e=ㄷ.
+                KeyCode::Char('e' | 'ㄷ') => {
+                    self.list_mode = Some(ListMode::ProviderPicker);
+                }
+                // Same physical key under Korean 2-beolsik: i=ㅑ.
+                KeyCode::Char('i' | 'ㅑ') => {
+                    self.images_toggle_requested = true;
                 }
                 KeyCode::Char('q' | 'ㅂ') => self.should_quit = true,
                 _ => {}
@@ -569,13 +799,17 @@ impl App {
         }
         if !self.view.loading.is_some() && self.view.error.is_none() {
             match key.code {
-                // Same physical keys under Korean 2-beolsik: s=ㄴ, l=ㅣ.
+                // Same physical keys under Korean 2-beolsik: s=ㄴ, l=ㅣ, v=ㅓ.
                 KeyCode::Char('s' | 'ㄴ') => {
                     self.save_load_request = Some(SaveLoadRequest::Open(SaveLoadMode::Save));
                     return None;
                 }
                 KeyCode::Char('l' | 'ㅣ') => {
                     self.save_load_request = Some(SaveLoadRequest::Open(SaveLoadMode::Load));
+                    return None;
+                }
+                KeyCode::Char('v' | 'ㅓ') => {
+                    self.tts_toggle_requested = true;
                     return None;
                 }
                 _ => {}
@@ -622,7 +856,35 @@ impl App {
     }
 
     /// Render the Story screen for the current view.
-    pub fn render(&self, frame: &mut Frame, area: Rect) {
+    /// Compose the narration pane's text, reusing the cached stack lines
+    /// unless the stack changed. Only the live "작성 중" entry is rebuilt
+    /// per frame while a Writer stream is arriving.
+    fn narration_text(&mut self) -> Text<'static> {
+        if self.story_stack.is_empty() {
+            return Text::from(markdown_lines(&self.view.narration));
+        }
+        // The stored version IS the cache key: a set_lists bump invalidates
+        // the cache on the very next frame.
+        let cache_matches = self
+            .stack_lines_cache
+            .as_ref()
+            .is_some_and(|(version, _)| *version == self.story_stack_version);
+        if !cache_matches {
+            let lines = story_stack_text(&self.story_stack);
+            self.stack_lines_cache = Some((self.story_stack_version, lines));
+        }
+        let mut lines = self
+            .stack_lines_cache
+            .as_ref()
+            .map(|(_, lines)| lines.clone())
+            .unwrap_or_default();
+        if let Some(streaming) = self.streaming_narration.as_deref() {
+            lines.extend(streaming_entry_lines(self.view.status.turn, streaming));
+        }
+        Text::from(lines)
+    }
+
+    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
         self.last_render_area.set(area);
         if self.home_visible {
             render_home(frame, area, self.home_selected, self.can_continue);
@@ -638,10 +900,14 @@ impl App {
                 render_model_picker(frame, area, &self.model_items, self.model_selected);
                 return;
             }
+            if mode == ListMode::ProviderPicker {
+                render_provider_picker(frame, area, &self.provider_items, self.provider_selected);
+                return;
+            }
             let items = match mode {
                 ListMode::History => &self.history_items,
                 ListMode::Memory => &self.memory_items,
-                ListMode::ModelPicker => unreachable!("rendered above"),
+                ListMode::ModelPicker | ListMode::ProviderPicker => unreachable!("rendered above"),
             };
             render_list(frame, area, mode, items, self.list_scroll);
             return;
@@ -659,11 +925,17 @@ impl App {
                     top_p: settings.top_p,
                     top_k: settings.top_k,
                     max_tokens: settings.max_tokens,
+                    tts_enabled: settings.tts.enabled,
+                    tts_backend: settings.tts.backend.clone(),
+                    tts_voice: settings.tts.voice.clone(),
+                    images_enabled: settings.images_enabled,
+                    image_backend: settings.image_backend.clone(),
                     theme_name: "default",
                 },
             );
             return;
         }
+        let narration_text = self.narration_text();
         let max_scroll = render_story(
             frame,
             area,
@@ -672,9 +944,10 @@ impl App {
             self.narration_scroll,
             self.input_mode,
             &self.input,
-            &self.story_stack,
+            narration_text,
             self.streaming_narration.as_deref(),
             self.generation_elapsed_seconds(),
+            self.scene_image.as_ref(),
         );
         self.narration_max_scroll.set(max_scroll);
     }
@@ -719,6 +992,16 @@ impl App {
                 if let Some(model) = self.model_items.get(index).cloned() {
                     self.model_selected = index;
                     self.selected_model = Some(model);
+                    self.list_mode = None;
+                }
+                return;
+            }
+            if self.list_mode == Some(ListMode::ProviderPicker) {
+                let scroll = model_picker_scroll(area, self.provider_selected) as usize;
+                let index = scroll + mouse.row.saturating_sub(area.y.saturating_add(1)) as usize;
+                if let Some((name, _)) = self.provider_items.get(index).cloned() {
+                    self.provider_selected = index;
+                    self.selected_provider = Some(name);
                     self.list_mode = None;
                 }
                 return;
@@ -1236,6 +1519,139 @@ mod tests {
     }
 
     #[test]
+    fn provider_picker_click_selects_a_profile() {
+        let mut app = App::new(sample_view(0));
+        app.set_providers(
+            &[
+                (
+                    "omlx-local".to_string(),
+                    "http://127.0.0.1:8000".to_string(),
+                ),
+                (
+                    "openrouter".to_string(),
+                    "https://openrouter.ai/api/v1".to_string(),
+                ),
+            ],
+            "omlx-local",
+        );
+        app.handle_key(key(KeyCode::Char('o')), None);
+        app.handle_key(key(KeyCode::Char('e')), None);
+
+        // Hit tests map rows through `last_render_area`, which a real frame
+        // sets. Simulate a 100x40 screen at the origin: the border occupies
+        // row 0, so click row 2 is the SECOND profile, row 1 the first.
+        app.last_render_area.set(Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 40,
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.take_selected_provider().as_deref(), Some("openrouter"));
+
+        // A click back on the first row selects the base profile again.
+        app.handle_key(key(KeyCode::Char('e')), None);
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.take_selected_provider().as_deref(), Some("omlx-local"));
+    }
+
+    #[test]
+    fn images_toggle_via_settings_key_flips_state() {
+        let mut app = App::new(sample_view(0));
+        assert!(app.images_enabled(), "images default to on");
+        app.handle_key(key(KeyCode::Char('o')), None);
+        app.handle_key(key(KeyCode::Char('i')), None);
+        assert!(app.take_images_toggle_request(), "toggle requested");
+        app.set_images_enabled(false);
+        assert!(!app.images_enabled());
+
+        // With images disabled the renderer sees no image, but the cached
+        // scene survives: re-enabling is instant (no re-decode).
+        let picker = ratatui_image::picker::Picker::halfblocks();
+        app.set_image_picker(Some(picker));
+        app.set_scene_image(Some(image::DynamicImage::new_rgb8(16, 16)));
+        assert!(app.scene_image().is_none(), "disabled toggle hides image");
+        app.set_images_enabled(true);
+        assert!(app.scene_image().is_some(), "re-enable is instant");
+    }
+
+    #[test]
+    fn stack_cache_invalidates_when_the_stack_changes() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use unicode_width::UnicodeWidthStr;
+
+        fn entry(turn: u32, narration: &str) -> story_model::HistoryEntry {
+            story_model::HistoryEntry {
+                id: Uuid::new_v4(),
+                turn,
+                scene_id: format!("scene-{turn}"),
+                created_at: chrono::Utc::now(),
+                narration: narration.to_string(),
+                player_action: None,
+                choices: Vec::new(),
+                applied_patch: story_model::StatePatch::default(),
+                generation_id: Uuid::new_v4(),
+            }
+        }
+
+        fn draw(app: &mut App) -> String {
+            let mut terminal = Terminal::new(TestBackend::new(100, 40)).expect("terminal");
+            terminal
+                .draw(|frame| app.render(frame, frame.area()))
+                .expect("draw");
+            let buffer = terminal.backend().buffer();
+            let mut out = String::new();
+            for y in 0..buffer.area.height {
+                // A double-width cell is followed by a literal " " spacer;
+                // skip only that spacer so Hangul sequences stay contiguous.
+                let mut previous_was_wide = false;
+                for x in 0..buffer.area.width {
+                    let symbol = buffer[(x, y)].symbol();
+                    if previous_was_wide && symbol == " " {
+                        previous_was_wide = false;
+                        continue;
+                    }
+                    previous_was_wide = symbol.width() == 2;
+                    out.push_str(symbol);
+                }
+            }
+            out
+        }
+
+        let mut app = App::new(sample_view(1));
+        app.set_lists(&[entry(1, "첫 번째 장면")], &[]);
+        let first = draw(&mut app);
+        assert!(first.contains("첫 번째 장면"));
+
+        // The cache MUST be invalidated by the set_lists version bump: the
+        // second draw renders the NEW transcript, not the frozen first one.
+        app.set_lists(
+            &[
+                entry(1, "첫 번째 장면"),
+                entry(2, "두 번째 장면의 내레이션"),
+            ],
+            &[],
+        );
+        let second = draw(&mut app);
+        assert!(
+            second.contains("두 번째 장면의 내레이션"),
+            "stale cache rendered the old transcript across a stack change"
+        );
+        assert_ne!(first, second);
+    }
+
+    #[test]
     fn set_lists_builds_chronological_story_stack() {
         let mut app = App::new(sample_view(1));
         let entries = vec![
@@ -1366,6 +1782,13 @@ mod tests {
             0.9,
             40,
             1_200,
+            TtsDisplay {
+                enabled: false,
+                backend: "say".to_string(),
+                voice: None,
+            },
+            true,
+            Some("halfblocks".to_string()),
         );
         app.show_home();
         app.handle_key(key(KeyCode::Down), None);
@@ -1384,6 +1807,34 @@ mod tests {
         app.handle_key(key(KeyCode::Char('p')), None);
         app.handle_key(key(KeyCode::Char('c')), None);
         assert_eq!(app.take_selected_choice_model().as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn provider_picker_selects_a_profile() {
+        let mut app = App::new(sample_view(0));
+        app.set_providers(
+            &[
+                (
+                    "omlx-local".to_string(),
+                    "http://127.0.0.1:8000".to_string(),
+                ),
+                (
+                    "openrouter".to_string(),
+                    "https://openrouter.ai/api/v1".to_string(),
+                ),
+            ],
+            "omlx-local",
+        );
+        assert_eq!(app.provider_selected, 0, "active profile highlighted");
+
+        app.handle_key(key(KeyCode::Char('o')), None);
+        app.handle_key(key(KeyCode::Char('e')), None);
+        assert_eq!(app.list_mode, Some(ListMode::ProviderPicker));
+
+        app.handle_key(key(KeyCode::Down), None);
+        app.handle_key(key(KeyCode::Enter), None);
+        assert_eq!(app.take_selected_provider().as_deref(), Some("openrouter"));
+        assert_eq!(app.take_selected_provider(), None, "request is consumed");
     }
 
     #[test]
@@ -1407,6 +1858,13 @@ mod tests {
             0.9,
             40,
             1_200,
+            TtsDisplay {
+                enabled: false,
+                backend: "say".to_string(),
+                voice: None,
+            },
+            true,
+            Some("halfblocks".to_string()),
         );
         app.show_home();
         app.handle_key(key(KeyCode::Down), None);
