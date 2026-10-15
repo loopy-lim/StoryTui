@@ -22,7 +22,7 @@ async fn main() {
     // The import subcommand never enters the TUI: it compiles a card into a
     // pack directory and prints a report.
     if raw_args.first().map(String::as_str) == Some("import") {
-        if let Err(message) = import_cmd::run(&raw_args[1..]) {
+        if let Err(message) = import_cmd::run(&raw_args[1..]).await {
             eprintln!("{message}");
             std::process::exit(2);
         }

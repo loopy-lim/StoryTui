@@ -13,6 +13,7 @@
 
 pub mod card;
 pub mod macros;
+pub mod normalize;
 pub mod report;
 pub mod scaffold;
 pub mod worldinfo;

@@ -840,3 +840,50 @@ async fn hosted_v1_base_url_adapts_paths_and_health_falls_back() {
         .expect("turn");
     assert_eq!(draft.narration, "비가 그쳤다.");
 }
+
+// --- raw completion path (import normalization) -----------------------------
+
+#[tokio::test]
+async fn generate_completion_returns_raw_content_and_falls_back_on_400() {
+    // A strict-mode style server rejects the constrained request with 400;
+    // the raw path must retry without response_format and return the body
+    // verbatim (no game-contract parsing).
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("response_format"))
+        .respond_with(ResponseTemplate::new(400))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "{\"personality\":[\"차분함\"]}"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+            })),
+        )
+        .mount(&server)
+        .await;
+
+    let mut config = cfg_for(&server);
+    config.structured_output = StructuredOutputMode::Auto;
+    let provider = OpenAiCompatibleProvider::new(config).expect("provider");
+    let raw = provider
+        .generate_completion(
+            "시스템",
+            "사용자",
+            512,
+            Some(serde_json::json!({"type": "object"})),
+        )
+        .await
+        .expect("raw completion");
+
+    assert_eq!(raw, "{\"personality\":[\"차분함\"]}");
+    let requests = server.received_requests().await.expect("requests");
+    assert_eq!(
+        requests.len(),
+        2,
+        "one constrained attempt, one plain retry"
+    );
+}

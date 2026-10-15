@@ -298,6 +298,49 @@ fn read_secret_file(
     Ok(secret)
 }
 
+/// Provider roster for the import subcommand: the base `[provider]` first,
+/// then every `[[providers]]` entry, with `api_key_file` secrets resolved.
+/// Deliberately lighter than [`load`] — no pack directory or model checks, so
+/// importing works on a machine whose story config points elsewhere.
+pub fn provider_roster(config_path: Option<&Path>) -> Result<Vec<ProviderConfig>, String> {
+    let path = config_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(preferred_default_config_path);
+    if !path.exists() {
+        return Err(format!(
+            "설정 파일이 없습니다: {} — --provider-config로 경로를 지정하세요",
+            path.display()
+        ));
+    }
+    let text = fs::read_to_string(&path)
+        .map_err(|e| format!("설정 파일을 읽지 못했습니다 ({}): {e}", path.display()))?;
+    let file: FileConfig =
+        toml::from_str(&text).map_err(|e| format!("설정 TOML이 올바르지 않습니다: {e}"))?;
+    let source_path = Some(path);
+
+    let mut base = file.provider;
+    if let Some(secret_path) = base.api_key_file.clone() {
+        base.api_key = Some(read_secret_file(
+            &secret_path,
+            source_path.as_deref(),
+            "provider.api_key_file",
+        )?);
+    }
+    let mut roster = vec![base];
+    for mut entry in file.providers {
+        if let Some(secret_path) = entry.api_key_file.clone() {
+            let label = format!("provider '{}'의 api_key_file", entry.name);
+            entry.api_key = Some(read_secret_file(
+                &secret_path,
+                source_path.as_deref(),
+                &label,
+            )?);
+        }
+        roster.push(entry);
+    }
+    Ok(roster)
+}
+
 pub fn load(cli: &CliOptions) -> Result<RuntimeConfig, String> {
     let config_path = cli
         .provider_config

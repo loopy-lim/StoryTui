@@ -231,6 +231,89 @@ impl OpenAiCompatibleProvider {
         }
     }
 
+    /// One-shot raw completion for non-game workloads (import normalization).
+    ///
+    /// Returns the assistant message content verbatim — no game-contract
+    /// parsing. Sampling uses the operator profile with a fixed moderate
+    /// temperature; `json_schema` follows the same capability and HTTP-400
+    /// fallback rules as `generate_turn` (a schema-rejecting server loses
+    /// `response_format` for the session). Transient send and 5xx failures
+    /// retry once.
+    pub async fn generate_completion(
+        &self,
+        system: &str,
+        user: &str,
+        max_tokens: u32,
+        json_schema: Option<story_model::serde_json::Value>,
+    ) -> Result<String, ProviderError> {
+        let cancel = CancellationToken::new();
+        let mut suppress_rf = false;
+        for attempt in 0..2 {
+            if cancel.is_cancelled() {
+                return Err(ProviderError::Cancelled);
+            }
+            let request = story_model::TurnRequest {
+                generation_id: story_model::uuid::Uuid::new_v4(),
+                messages: vec![
+                    story_model::ChatMessage {
+                        role: "system".to_string(),
+                        content: system.to_string(),
+                    },
+                    story_model::ChatMessage {
+                        role: "user".to_string(),
+                        content: user.to_string(),
+                    },
+                ],
+                model: String::new(),
+                temperature: 0.4,
+                top_p: self.config.top_p,
+                top_k: self.config.top_k,
+                max_tokens,
+                json_schema: json_schema.clone(),
+            };
+            let send_rf =
+                !suppress_rf && self.structured_enabled() && request.json_schema.is_some();
+            let mut body = ChatCompletionRequest::from_turn(&request, &self.config.model, send_rf);
+            body.max_tokens_field = self.config.max_tokens_field;
+            let send = self
+                .authorize(self.client.post(self.chat_url()))
+                .json(&body)
+                .send();
+            let result = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
+                r = send => r,
+            };
+            let resp = match result {
+                Ok(resp) => resp,
+                Err(_e) if attempt == 0 => continue,
+                Err(e) => return Err(map_send_error(e, self.config.request_timeout_ms)),
+            };
+            let status = resp.status();
+            if status == StatusCode::BAD_REQUEST && send_rf {
+                // Mirror generate_turn's policy: the schema was rejected, so
+                // the session loses structured output.
+                self.disable_structured();
+                suppress_rf = true;
+                continue;
+            }
+            if status.is_server_error() && attempt == 0 {
+                continue;
+            }
+            let envelope_body = resp
+                .text()
+                .await
+                .map_err(|e| ProviderError::Protocol(format!("response body read failed: {e}")))?;
+            let parsed: crate::envelope::ChatCompletionResponse =
+                story_model::serde_json::from_str(&envelope_body)
+                    .map_err(|e| ProviderError::Protocol(format!("response decode failed: {e}")))?;
+            return Ok(parsed.content());
+        }
+        Err(ProviderError::Protocol(
+            "retry budget exhausted".to_string(),
+        ))
+    }
+
     /// `true` iff the configured `base_url` host is loopback (ADR-002). Surfaced
     /// for the status bar / coordinator; a non-loopback provider still
     /// functions (the warning is non-blocking).

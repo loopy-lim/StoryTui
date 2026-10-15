@@ -1,9 +1,11 @@
 //! `storytui import <card> [옵션]` — compile a SillyTavern/RisuAI character
-//! card into a native StoryTui pack directory.
+//! card into a native StoryTui pack directory, optionally followed by the
+//! Director normalization pass against the configured provider.
 
 use std::path::PathBuf;
 
 use story_import::ImportOptions;
+use story_provider::OpenAiCompatibleProvider;
 
 /// Help text for the import subcommand.
 pub fn usage() -> String {
@@ -13,6 +15,9 @@ pub fn usage() -> String {
   --player-name NAME    {{user}} 매크로 치환에 쓸 호칭 (기본: 플레이어)
   --language TAG        story.toml 언어 태그 (기본: ko-KR)
   --lorebook PATH       병합할 World Info(로어북) JSON
+  --normalize           Director 정규화 패스 실행 (생성 1회, 기본 OFF)
+  --provider-config PATH  프로바이더 설정 TOML (기본: config/storytui*.toml)
+  --provider NAME       --normalize가 쓸 프로필 이름 (기본: [provider])
   --force               기존 출력 디렉터를 덮어쓴다
   -h, --help            도움말"
         .to_string()
@@ -20,10 +25,13 @@ pub fn usage() -> String {
 
 /// Parse `import` arguments (the `import` verb itself already consumed) and
 /// run the import. Errors are human-readable Korean.
-pub fn run(args: &[String]) -> Result<(), String> {
+pub async fn run(args: &[String]) -> Result<(), String> {
     let mut card: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
     let mut options = ImportOptions::default();
+    let mut normalize = false;
+    let mut provider_config: Option<PathBuf> = None;
+    let mut provider_name: Option<String> = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -44,6 +52,17 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 options.lorebook_path =
                     Some(PathBuf::from(take_value(args, &mut index, "--lorebook")?));
             }
+            "--normalize" => normalize = true,
+            "--provider-config" => {
+                provider_config = Some(PathBuf::from(take_value(
+                    args,
+                    &mut index,
+                    "--provider-config",
+                )?));
+            }
+            "--provider" => {
+                provider_name = Some(take_value(args, &mut index, "--provider")?);
+            }
             "--force" => options.force = true,
             other => {
                 if other.starts_with('-') {
@@ -61,7 +80,37 @@ pub fn run(args: &[String]) -> Result<(), String> {
         return Err(format!("카드 파일이 필요합니다\n\n{}", usage()));
     };
 
-    let output = story_import::import_card(&card, out.as_deref(), &options)?;
+    let mut output = story_import::import_card(&card, out.as_deref(), &options)?;
+    if normalize {
+        let roster = storytui::config::provider_roster(provider_config.as_deref())?;
+        let selected = match provider_name.as_deref() {
+            Some(name) => roster
+                .into_iter()
+                .find(|entry| entry.name == name)
+                .ok_or_else(|| format!("프로바이더 '{name}'가 구성에 없습니다"))?,
+            None => roster
+                .into_iter()
+                .next()
+                .ok_or("구성된 프로바이더가 없습니다")?,
+        };
+        let provider = OpenAiCompatibleProvider::new(selected)
+            .map_err(|e| format!("프로바이더를 만들지 못했습니다: {e}"))?;
+        println!("Director 정규화 중… (생성 1회)");
+        let summary = story_import::normalize::normalize_pack(
+            &output.pack_dir,
+            &provider,
+            &mut output.report,
+        )
+        .await;
+        if summary.applied {
+            println!("  정규화: {}", summary.filled.join(", "));
+        }
+        // Re-write the report so the file carries the normalization notes too.
+        output
+            .report
+            .write(&output.pack_dir.join("import-report.md"))?;
+    }
+
     let report = &output.report;
     println!("가져오기 완료: {}", output.pack_dir.display());
     println!(
@@ -83,5 +132,5 @@ fn take_value(args: &[String], index: &mut usize, flag: &str) -> Result<String, 
     *index += 1;
     args.get(*index)
         .cloned()
-        .ok_or_else(|| format!("{flag} 값이 필요합니다\n\n{}", crate::import_cmd::usage()))
+        .ok_or_else(|| format!("{flag} 값이 필요합니다\n\n{}", usage()))
 }
