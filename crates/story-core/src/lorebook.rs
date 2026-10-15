@@ -1,9 +1,13 @@
-//! Per-turn lorebook selection and prompt rendering (execution tier T0+T1).
+//! Per-turn lorebook selection and prompt rendering (execution tiers T0–T2).
 //!
 //! Executed features: keyword matching (case-folded by default), constant
 //! entries, `insertion_order`, `before_char`/`after_char` positions, selective
-//! secondary-key logic, `scan_depth`, per-turn `probability`, and a soft token
-//! budget. Recursion fields are preserved but not yet executed (T2).
+//! secondary-key logic, `scan_depth`, per-turn `probability`, a soft token
+//! budget, and recursion (T2): activated entries' content re-scans for further
+//! activations, gated by the book's `recursive_scanning` master switch, the
+//! per-entry `prevent_recursion` (this entry triggers nothing) and
+//! `exclude_recursion` (this entry cannot be triggered by other entries),
+//! with a cycle guard and a bounded pass count.
 //!
 //! Placement policy — prompt-prefix stability: the user message deliberately
 //! keeps a turn-invariant prefix (world/style/canon) so local runtimes can
@@ -41,6 +45,11 @@ impl SelectedLore {
     }
 }
 
+/// Maximum number of recursion re-scan passes after the direct scan. A
+/// tight bound keeps pathological books linear and the selection
+/// deterministic; chains deeper than this simply do not fire.
+pub const MAX_RECURSION_PASSES: u32 = 3;
+
 /// Scan + select lorebook entries for this turn.
 ///
 /// Deterministic: the same inputs always yield the same selection — the
@@ -68,7 +77,15 @@ pub fn select_lore(
 
     let mut stable_before = Vec::new();
     let mut stable_after = Vec::new();
-    let mut candidates = Vec::new();
+    let mut candidates: Vec<LorebookEntry> = Vec::new();
+    // Entries still eligible for (re-)scanning, keyed by id. Constants never
+    // re-scan; `exclude_recursion` entries drop out after the direct pass.
+    // Removal on activation doubles as the per-turn cycle guard.
+    let mut pending: std::collections::BTreeMap<&str, &LorebookEntry> = Default::default();
+    // Recursion sources: content of everything active this turn whose
+    // `prevent_recursion` flag does not opt it out.
+    let mut recursion_corpus = String::new();
+
     for entry in &book.entries {
         if !entry.enabled {
             continue;
@@ -78,13 +95,68 @@ pub fn select_lore(
                 LorebookPosition::BeforeChar => stable_before.push(entry.clone()),
                 LorebookPosition::AfterChar => stable_after.push(entry.clone()),
             }
+            if !entry.prevent_recursion {
+                recursion_corpus.push_str(entry.content.trim());
+                recursion_corpus.push('\n');
+            }
             continue;
         }
+        pending.insert(entry.id.as_str(), entry);
+    }
+
+    // Direct pass against the story corpus.
+    let direct: Vec<&LorebookEntry> = pending.values().copied().collect();
+    for entry in direct {
         if entry.probability < 100 && probability_roll(state.turn, &entry.id) >= entry.probability {
+            pending.remove(entry.id.as_str());
             continue;
         }
-        if entry_matches(&corpus_raw, &corpus_folded, entry) {
-            candidates.push(entry.clone());
+        if !entry_matches(&corpus_raw, &corpus_folded, entry) {
+            continue;
+        }
+        candidates.push(entry.clone());
+        if !entry.prevent_recursion {
+            recursion_corpus.push_str(entry.content.trim());
+            recursion_corpus.push('\n');
+        }
+        if entry.exclude_recursion {
+            pending.remove(entry.id.as_str());
+        }
+    }
+    // `exclude_recursion` entries that never fired directly are still barred
+    // from the recursive passes — only the story corpus may activate them.
+    pending.retain(|_, entry| !entry.exclude_recursion);
+
+    // Recursion passes: each pass scans the remaining entries against the
+    // corpus frozen at the previous pass's end (breadth-per-pass, so chains
+    // grow by exactly one link per pass), until nothing new fires or the
+    // pass budget runs out.
+    if book.recursive_scanning {
+        let mut recursion_folded = recursion_corpus.to_lowercase();
+        for _ in 0..MAX_RECURSION_PASSES {
+            if pending.is_empty() {
+                break;
+            }
+            let mut fired_this_pass = false;
+            let mut corpus_delta = String::new();
+            let round: Vec<&LorebookEntry> = pending.values().copied().collect();
+            for entry in round {
+                if !entry_matches(&recursion_corpus, &recursion_folded, entry) {
+                    continue;
+                }
+                pending.remove(entry.id.as_str());
+                candidates.push(entry.clone());
+                fired_this_pass = true;
+                if !entry.prevent_recursion {
+                    corpus_delta.push_str(entry.content.trim());
+                    corpus_delta.push('\n');
+                }
+            }
+            if !fired_this_pass {
+                break;
+            }
+            recursion_corpus.push_str(&corpus_delta);
+            recursion_folded = recursion_corpus.to_lowercase();
         }
     }
 
@@ -419,5 +491,105 @@ mod tests {
         let _map: BTreeMap<String, String> = BTreeMap::new();
         let _loc = LocationId("x".to_string());
         let _slot = TimeSlot::Evening;
+    }
+
+    // --- recursion (T2) ------------------------------------------------------
+
+    fn recursive_book(entries: Vec<LorebookEntry>) -> Lorebook {
+        Lorebook {
+            recursive_scanning: true,
+            ..book(entries)
+        }
+    }
+
+    #[test]
+    fn recursion_chains_entries_when_enabled() {
+        let mut a = entry("a", &["비"], "그날 전시회 이야기가 떠올랐다.");
+        a.prevent_recursion = false;
+        let b = entry("b", &["전시회"], "전시회의 기억.");
+        let pack = pack_with(recursive_book(vec![a, b]));
+        let state = state_with(&["비가 그쳤다."]);
+
+        let selected = select_lore(&pack, &state, &state.history, None, None);
+        let mut ids: Vec<&str> = selected.triggered.iter().map(|e| e.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec!["a", "b"],
+            "b fires from a's content, not the story text"
+        );
+    }
+
+    #[test]
+    fn recursion_requires_the_master_switch() {
+        let a = entry("a", &["비"], "그날 전시회 이야기가 떠올랐다.");
+        let b = entry("b", &["전시회"], "전시회의 기억.");
+        let pack = pack_with(book(vec![a, b])); // recursive_scanning: false
+        let state = state_with(&["비가 그쳤다."]);
+
+        let selected = select_lore(&pack, &state, &state.history, None, None);
+        let ids: Vec<&str> = selected.triggered.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["a"], "no master switch, no recursive activation");
+    }
+
+    #[test]
+    fn exclude_recursion_blocks_recursive_activation_but_not_direct() {
+        let a = entry("a", &["비"], "그날 전시회 이야기가 떠올랐다.");
+        let mut b = entry("b", &["전시회"], "전시회의 기억.");
+        b.exclude_recursion = true;
+        let pack = pack_with(recursive_book(vec![a, b]));
+
+        // Direct match still fires: the story text itself mentions 전시회.
+        let direct = state_with(&["비가 그치고 전시회 포스터가 보였다."]);
+        let selected = select_lore(&pack, &direct, &direct.history, None, None);
+        let mut ids: Vec<&str> = selected.triggered.iter().map(|e| e.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec!["a", "b"],
+            "exclude_recursion only gates recursive passes"
+        );
+
+        // Recursive activation is blocked: only a's content mentions 전시회.
+        let indirect = state_with(&["비가 그쳤다."]);
+        let selected = select_lore(&pack, &indirect, &indirect.history, None, None);
+        let ids: Vec<&str> = selected.triggered.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["a"]);
+    }
+
+    #[test]
+    fn prevent_recursion_stops_outgoing_triggers() {
+        let mut a = entry("a", &["비"], "그날 전시회 이야기가 떠올랐다.");
+        a.prevent_recursion = true;
+        let b = entry("b", &["전시회"], "전시회의 기억.");
+        let pack = pack_with(recursive_book(vec![a, b]));
+        let state = state_with(&["비가 그쳤다."]);
+
+        let selected = select_lore(&pack, &state, &state.history, None, None);
+        let ids: Vec<&str> = selected.triggered.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["a"], "a fires but must not trigger b");
+    }
+
+    #[test]
+    fn recursion_pass_budget_caps_chain_depth() {
+        // a → b → c → d → e: each entry's content names the next key.
+        let chain = [
+            ("a", "비", "그날 전시회 이야기가 떠올랐다."),
+            ("b", "전시회", "전시회 다음 날, 우산을 두고 나왔다."),
+            ("c", "우산", "두고 간 우산을 찾으러 지하철역으로 갔다."),
+            ("d", "지하철", "지하철역 앞에서 마지막 인사를 떠올렸다."),
+            ("e", "마지막 인사", "마지막 인사의 온기."),
+        ]
+        .into_iter()
+        .map(|(id, key, content)| entry(id, &[key], content))
+        .collect();
+        let pack = pack_with(recursive_book(chain));
+        let state = state_with(&["비가 그쳤다."]);
+
+        let selected = select_lore(&pack, &state, &state.history, None, None);
+        let ids: Vec<&str> = selected.triggered.iter().map(|e| e.id.as_str()).collect();
+        // direct + MAX_RECURSION_PASSES(3) activations: a..=d fire, e needs a 4th pass.
+        assert_eq!(ids.len(), 4, "chain depth is capped: {ids:?}");
+        assert!(!ids.contains(&"e"), "the fifth link stays out: {ids:?}");
     }
 }
