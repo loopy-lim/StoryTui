@@ -12,11 +12,16 @@ pub fn render_home(frame: &mut Frame, area: Rect, selected: usize, can_continue:
         ("새 게임", "새로운 이야기로 시작합니다.", true),
         ("이어하기", "자동 저장된 이야기를 이어갑니다.", can_continue),
         ("설정", "모델과 생성 설정을 확인합니다.", true),
+        (
+            "카드 가져오기",
+            "캐릭터 카드를 이 팩 목록에 임포트합니다.",
+            true,
+        ),
         ("종료", "StoryTUI를 종료합니다.", true),
     ];
     let content = Layout::vertical([
         Constraint::Fill(1),
-        Constraint::Length(11),
+        Constraint::Length(15),
         Constraint::Fill(1),
     ])
     .split(area)[1];
@@ -68,10 +73,10 @@ pub fn render_home(frame: &mut Frame, area: Rect, selected: usize, can_continue:
 pub fn menu_selection_at(area: Rect, row: u16) -> Option<usize> {
     let content = Layout::vertical([
         Constraint::Fill(1),
-        Constraint::Length(11),
+        Constraint::Length(15),
         Constraint::Fill(1),
     ])
     .split(area)[1];
     let offset = row.checked_sub(content.y + 1)?;
-    (offset < 8).then_some((offset / 2) as usize)
+    (offset < 10).then_some((offset / 2) as usize)
 }

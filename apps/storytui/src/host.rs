@@ -30,7 +30,17 @@ mod settings;
 
 type UiTerminal = Terminal<CrosstermBackend<Stdout>>;
 
+/// Summary of a finished card import (dialog report content).
+struct ImportOutcome {
+    pack_dir: String,
+    lines: Vec<String>,
+}
+
 enum HostMessage {
+    ImportFinished {
+        path: String,
+        result: Result<ImportOutcome, String>,
+    },
     Generation {
         generation_id: story_model::uuid::Uuid,
         model: String,
@@ -247,7 +257,7 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                             dispatch(command, &mut engine, &mut app, &pack, &provider, &config, &save_store, &tts, &mut scene_image_cache, &tx, &mut cancellation).await?;
                         }
                         handle_ui_requests(
-                            &mut app, &mut engine, &pack, &mut provider_config,
+                            &mut app, &mut engine, &mut pack, &mut provider_config,
                             &mut provider, &mut user_settings, &mut config,
                             &save_store, &tts, &mut scene_image_cache, &tx, &mut cancellation, &mut resume_engine,
                         ).await?;
@@ -272,7 +282,7 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                             .await?;
                         }
                         handle_ui_requests(
-                            &mut app, &mut engine, &pack, &mut provider_config,
+                            &mut app, &mut engine, &mut pack, &mut provider_config,
                             &mut provider, &mut user_settings, &mut config,
                             &save_store, &tts, &mut scene_image_cache, &tx, &mut cancellation, &mut resume_engine,
                         ).await?;
@@ -363,6 +373,17 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                         dispatch(command, &mut engine, &mut app, &pack, &provider, &config, &save_store, &tts, &mut scene_image_cache, &tx, &mut cancellation).await?;
                         needs_redraw = true;
                     }
+                    HostMessage::ImportFinished { path, result } => {
+                        match result {
+                            Ok(outcome) => {
+                                app.show_import_report(&path, outcome.lines, Some(outcome.pack_dir))
+                            }
+                            Err(error) => {
+                                app.show_import_report(&path, vec![format!("임포트 실패: {error}")], None)
+                            }
+                        }
+                        needs_redraw = true;
+                    }
                     HostMessage::WriterChunk { generation_id, text } => {
                         app.push_writer_chunk(generation_id, &text);
                         needs_redraw = true;
@@ -398,6 +419,50 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Switch the session to the pack at `pack_dir`: reset the engine, drop the
+/// stale autosave resume, and refresh every pack-derived view. The old pack
+/// stays in charge when the new one fails to load.
+#[allow(clippy::too_many_arguments)]
+fn swap_pack(
+    app: &mut App,
+    pack_dir: &str,
+    pack: &mut StoryPack,
+    engine: &mut EngineState,
+    scene_images: &mut images::SceneImageCache,
+    config: &RuntimeConfig,
+    cancellation: &mut Option<(story_model::uuid::Uuid, CancellationToken)>,
+    resume_engine: &mut Option<EngineState>,
+) {
+    let new_pack = match PackLoader::load(std::path::Path::new(pack_dir)) {
+        Ok(pack) => pack,
+        Err(error) => {
+            tracing::warn!(pack = %pack_dir, %error, "imported pack failed to load");
+            app.view.error = Some(story_model::DomainErrorView {
+                code: "pack_load_failed".to_string(),
+                title_ko: "팩을 불러오지 못했습니다".to_string(),
+                message_ko: error.to_string(),
+                recoverable: true,
+            });
+            return;
+        }
+    };
+    if let Some((_, token)) = cancellation.take() {
+        token.cancel();
+    }
+    *pack = new_pack;
+    apply_player_profile(pack, &config.player);
+    *engine = EngineState::initial(pack);
+    engine.use_director_writer = config.use_director_writer;
+    *resume_engine = None;
+    *scene_images = images::SceneImageCache::default();
+    app.set_view(build_view(engine, pack, None, None));
+    app.set_lists(&engine.game.history, &engine.game.memories);
+    app.follow_story_end();
+    app.set_can_continue(false);
+    refresh_scene_images(app, pack, engine, scene_images);
+    tracing::info!(pack = %pack_dir, "switched to the imported pack");
+}
+
 /// Refresh the scene image cache and push its update into the view: set a new
 /// image, clear it, or leave the current pane untouched.
 fn refresh_scene_images(
@@ -417,7 +482,7 @@ fn refresh_scene_images(
 async fn handle_ui_requests(
     app: &mut App,
     engine: &mut EngineState,
-    pack: &StoryPack,
+    pack: &mut StoryPack,
     provider_config: &mut story_provider::ProviderConfig,
     provider: &mut Arc<OpenAiCompatibleProvider>,
     user_settings: &mut UserSettings,
@@ -574,6 +639,57 @@ async fn handle_ui_requests(
             backend: status.backend.as_str().to_string(),
             voice: status.voice.clone(),
         });
+    }
+    if let Some(path) = app.take_import_request() {
+        // ADR-003: the host owns all file I/O. The importer runs off the UI
+        // loop; its outcome returns as `HostMessage::ImportFinished`.
+        let tx = tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let result = story_import::import_card(
+                std::path::Path::new(&path),
+                None,
+                &story_import::ImportOptions::default(),
+            )
+            .map(|output| {
+                let report = &output.report;
+                let mut lines = Vec::new();
+                if report.lorebook_entries > 0 {
+                    lines.push(format!("로어북 엔트리 {}개", report.lorebook_entries));
+                }
+                for mapped in report.mapped.iter().take(5) {
+                    lines.push(format!("· {mapped}"));
+                }
+                for note in report.approximations.iter().take(3) {
+                    lines.push(format!("≈ {note}"));
+                }
+                for warning in &report.warnings {
+                    lines.push(format!("! {warning}"));
+                }
+                if !report.ignored_fields.is_empty() {
+                    lines.push(format!(
+                        "무시된 필드 {}건 — sources/card.json에 보존",
+                        report.ignored_fields.len()
+                    ));
+                }
+                ImportOutcome {
+                    pack_dir: output.pack_dir.display().to_string(),
+                    lines,
+                }
+            });
+            let _ = tx.send(HostMessage::ImportFinished { path, result });
+        });
+    }
+    if let Some(pack_dir) = app.take_pack_swap_request() {
+        swap_pack(
+            app,
+            &pack_dir,
+            pack,
+            engine,
+            scene_images,
+            config,
+            cancellation,
+            resume_engine,
+        );
     }
     if let Some(request) = app.take_save_load_request() {
         saves::handle_request(

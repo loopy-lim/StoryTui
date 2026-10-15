@@ -16,10 +16,14 @@ stateDiagram-v2
     ModelPicker: 모델 선택기 (o → p)
     ProviderPicker: 프로바이더 선택기 (o → e)
     SaveLoad: 저장/불러오기 (s / l)
+    ImportDialog: 카드 가져오기 (홈 메뉴)
     Error: 오류 오버레이
 
     [*] --> Home
     Home --> Story: Enter · 새 게임(N) / 이어하기(자동저장 있을 때)
+    Home --> ImportDialog: 메뉴 "카드 가져오기" Enter
+    ImportDialog --> ImportDialog: 경로 입력 · Enter 임포트 (호스트가 백그라운드 실행)
+    ImportDialog --> Home: Esc 취소 · 리포트에서 Enter 시 임포트된 팩으로 전환
     Home --> Home: ↑↓ 이동 · 메뉴 클릭
     Story --> Story: 선택지 확정(1-9/Enter/클릭) → 생성 → 다음 턴
     Story --> Input: i/ㅑ
@@ -78,6 +82,18 @@ stateDiagram-v2
 | `i/ㅑ` | **장면 이미지 켜기/끄기** | user-settings.toml |
 | 상태 블록 | TTS(v) 상태·백엔드·보이스, 이미지 프로토콜(kitty 등) 표시 | — |
 | `Esc` | 닫기 · `q` 종료 | — |
+
+### 카드 가져오기 (시작 메뉴)
+
+- 시작 메뉴에서 `카드 가져오기` 선택 → 경로 입력 모달
+- 대상: SillyTavern/RisuAI 캐릭터 카드 (PNG `chara`/`ccv3` 임베디드 또는 `.json`, V1/V2/V3)
+- `Enter` 임포트 → 호스트가 백그라운드 실행 → 리포트 표시 (로어북 엔트리 수,
+  매핑/근사/경고/무시 필드 요약)
+- 리포트에서 `Enter` → 임포트된 팩(`stories/<slug>`)으로 즉시 전환(새 엔진),
+  `Esc` → 닫기 (기존 팩 유지)
+- World Info 병합·언어·플레이어 호칭 등 세부 옵션은 CLI 사용:
+  `storytui import --help` (`--normalize` 정규화 패스 포함)
+- 상세 정책: `crates/story-import` 모듈 문서와 임포트 리포트(`import-report.md`)
 
 ### 이미지 표시 규칙
 

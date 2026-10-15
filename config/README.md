@@ -196,3 +196,31 @@ cargo run -p storytui -- \
 ```bash
 cargo run -p storytui -- --help
 ```
+
+## 캐릭터 카드 임포트
+
+SillyTavern/RisuAI 캐릭터 카드(V1/V2/V3, PNG `chara`/`ccv3` 또는 JSON)를 네이티브
+팩으로 컴파일한다.
+
+```bash
+# 기본: stories/<카드명-slug> 에 팩 생성
+cargo run -p storytui -- import card.png
+
+# 옵션: 출력 위치, World Info 병합, {{user}} 치환, Director 정규화
+cargo run -p storytui -- import card.json \
+  -o stories/yuna \
+  --lorebook world-info.json \
+  --player-name 하늘 \
+  --normalize --provider omlx-local
+```
+
+- 원본 카드는 `sources/card.json`에 그대로 보존되고, 매핑/무시/근사 내역은
+  `import-report.md`에 기록된다. 임포트가 끝나면 PackLoader 검증을 통과한 팩만
+  남는다.
+- 로어북(`character_book`, World Info 단독 파일 모두)은 `lorebook.toml`로
+  저장되어 턴마다 키워드 매칭으로 프롬프트에 주입된다(예산·우선순위·재귀 지원).
+- `--normalize`는 설명 본문을 로컬 모델로 구조화 필드(personality, 말투, 목표,
+  알고/모르는 사실)에 옮기는 생성 1회짜리 후속 단계다. 실패해도 결정적 임포트
+  결과는 그대로 남는다.
+- TUI에서도 시작 메뉴의 `카드 가져오기`로 같은 임포트를 실행할 수 있다(옵션은
+  CLI만 제공).

@@ -59,6 +59,21 @@ pub struct TtsDisplay {
     pub voice: Option<String>,
 }
 
+/// Card import dialog state: path input → running → report.
+#[derive(Clone, Debug)]
+enum ImportDialog {
+    /// Typing the card file path.
+    Input { buffer: InputBuffer },
+    /// The host is running the import (keys ignored).
+    Running { path: String },
+    /// Finished. `ready` carries the pack dir the player can switch to.
+    Report {
+        path: String,
+        lines: Vec<String>,
+        ready: Option<String>,
+    },
+}
+
 #[derive(Clone, Debug)]
 struct SettingsState {
     provider: ProviderConfigSafe,
@@ -191,6 +206,12 @@ pub struct App {
     /// Current pre-encoded scene image, if the pack ships one.
     scene_image: Option<SceneImage>,
     mouse_command: Option<EngineCommand>,
+    /// Card import dialog (home menu "카드 가져오기"); `Some` = modal active.
+    import_dialog: Option<ImportDialog>,
+    /// Set when the player submits a card path; the host runs the import.
+    import_request: Option<String>,
+    /// Set when the player confirms the report; the host swaps the pack in.
+    pack_swap_request: Option<String>,
     /// Chronological narration stack shown in the main story pane. Writes
     /// MUST go through [`Self::replace_story_stack`] (or `set_lists`) so the
     /// render cache is invalidated — the version field keys that cache.
@@ -257,6 +278,9 @@ impl App {
             images_toggle_requested: false,
             scene_image: None,
             mouse_command: None,
+            import_dialog: None,
+            import_request: None,
+            pack_swap_request: None,
             story_stack: Vec::new(),
             story_stack_version: 0,
             stack_lines_cache: None,
@@ -352,6 +376,77 @@ impl App {
     /// Consume an engine command requested through a mouse click.
     pub fn take_mouse_command(&mut self) -> Option<EngineCommand> {
         self.mouse_command.take()
+    }
+
+    /// Open the card import dialog from the home menu.
+    pub fn open_import_dialog(&mut self) {
+        self.import_dialog = Some(ImportDialog::Input {
+            buffer: InputBuffer::new(500),
+        });
+    }
+
+    /// Consume a submitted card path; the host runs the import.
+    pub fn take_import_request(&mut self) -> Option<String> {
+        self.import_request.take()
+    }
+
+    /// Consume a confirmed pack directory; the host swaps it in.
+    pub fn take_pack_swap_request(&mut self) -> Option<String> {
+        self.pack_swap_request.take()
+    }
+
+    /// Present a finished import (or its failure) in the dialog.
+    pub fn show_import_report(&mut self, path: &str, lines: Vec<String>, ready: Option<String>) {
+        self.import_dialog = Some(ImportDialog::Report {
+            path: path.to_string(),
+            lines,
+            ready,
+        });
+    }
+
+    /// Keys while the import dialog owns the screen.
+    fn handle_import_dialog_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.should_quit = true;
+            return;
+        }
+        let Some(dialog) = self.import_dialog.as_mut() else {
+            return;
+        };
+        match dialog {
+            ImportDialog::Input { buffer } => match key.code {
+                KeyCode::Esc => self.import_dialog = None,
+                KeyCode::Enter => {
+                    let path = buffer.text().trim().to_string();
+                    if path.is_empty() {
+                        return;
+                    }
+                    self.import_request = Some(path.clone());
+                    *dialog = ImportDialog::Running { path };
+                }
+                KeyCode::Backspace => buffer.backspace(),
+                KeyCode::Delete => buffer.delete(),
+                KeyCode::Left => buffer.cursor_left(),
+                KeyCode::Right => buffer.cursor_right(),
+                KeyCode::Home => buffer.cursor_start(),
+                KeyCode::End => buffer.cursor_end(),
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    buffer.insert_grapheme(&c.to_string());
+                }
+                _ => {}
+            },
+            ImportDialog::Running { .. } => {}
+            ImportDialog::Report { ready, .. } => match key.code {
+                KeyCode::Esc => self.import_dialog = None,
+                KeyCode::Enter if ready.is_some() => {
+                    if let Some(pack_dir) = ready.clone() {
+                        self.pack_swap_request = Some(pack_dir);
+                        self.import_dialog = None;
+                    }
+                }
+                _ => {}
+            },
+        }
     }
 
     /// Supply the redacted configuration and health details for the Settings
@@ -643,6 +738,10 @@ impl App {
         key: KeyEvent,
         pending_generation_id: Option<Uuid>,
     ) -> Option<EngineCommand> {
+        if self.import_dialog.is_some() {
+            self.handle_import_dialog_key(key);
+            return None;
+        }
         if self.home_visible {
             self.handle_home_key(key);
             return None;
@@ -850,6 +949,10 @@ impl App {
     /// Insert a terminal bracketed-paste payload into the active free-input
     /// editor. Paste events outside input mode are intentionally ignored.
     pub fn handle_paste(&mut self, text: &str) {
+        if let Some(ImportDialog::Input { buffer }) = self.import_dialog.as_mut() {
+            buffer.insert_str(text);
+            return;
+        }
         if self.input_mode {
             self.input.insert_str(text);
         }
@@ -885,6 +988,38 @@ impl App {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
+        self.render_base(frame, area);
+        // The import dialog draws last so it overlays the base screen. The
+        // cursor split is computed first so its owned strings outlive the view.
+        let cursor_split = if let Some(ImportDialog::Input { buffer }) = self.import_dialog.as_ref()
+        {
+            Some(buffer.split_at_cursor())
+        } else {
+            None
+        };
+        let view = match self.import_dialog.as_ref() {
+            Some(ImportDialog::Input { .. }) => {
+                let (before, after) = cursor_split.as_ref().expect("input split set above");
+                Some(crate::screens::import::ImportDialogView::Input { before, after })
+            }
+            Some(ImportDialog::Running { path }) => {
+                Some(crate::screens::import::ImportDialogView::Running { path })
+            }
+            Some(ImportDialog::Report { path, lines, ready }) => {
+                Some(crate::screens::import::ImportDialogView::Report {
+                    path,
+                    lines,
+                    ready: ready.is_some(),
+                })
+            }
+            None => None,
+        };
+        if let Some(view) = view {
+            crate::screens::import::render_import_dialog(frame, area, view);
+        }
+    }
+
+    fn render_base(&mut self, frame: &mut Frame, area: Rect) {
         self.last_render_area.set(area);
         if self.home_visible {
             render_home(frame, area, self.home_selected, self.can_continue);
@@ -974,6 +1109,11 @@ impl App {
 
     /// Handle mouse-wheel scrolling without changing the selected choice.
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        // The import dialog is a keyboard-only modal: clicks must not reach
+        // the home menu or story screen underneath it.
+        if self.import_dialog.is_some() {
+            return;
+        }
         if self.save_load.is_some() {
             return;
         }
@@ -1127,7 +1267,7 @@ impl App {
                 }
             }
             KeyCode::Down | KeyCode::Char('j' | 'ㅓ') => {
-                self.home_selected = (self.home_selected + 1).min(3);
+                self.home_selected = (self.home_selected + 1).min(4);
                 if !self.can_continue && self.home_selected == 1 {
                     self.home_selected = 2;
                 }
@@ -1160,7 +1300,8 @@ impl App {
                 self.settings_opened = true;
                 self.settings_returns_home = true;
             }
-            3 => self.should_quit = true,
+            3 => self.open_import_dialog(),
+            4 => self.should_quit = true,
             _ => {}
         }
     }
@@ -1963,5 +2104,132 @@ mod tests {
         });
 
         assert_eq!(app.narration_scroll, u16::MAX);
+    }
+
+    #[test]
+    fn home_menu_opens_import_dialog_and_submits_path() {
+        let mut app = App::new(sample_view(0));
+        app.show_home();
+        app.set_can_continue(false);
+        // 0 → (이어하기 disabled) → 2 설정 → 3 카드 가져오기
+        app.handle_key(key(KeyCode::Down), None);
+        app.handle_key(key(KeyCode::Down), None);
+        assert_eq!(app.home_selected, 3);
+        app.handle_key(key(KeyCode::Enter), None);
+        assert!(app.import_dialog.is_some(), "dialog opens");
+
+        // Typing goes into the dialog, not the story input.
+        for character in "sto/c".chars() {
+            app.handle_key(key(KeyCode::Char(character)), None);
+        }
+        app.handle_key(key(KeyCode::Enter), None);
+        assert_eq!(app.take_import_request().as_deref(), Some("sto/c"));
+        assert!(app.take_import_request().is_none(), "request consumed once");
+        app.take_import_request(); // stay None
+        let _ = app.take_import_request();
+
+        // Paste lands in the path buffer too.
+        app.open_import_dialog();
+        app.handle_paste("/tmp/card.png");
+        assert_eq!(
+            app.take_import_request(),
+            None,
+            "paste alone does not submit"
+        );
+        app.handle_key(key(KeyCode::Enter), None);
+        assert_eq!(app.take_import_request().as_deref(), Some("/tmp/card.png"));
+    }
+
+    #[test]
+    fn import_report_enter_requests_pack_swap_and_esc_closes() {
+        let mut app = App::new(sample_view(0));
+        app.show_home();
+        app.open_import_dialog();
+        app.handle_key(key(KeyCode::Char('x')), None);
+        app.handle_key(key(KeyCode::Enter), None);
+        assert!(app.take_import_request().is_some());
+
+        app.show_import_report(
+            "stories/x",
+            vec!["로어북 엔트리 1개".to_string()],
+            Some("stories/x".to_string()),
+        );
+        app.handle_key(key(KeyCode::Enter), None);
+        assert_eq!(app.take_pack_swap_request().as_deref(), Some("stories/x"));
+        assert!(
+            app.import_dialog.is_none(),
+            "report closes after the swap request"
+        );
+
+        // Without a ready pack, Enter does nothing and Esc closes.
+        app.open_import_dialog();
+        app.handle_key(key(KeyCode::Char('y')), None);
+        app.handle_key(key(KeyCode::Enter), None);
+        app.show_import_report(
+            "stories/x",
+            vec!["임포트 실패: 파일 없음".to_string()],
+            None,
+        );
+        app.handle_key(key(KeyCode::Enter), None);
+        assert!(app.take_pack_swap_request().is_none(), "no pack, no swap");
+        app.handle_key(key(KeyCode::Esc), None);
+        assert!(app.import_dialog.is_none());
+    }
+
+    #[test]
+    fn import_dialog_esc_cancels_and_running_ignores_keys() {
+        let mut app = App::new(sample_view(0));
+        app.show_home();
+        app.open_import_dialog();
+        app.handle_key(key(KeyCode::Esc), None);
+        assert!(app.import_dialog.is_none());
+        assert!(app.take_import_request().is_none());
+
+        // Running state swallows keys (including Esc) until the host reports.
+        app.open_import_dialog();
+        app.handle_key(key(KeyCode::Char('z')), None);
+        app.handle_key(key(KeyCode::Enter), None);
+        app.show_import_report("p", vec![], None); // host path: goes straight to report
+        app.import_dialog = Some(ImportDialog::Running {
+            path: "p".to_string(),
+        });
+        app.handle_key(key(KeyCode::Esc), None);
+        assert!(app.import_dialog.is_some(), "running state ignores Esc");
+    }
+
+    #[test]
+    fn render_draws_the_import_dialog_over_home() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use unicode_width::UnicodeWidthStr;
+
+        let mut app = App::new(sample_view(0));
+        app.show_home();
+        app.open_import_dialog();
+        app.handle_paste("stories/card.png");
+        let mut terminal = Terminal::new(TestBackend::new(90, 30)).expect("terminal");
+        terminal
+            .draw(|frame| app.render(frame, frame.area()))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buffer.area.height {
+            // Skip the spacer cell that follows a double-width symbol so
+            // Hangul sequences stay contiguous.
+            let mut previous_was_wide = false;
+            for x in 0..buffer.area.width {
+                let symbol = buffer[(x, y)].symbol();
+                if previous_was_wide && symbol == " " {
+                    previous_was_wide = false;
+                    continue;
+                }
+                previous_was_wide = symbol.width() == 2;
+                out.push_str(symbol);
+            }
+            out.push('\n');
+        }
+        assert!(out.contains("카드 가져오기"), "modal title renders: {out}");
+        assert!(out.contains("> stories/card.png"), "path renders: {out}");
+        assert!(out.contains("시작 메뉴"), "home still visible underneath");
     }
 }
