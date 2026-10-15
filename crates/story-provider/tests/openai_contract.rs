@@ -11,11 +11,11 @@ use std::time::Duration;
 
 use story_model::{ChatMessage, ProviderError, ProviderHealth, TurnRequest};
 use story_provider::{
-    LlmProvider, OpenAiCompatibleProvider, ProviderConfig, StructuredOutputMode,
+    LlmProvider, MaxTokensField, OpenAiCompatibleProvider, ProviderConfig, StructuredOutputMode,
     is_loopback_base_url,
 };
 use tokio_util::sync::CancellationToken;
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// A valid `GeneratedTurn` JSON body (recovery-parser input), mirroring the
@@ -593,4 +593,250 @@ fn chat_and_health_urls_join_correctly() {
     );
     assert_eq!(provider.health_url(), "http://127.0.0.1:8080/health");
     assert_eq!(provider.models_url(), "http://127.0.0.1:8080/v1/models");
+}
+
+// --- configurable paths + output-token wire key (OpenAI cloud preset) ------
+
+#[tokio::test]
+async fn model_list_honors_configured_models_path() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/models"))
+        .and(header("authorization", "Bearer local-secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "object": "list",
+            "data": [{"id": "gpt-5.5"}, {"id": "gpt-5.5-mini"}]
+        })))
+        .mount(&server)
+        .await;
+
+    let mut config = cfg_for(&server);
+    config.models_path = "/api/models".to_string();
+    config.api_key = Some("local-secret".to_string());
+    let provider = OpenAiCompatibleProvider::new(config).expect("provider");
+
+    assert_eq!(
+        provider.list_models().await.expect("model list"),
+        vec!["gpt-5.5", "gpt-5.5-mini"]
+    );
+    assert_eq!(
+        provider.models_url(),
+        format!("{}/api/models", server.uri())
+    );
+}
+
+#[tokio::test]
+async fn health_ready_via_models_health_path() {
+    // OpenAI-style deployments have no /health; the preset points health_path
+    // at the authenticated /models listing instead.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "object": "list",
+            "data": [{"id": "gpt-5.5"}]
+        })))
+        .mount(&server)
+        .await;
+
+    let mut config = cfg_for(&server);
+    config.health_path = "/models".to_string();
+    let provider = OpenAiCompatibleProvider::new(config).expect("provider");
+    assert_eq!(
+        provider.health().await.expect("health"),
+        ProviderHealth::Ready
+    );
+}
+
+#[tokio::test]
+async fn generation_keeps_max_tokens_wire_key_by_default() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(envelope(VALID_TURN)))
+        .mount(&server)
+        .await;
+
+    let provider = OpenAiCompatibleProvider::new(cfg_for(&server)).expect("provider");
+    provider
+        .generate_turn(turn_request(), CancellationToken::new())
+        .await
+        .expect("ok");
+
+    let requests = server.received_requests().await.expect("requests");
+    assert_eq!(requests.len(), 1);
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(
+        body.get("max_tokens").and_then(|v| v.as_u64()),
+        Some(1800),
+        "default wire key must stay max_tokens: {body}"
+    );
+    assert!(
+        body.get("max_completion_tokens").is_none(),
+        "max_completion_tokens must be absent by default: {body}"
+    );
+}
+
+#[tokio::test]
+async fn generation_uses_max_completion_tokens_when_configured() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(envelope(VALID_TURN)))
+        .mount(&server)
+        .await;
+
+    let mut config = cfg_for(&server);
+    config.max_tokens_field = MaxTokensField::MaxCompletionTokens;
+    let provider = OpenAiCompatibleProvider::new(config).expect("provider");
+    provider
+        .generate_turn(turn_request(), CancellationToken::new())
+        .await
+        .expect("ok");
+
+    let requests = server.received_requests().await.expect("requests");
+    assert_eq!(requests.len(), 1);
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(
+        body.get("max_completion_tokens").and_then(|v| v.as_u64()),
+        Some(1800),
+        "configured field must serialize under max_completion_tokens: {body}"
+    );
+    assert!(
+        body.get("max_tokens").is_none(),
+        "legacy max_tokens key must be absent when MaxCompletionTokens is selected: {body}"
+    );
+}
+
+#[test]
+fn max_tokens_field_serde_is_snake_case() {
+    for (mode, s) in [
+        (MaxTokensField::MaxTokens, "max_tokens"),
+        (MaxTokensField::MaxCompletionTokens, "max_completion_tokens"),
+    ] {
+        let ser = serde_json::to_string(&mode).expect("serialize");
+        assert_eq!(ser, format!("\"{s}\""));
+        let de: MaxTokensField = serde_json::from_str(&ser).expect("deserialize");
+        assert_eq!(de, mode);
+    }
+}
+
+#[tokio::test]
+async fn auto_fallback_retries_without_response_format_on_http_400() {
+    // Strict-mode servers (e.g. OpenAI) reject the constrained request with
+    // 400. `auto` must retry once WITHOUT response_format, accept the valid
+    // turn, and stay schema-free for the rest of the session.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("response_format"))
+        .respond_with(ResponseTemplate::new(400))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(envelope(VALID_TURN)))
+        .mount(&server)
+        .await;
+
+    let mut config = cfg_for(&server);
+    config.structured_output = StructuredOutputMode::Auto;
+    let schema = serde_json::json!({"type": "object"});
+    let request = TurnRequest {
+        json_schema: Some(schema),
+        ..turn_request()
+    };
+
+    let provider = OpenAiCompatibleProvider::new(config).expect("provider");
+    let draft = provider
+        .generate_turn(request, CancellationToken::new())
+        .await
+        .expect("fallback must succeed");
+    assert_eq!(draft.narration, "비가 그쳤다.");
+
+    // First request carried response_format (→400), the retry did not.
+    let requests = server.received_requests().await.expect("requests");
+    assert_eq!(requests.len(), 2);
+    let had_rf: Vec<bool> = requests
+        .iter()
+        .map(|req| {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).expect("json");
+            body.get("response_format").is_some()
+        })
+        .collect();
+    assert_eq!(
+        had_rf,
+        vec![true, false],
+        "exactly one constrained attempt, then a schema-free retry"
+    );
+
+    // The session lost the capability: the next turn goes out schema-free
+    // even though a schema is attached again.
+    let request = TurnRequest {
+        json_schema: Some(serde_json::json!({"type": "object"})),
+        ..turn_request()
+    };
+    provider
+        .generate_turn(request, CancellationToken::new())
+        .await
+        .expect("subsequent turn");
+    let requests = server.received_requests().await.expect("requests");
+    let last = requests.last().expect("last request");
+    let body: serde_json::Value = serde_json::from_slice(&last.body).expect("json");
+    assert!(
+        body.get("response_format").is_none(),
+        "capability must stay disabled for the session: {body}"
+    );
+}
+
+#[tokio::test]
+async fn hosted_v1_base_url_adapts_paths_and_health_falls_back() {
+    // A hosted OpenAI-compatible endpoint: base_url ends in `/v1` and there
+    // is no `/health`. The provider must adapt the defaulted paths at
+    // construction and fall back to the model list for the health probe —
+    // URL swap only, no preset, no per-path overrides.
+    let server = MockServer::start().await;
+    let hosted_base = format!("{}/v1", server.uri());
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .and(header("authorization", "Bearer hosted-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "object": "list",
+            "data": [{"id": "compatible-model"}]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(envelope(VALID_TURN)))
+        .mount(&server)
+        .await;
+
+    let mut config = cfg_for(&server);
+    config.base_url = hosted_base.clone();
+    config.api_key = Some("hosted-key".to_string());
+    let provider = OpenAiCompatibleProvider::new(config).expect("provider");
+
+    // Wire paths keep the /v1 prefix (it lives in the base URL).
+    assert_eq!(provider.models_url(), format!("{hosted_base}/models"));
+    assert_eq!(provider.health_url(), format!("{hosted_base}/health"));
+
+    // Health: 404 on /health → model-list fallback → Ready.
+    assert_eq!(
+        provider.health().await.expect("health"),
+        ProviderHealth::Ready
+    );
+
+    // A normal turn completes against the adapted chat path.
+    let draft = provider
+        .generate_turn(turn_request(), CancellationToken::new())
+        .await
+        .expect("turn");
+    assert_eq!(draft.narration, "비가 그쳤다.");
 }

@@ -8,17 +8,18 @@
 //! The assistant message body extracted from a response is fed to the existing
 //! [`crate::recovery::parse_generated_turn`] — parsing is NOT reimplemented here.
 
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Serialize, Serializer};
 
+use crate::config::MaxTokensField;
 use story_model::{ChatMessage, DirectorRequest, TokenUsage, TurnRequest, WriterRequest};
 
-/// Serialize `&u32` only when it is non-zero (some servers reject `top_k`).
-fn skip_zero_u32(v: &u32) -> bool {
-    *v == 0
-}
-
 /// OpenAI chat-completions request body.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+///
+/// Serialization is hand-rolled because the output token cap is emitted under
+/// a configurable key: local OpenAI-compatible servers expect `max_tokens`,
+/// while the OpenAI cloud API expects `max_completion_tokens`
+/// (see [`MaxTokensField`]). Key order mirrors the derive it replaces.
 pub struct ChatCompletionRequest {
     /// Model id to target.
     pub model: String,
@@ -30,16 +31,40 @@ pub struct ChatCompletionRequest {
     pub top_p: f32,
     /// Top-k sampling cutoff. Omitted from the wire body when `0` because some
     /// servers reject the field.
-    #[serde(skip_serializing_if = "skip_zero_u32")]
     pub top_k: u32,
     /// Maximum output tokens.
     pub max_tokens: u32,
+    /// Wire key selection for the output token cap.
+    pub max_tokens_field: MaxTokensField,
     /// Streaming flag (always `false` for the W6 MVP).
     pub stream: bool,
     /// Structured-output constraint, included only when the provider's
     /// capability confirms support AND the request carries a schema.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<ResponseFormat>,
+}
+
+impl Serialize for ChatCompletionRequest {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("model", &self.model)?;
+        map.serialize_entry("messages", &self.messages)?;
+        map.serialize_entry("temperature", &self.temperature)?;
+        map.serialize_entry("top_p", &self.top_p)?;
+        if self.top_k != 0 {
+            map.serialize_entry("top_k", &self.top_k)?;
+        }
+        match self.max_tokens_field {
+            MaxTokensField::MaxTokens => map.serialize_entry("max_tokens", &self.max_tokens)?,
+            MaxTokensField::MaxCompletionTokens => {
+                map.serialize_entry("max_completion_tokens", &self.max_tokens)?;
+            }
+        }
+        map.serialize_entry("stream", &self.stream)?;
+        if let Some(response_format) = &self.response_format {
+            map.serialize_entry("response_format", response_format)?;
+        }
+        map.end()
+    }
 }
 
 /// `response_format` payload (OpenAI structured-output shape).
@@ -88,6 +113,7 @@ impl ChatCompletionRequest {
             top_p: req.top_p,
             top_k: req.top_k,
             max_tokens: req.max_tokens,
+            max_tokens_field: MaxTokensField::MaxTokens,
             stream: false,
             response_format,
         }
@@ -121,6 +147,7 @@ impl ChatCompletionRequest {
             top_p: req.top_p,
             top_k: req.top_k,
             max_tokens: req.max_tokens,
+            max_tokens_field: MaxTokensField::MaxTokens,
             stream: false,
             response_format,
         }
@@ -137,6 +164,7 @@ impl ChatCompletionRequest {
             top_p: req.top_p,
             top_k: req.top_k,
             max_tokens: req.max_tokens,
+            max_tokens_field: MaxTokensField::MaxTokens,
             stream: true,
             response_format: None,
         }
@@ -237,6 +265,37 @@ mod tests {
             max_tokens: 100,
             json_schema: schema,
         }
+    }
+
+    #[test]
+    fn max_tokens_is_the_default_wire_key() {
+        let req = turn(0, None);
+        let env = ChatCompletionRequest::from_turn(&req, "m", false);
+        let json = serde_json::to_string(&env).expect("serialize");
+        assert!(
+            json.contains("\"max_tokens\":100"),
+            "max_tokens must be the default wire key: {json}"
+        );
+        assert!(
+            !json.contains("max_completion_tokens"),
+            "max_completion_tokens must be absent by default: {json}"
+        );
+    }
+
+    #[test]
+    fn max_completion_tokens_wire_key_when_selected() {
+        let req = turn(0, None);
+        let mut env = ChatCompletionRequest::from_turn(&req, "m", false);
+        env.max_tokens_field = MaxTokensField::MaxCompletionTokens;
+        let json = serde_json::to_string(&env).expect("serialize");
+        assert!(
+            json.contains("\"max_completion_tokens\":100"),
+            "selected field must serialize under max_completion_tokens: {json}"
+        );
+        assert!(
+            !json.contains("\"max_tokens\""),
+            "legacy max_tokens key must be absent when MaxCompletionTokens is selected: {json}"
+        );
     }
 
     #[test]

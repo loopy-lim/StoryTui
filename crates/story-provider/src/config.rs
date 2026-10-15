@@ -8,6 +8,21 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Which request-body key carries the output token cap.
+///
+/// `MaxTokens` is the historical OpenAI-compatible key every local server
+/// (MLX-LM / MLX-VLM / OMLX / vLLM) accepts. `MaxCompletionTokens` is the
+/// modern OpenAI cloud key; the hosted API rejects `max_tokens` on
+/// reasoning-era models, so hosted OpenAI endpoints select this variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaxTokensField {
+    /// Wire key `max_tokens` (default).
+    MaxTokens,
+    /// Wire key `max_completion_tokens` (OpenAI cloud).
+    MaxCompletionTokens,
+}
+
 /// Whether to advertise structured-output (`response_format` JSON Schema)
 /// support to the OpenAI-compatible server.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +58,11 @@ pub struct ProviderConfig {
     /// Health-check path appended to `base_url`.
     #[serde(default = "default_health_path")]
     pub health_path: String,
+    /// Model-list path appended to `base_url`. OpenAI hosts expose
+    /// `{base}/models` when `base_url` already ends in `/v1`, while most local
+    /// servers expose `{base}/v1/models`.
+    #[serde(default = "default_models_path")]
+    pub models_path: String,
     /// Model id to target. Defaults to empty — the operator must set this.
     #[serde(default)]
     pub model: String,
@@ -68,6 +88,9 @@ pub struct ProviderConfig {
     /// Maximum output tokens per turn.
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
+    /// Wire key used for the output token cap (see [`MaxTokensField`]).
+    #[serde(default = "default_max_tokens_field")]
+    pub max_tokens_field: MaxTokensField,
     /// Soft lower target for narration length. `0` disables the optional
     /// quality retry; a short but valid response is never rejected solely for
     /// this setting.
@@ -100,6 +123,7 @@ impl ProviderConfig {
             base_url: default_base_url(),
             chat_path: default_chat_path(),
             health_path: default_health_path(),
+            models_path: default_models_path(),
             model: String::new(),
             api_key_env: None,
             api_key_file: None,
@@ -108,6 +132,7 @@ impl ProviderConfig {
             top_p: default_top_p(),
             top_k: default_top_k(),
             max_tokens: default_max_tokens(),
+            max_tokens_field: default_max_tokens_field(),
             min_narration_chars: 0,
             request_timeout_ms: default_request_timeout_ms(),
             connect_timeout_ms: default_connect_timeout_ms(),
@@ -121,6 +146,35 @@ impl ProviderConfig {
 impl Default for ProviderConfig {
     fn default() -> Self {
         Self::defaults()
+    }
+}
+
+impl ProviderConfig {
+    /// Adapt the request paths to hosted OpenAI-compatible conventions.
+    ///
+    /// Hosted endpoints conventionally include `/v1` in the base URL
+    /// (`https://openrouter.ai/api/v1`, `https://api.groq.com/openai/v1`,
+    /// LM Studio's `http://localhost:1234/v1`, …), while the local defaults
+    /// keep `/v1` in the request paths. When `base_url` ends in `/v1` and a
+    /// path still carries its local default, drop the redundant prefix so a
+    /// plain URL swap — no preset, no per-path overrides — is enough to move
+    /// from a local box to any compatible cloud. Explicitly customized paths
+    /// always win.
+    ///
+    /// `health_path` is intentionally untouched: `/health` is a local-server
+    /// convention and clouds have no equivalent; [`ProviderHealth`] probing
+    /// falls back to the model list when the health path answers 404.
+    pub fn normalize_paths(&mut self) {
+        let ends_with_v1 = self.base_url.trim_end_matches('/').ends_with("/v1");
+        if !ends_with_v1 {
+            return;
+        }
+        if self.chat_path == default_chat_path() {
+            self.chat_path = "/chat/completions".to_string();
+        }
+        if self.models_path == default_models_path() {
+            self.models_path = "/models".to_string();
+        }
     }
 }
 
@@ -140,6 +194,12 @@ fn default_chat_path() -> String {
 }
 fn default_health_path() -> String {
     "/health".to_string()
+}
+fn default_models_path() -> String {
+    "/v1/models".to_string()
+}
+fn default_max_tokens_field() -> MaxTokensField {
+    MaxTokensField::MaxTokens
 }
 fn default_temperature() -> f32 {
     0.85
@@ -181,6 +241,8 @@ mod tests {
         assert_eq!(c.base_url, "http://127.0.0.1:8080");
         assert_eq!(c.chat_path, "/v1/chat/completions");
         assert_eq!(c.health_path, "/health");
+        assert_eq!(c.models_path, "/v1/models");
+        assert_eq!(c.max_tokens_field, MaxTokensField::MaxTokens);
         assert_eq!(c.temperature, 0.85);
         assert_eq!(c.top_p, 0.92);
         assert_eq!(c.top_k, 40);
@@ -222,6 +284,46 @@ model = "mlx-community/x"
         assert_eq!(cfg.provider.max_retries, 2);
         assert_eq!(cfg.provider.top_k, 40);
         assert_eq!(cfg.provider.structured_output, StructuredOutputMode::Auto);
+    }
+
+    #[test]
+    fn v1_base_url_normalizes_default_paths() {
+        let mut c = ProviderConfig::defaults();
+        c.base_url = "https://openrouter.ai/api/v1".to_string();
+        c.normalize_paths();
+        assert_eq!(c.chat_path, "/chat/completions");
+        assert_eq!(c.models_path, "/models");
+        // health stays local-default; probing falls back to the model list
+        // when a cloud answers 404.
+        assert_eq!(c.health_path, "/health");
+    }
+
+    #[test]
+    fn local_base_url_keeps_local_paths() {
+        let mut c = ProviderConfig::defaults();
+        c.normalize_paths();
+        assert_eq!(c.chat_path, "/v1/chat/completions");
+        assert_eq!(c.models_path, "/v1/models");
+    }
+
+    #[test]
+    fn explicit_paths_win_over_normalization() {
+        let mut c = ProviderConfig::defaults();
+        c.base_url = "https://gateway.example.com/v1".to_string();
+        c.chat_path = "/api/chat".to_string();
+        c.normalize_paths();
+        assert_eq!(c.chat_path, "/api/chat", "customized chat path survives");
+        assert_eq!(c.models_path, "/models", "defaulted models path adapts");
+    }
+
+    #[test]
+    fn normalization_is_idempotent() {
+        let mut c = ProviderConfig::defaults();
+        c.base_url = "https://api.example.com/v1".to_string();
+        c.normalize_paths();
+        let first = c.clone();
+        c.normalize_paths();
+        assert_eq!(c, first);
     }
 
     #[test]

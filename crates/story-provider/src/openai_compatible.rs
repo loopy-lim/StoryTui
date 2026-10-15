@@ -94,8 +94,13 @@ pub struct OpenAiCompatibleProvider {
 
 impl OpenAiCompatibleProvider {
     /// Build the provider: reqwest client (timeouts, no redirects), loopback
-    /// warning if needed. Does NOT touch the network.
-    pub fn new(config: ProviderConfig) -> Result<Self, ProviderError> {
+    /// warning if needed, hosted-`/v1` path normalization. Does NOT touch the
+    /// network.
+    pub fn new(mut config: ProviderConfig) -> Result<Self, ProviderError> {
+        // A `base_url` ending in `/v1` (hosted OpenAI-compatible convention)
+        // adapts the still-default request paths. Idempotent: the adapted
+        // values no longer equal the defaults.
+        config.normalize_paths();
         let loopback = is_loopback_base_url(&config.base_url);
         if !loopback {
             tracing::warn!(
@@ -153,7 +158,7 @@ impl OpenAiCompatibleProvider {
 
     /// OpenAI-compatible model-list URL.
     pub fn models_url(&self) -> String {
-        join_url(&self.config.base_url, "/v1/models")
+        join_url(&self.config.base_url, &self.config.models_path)
     }
 
     /// Fetch the models exposed by the configured OpenAI-compatible server.
@@ -195,6 +200,35 @@ impl OpenAiCompatibleProvider {
         ids.sort_unstable();
         ids.dedup();
         Ok(ids)
+    }
+
+    /// Secondary health probe against the model-list path (404 fallback).
+    async fn probe_models_health(&self) -> Result<ProviderHealth, ProviderError> {
+        let result = tokio::time::timeout(
+            Duration::from_millis(PROBE_TIMEOUT_MS),
+            self.authorize(self.client.get(self.models_url())).send(),
+        )
+        .await;
+        match result {
+            Err(_) => Ok(ProviderHealth::Degraded),
+            Ok(Err(e)) => {
+                if e.is_timeout() {
+                    Ok(ProviderHealth::Degraded)
+                } else {
+                    Ok(ProviderHealth::Unavailable)
+                }
+            }
+            Ok(Ok(resp)) => {
+                let s = resp.status();
+                if s.is_success() {
+                    Ok(ProviderHealth::Ready)
+                } else if s.is_server_error() {
+                    Ok(ProviderHealth::Degraded)
+                } else {
+                    Ok(ProviderHealth::Unavailable)
+                }
+            }
+        }
     }
 
     /// `true` iff the configured `base_url` host is loopback (ADR-002). Surfaced
@@ -271,7 +305,8 @@ impl OpenAiCompatibleProvider {
         } else {
             &request.model
         };
-        let body = ChatCompletionRequest::from_turn(&bounded_request, model_name, send_rf);
+        let mut body = ChatCompletionRequest::from_turn(&bounded_request, model_name, send_rf);
+        body.max_tokens_field = self.config.max_tokens_field;
         let max_attempts = self.config.max_retries.saturating_add(1);
 
         for attempt in 0..max_attempts {
@@ -688,6 +723,12 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
                     Ok(ProviderHealth::Ready)
                 } else if s.is_server_error() {
                     Ok(ProviderHealth::Degraded)
+                } else if s == StatusCode::NOT_FOUND {
+                    // Hosted OpenAI-compatible APIs have no `/health`. The
+                    // authenticated model listing is an equivalent liveness +
+                    // credential check; a 404 health path no longer means an
+                    // unusable provider.
+                    self.probe_models_health().await
                 } else {
                     Ok(ProviderHealth::Unavailable)
                 }
@@ -734,6 +775,25 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
                 }
             }
             Ok(draft) => Ok(draft),
+            // A schema-rejecting server (e.g. OpenAI strict mode refusing the
+            // game contract's dynamic-map schemas) answers the constrained
+            // request with HTTP 400. Under `auto`, treat the first 400 as a
+            // capability loss: retry once without response_format, then stay
+            // schema-free for the session. A 400 for an unrelated reason
+            // simply fails again without response_format and surfaces.
+            Err(ProviderError::Protocol(detail))
+                if self.config.structured_output == StructuredOutputMode::Auto
+                    && request.json_schema.is_some()
+                    && self.structured_enabled()
+                    && detail == "HTTP 400" =>
+            {
+                tracing::warn!(
+                    target: "story_provider::openai_compatible",
+                    "structured-output schema rejected (HTTP 400); retrying without response_format"
+                );
+                self.disable_structured();
+                self.do_generate(&request, true, &cancel, None).await
+            }
             // Auto-fallback is only for a server that ignored or could not
             // produce the JSON envelope at all. A `schema:`/`validation:`
             // failure means structured output did run, but the model produced
@@ -818,7 +878,8 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
         // caught by the host's single-pass fallback — so always attaching the
         // schema is both safe and the fix that lets weaker Director models plan.
         let send_rf = request.json_schema.is_some();
-        let body = ChatCompletionRequest::from_director(&request, model_name, send_rf);
+        let mut body = ChatCompletionRequest::from_director(&request, model_name, send_rf);
+        body.max_tokens_field = self.config.max_tokens_field;
         let max_attempts = self.config.max_retries.saturating_add(1);
 
         for attempt in 0..max_attempts {
@@ -939,7 +1000,8 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
         } else {
             &request.model
         };
-        let body = ChatCompletionRequest::from_writer(&request, model_name);
+        let mut body = ChatCompletionRequest::from_writer(&request, model_name);
+        body.max_tokens_field = self.config.max_tokens_field;
         let generation_id = request.generation_id;
 
         if cancel.is_cancelled() {
