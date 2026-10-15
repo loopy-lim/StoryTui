@@ -4,9 +4,12 @@
 //! the W8 save/load tests can drive the same pack / draft shapes the W5/W7
 //! reduce tests use, without duplicating them.
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+use story_model::GameState;
+use story_model::HistoryEntry;
 use story_model::LocationDef;
 use story_model::StatePatch;
 use story_model::{
@@ -15,6 +18,7 @@ use story_model::{
     TimeSlot, TurnSummary,
 };
 use story_model::{CharacterId, semver, uuid};
+use story_model::{CharacterState, Emotion};
 
 /// The "demo" pack used across reduce tests.
 pub fn sample_pack() -> StoryPack {
@@ -80,6 +84,7 @@ pub fn sample_pack() -> StoryPack {
         .extend(["f-brave", "f-met"].map(String::from));
 
     StoryPack {
+        lorebook: story_model::Lorebook::default(),
         metadata,
         characters,
         rules,
@@ -120,6 +125,61 @@ pub fn valid_draft(generation_id: uuid::Uuid, affection_delta: i16) -> Generated
             source_history_ids: vec![],
         },
         usage: None,
+    }
+}
+
+/// A minimal, all-defaults [`GameState`] for lorebook / prompt tests.
+pub fn sample_game_state() -> GameState {
+    GameState {
+        save_schema_version: story_model::SAVE_SCHEMA_VERSION,
+        story_id: "demo".to_string(),
+        story_version: semver::Version::new(0, 1, 0),
+        pack_schema_version: semver::Version::new(1, 0, 0),
+        session_id: uuid::Uuid::nil(),
+        current_chapter: "chapter-1".to_string(),
+        current_scene_id: "scene-1".to_string(),
+        turn: 1,
+        location: LocationId("loc-classroom".to_string()),
+        time_slot: TimeSlot::Morning,
+        active_route: None,
+        characters: BTreeMap::from([(
+            cid(),
+            CharacterState {
+                affection: 0,
+                trust: 0,
+                tension: 0,
+                relationship_stage: RelationshipStage::Acquaintance,
+                current_emotion: Emotion::Neutral,
+                known_facts: BTreeSet::new(),
+                address_form_overrides: BTreeMap::new(),
+            },
+        )]),
+        flags: BTreeMap::from([("f-brave".to_string(), false)]),
+        numbers: BTreeMap::new(),
+        strings: BTreeMap::new(),
+        inventory: BTreeMap::new(),
+        occurred_events: BTreeSet::new(),
+        recent_summaries: VecDeque::new(),
+        memories: Vec::new(),
+        history: Vec::new(),
+        last_choice: None,
+        revision: 0,
+        stable_generation_id: None,
+    }
+}
+
+/// One history entry carrying `narration` at `turn`.
+pub fn sample_history_entry(turn: u32, narration: &str) -> HistoryEntry {
+    HistoryEntry {
+        id: uuid::Uuid::nil(),
+        turn,
+        scene_id: "scene-1".to_string(),
+        created_at: story_model::chrono::Utc::now(),
+        narration: narration.to_string(),
+        player_action: None,
+        choices: Vec::new(),
+        applied_patch: StatePatch::default(),
+        generation_id: uuid::Uuid::nil(),
     }
 }
 

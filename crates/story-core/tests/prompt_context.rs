@@ -126,6 +126,7 @@ fn fixture(reversed: bool) -> (StoryPack, GameState, Vec<HistoryEntry>) {
     // delta_limits stay at the default -3..=3 for all three axes.
 
     let pack = StoryPack {
+        lorebook: story_model::Lorebook::default(),
         metadata: sample_metadata(),
         characters,
         rules,
@@ -629,4 +630,120 @@ fn empty_history_has_no_recent_arc_block() {
     let bundle = build_prompt(&pack, &state, &[], None);
     assert!(!bundle.user.contains("# Recent arc"));
     assert!(!bundle.user.contains("# 반복 감지"));
+}
+
+// ---------------------------------------------------------------------------
+// lorebook injection (T0+T1)
+// ---------------------------------------------------------------------------
+
+fn lore_entry(
+    id: &str,
+    keys: &[&str],
+    content: &str,
+    constant: bool,
+    position: story_model::LorebookPosition,
+) -> story_model::LorebookEntry {
+    story_model::LorebookEntry {
+        id: id.to_string(),
+        keys: keys.iter().map(|key| key.to_string()).collect(),
+        secondary_keys: Vec::new(),
+        logic: story_model::LorebookLogic::AndAny,
+        content: content.to_string(),
+        constant,
+        enabled: true,
+        insertion_order: 100,
+        position,
+        case_sensitive: false,
+        probability: 100,
+        priority: None,
+        comment: None,
+        prevent_recursion: false,
+        exclude_recursion: false,
+    }
+}
+
+#[test]
+fn lorebook_blocks_inject_at_stable_and_variable_sites() {
+    let mut pack = story_core::tests_support::sample_pack();
+    pack.lorebook = story_model::Lorebook {
+        name: "테스트 책".to_string(),
+        scan_depth: 2,
+        token_budget: 500,
+        recursive_scanning: false,
+        entries: vec![
+            lore_entry(
+                "always-before",
+                &[],
+                "항상 캐논 앞에 오는 상시 설정.",
+                true,
+                story_model::LorebookPosition::BeforeChar,
+            ),
+            lore_entry(
+                "always-after",
+                &[],
+                "항상 캐논 뒤에 오는 상시 설정.",
+                true,
+                story_model::LorebookPosition::AfterChar,
+            ),
+            lore_entry(
+                "triggered",
+                &["전시회"],
+                "전시회의 기억이 트리거됐다.",
+                false,
+                story_model::LorebookPosition::AfterChar,
+            ),
+        ],
+    };
+    let mut state = story_core::tests_support::sample_game_state();
+    state.turn = 3;
+    state.history = vec![story_core::tests_support::sample_history_entry(
+        1,
+        "전시회 이야기를 꺼냈다.",
+    )];
+
+    let bundle = story_core::prompt_context::build_prompt(&pack, &state, &state.history, None);
+    let user = &bundle.user;
+    let style = user.find("# Style").expect("style block");
+    let canon = user.find("# Character canon").expect("canon block");
+    let progression = user
+        .find("# Story progression rules")
+        .expect("progression block");
+    let before_pos = user
+        .find("항상 캐논 앞에 오는 상시 설정.")
+        .expect("constant before");
+    let after_pos = user
+        .find("항상 캐논 뒤에 오는 상시 설정.")
+        .expect("constant after");
+    let triggered_pos = user.find("전시회의 기억이 트리거됐다.").expect("triggered");
+
+    assert!(
+        style < before_pos && before_pos < canon,
+        "constant before_char lore sits between Style and the canon"
+    );
+    assert!(
+        canon < after_pos && after_pos < triggered_pos && triggered_pos < progression,
+        "after-canon lore keeps constants first, then the turn-variable block"
+    );
+}
+
+#[test]
+fn untriggered_lorebook_keeps_only_constant_entries() {
+    let mut pack = story_core::tests_support::sample_pack();
+    pack.lorebook = story_model::Lorebook {
+        entries: vec![lore_entry(
+            "triggered",
+            &["전시회"],
+            "전시회의 기억.",
+            false,
+            story_model::LorebookPosition::BeforeChar,
+        )],
+        ..story_model::Lorebook::default()
+    };
+    let state = story_core::tests_support::sample_game_state();
+
+    let bundle = story_core::prompt_context::build_prompt(&pack, &state, &state.history, None);
+    assert!(
+        !bundle.user.contains("전시회의 기억."),
+        "no key match means no triggered lore"
+    );
 }

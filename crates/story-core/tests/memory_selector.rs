@@ -152,6 +152,7 @@ fn pack_with_route_premise(premise: &str) -> StoryPack {
         },
     );
     StoryPack {
+        lorebook: story_model::Lorebook::default(),
         metadata: PackMetadata {
             schema_version: semver::Version::parse("1.0.0").unwrap(),
             story_id: "demo".to_string(),

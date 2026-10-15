@@ -1,0 +1,423 @@
+//! Per-turn lorebook selection and prompt rendering (execution tier T0+T1).
+//!
+//! Executed features: keyword matching (case-folded by default), constant
+//! entries, `insertion_order`, `before_char`/`after_char` positions, selective
+//! secondary-key logic, `scan_depth`, per-turn `probability`, and a soft token
+//! budget. Recursion fields are preserved but not yet executed (T2).
+//!
+//! Placement policy — prompt-prefix stability: the user message deliberately
+//! keeps a turn-invariant prefix (world/style/canon) so local runtimes can
+//! reuse it across turns. Therefore **constant** entries render in the stable
+//! prefix at their canonical `before_char`/`after_char` position, while
+//! **keyword-triggered** entries all render in one turn-variable block right
+//! after the canon block (`before_char` entries ordered first within it).
+//! Splitting triggered entries back out into the prefix would invalidate the
+//! cached prefix every turn for a placement nuance the two-message layout
+//! already approximates.
+
+use std::hash::{Hash, Hasher};
+
+use story_model::{
+    Choice, GameState, LorebookEntry, LorebookLogic, LorebookPosition, ParsedAction, StoryPack,
+};
+
+use crate::memory_selector::estimate_tokens;
+
+/// The turn's lorebook selection, grouped by injection site.
+#[derive(Debug, Default, Clone)]
+pub struct SelectedLore {
+    /// Constant entries injected before the character canon (stable prefix).
+    pub stable_before: Vec<LorebookEntry>,
+    /// Constant entries injected after the character canon (stable prefix).
+    pub stable_after: Vec<LorebookEntry>,
+    /// Keyword-triggered entries for this turn, one block after the canon.
+    pub triggered: Vec<LorebookEntry>,
+}
+
+impl SelectedLore {
+    /// `true` when nothing would be injected this turn.
+    pub fn is_empty(&self) -> bool {
+        self.stable_before.is_empty() && self.stable_after.is_empty() && self.triggered.is_empty()
+    }
+}
+
+/// Scan + select lorebook entries for this turn.
+///
+/// Deterministic: the same inputs always yield the same selection — the
+/// probability roll is keyed on `(turn, entry id)` instead of an RNG, so a
+/// retry of the same turn re-rolls identically.
+pub fn select_lore(
+    pack: &StoryPack,
+    state: &GameState,
+    history: &[story_model::HistoryEntry],
+    player_action: Option<&ParsedAction>,
+    player_choice: Option<&Choice>,
+) -> SelectedLore {
+    let book = &pack.lorebook;
+    if book.is_empty() {
+        return SelectedLore::default();
+    }
+    let corpus_raw = scan_corpus(
+        state,
+        history,
+        book.scan_depth,
+        player_action,
+        player_choice,
+    );
+    let corpus_folded = corpus_raw.to_lowercase();
+
+    let mut stable_before = Vec::new();
+    let mut stable_after = Vec::new();
+    let mut candidates = Vec::new();
+    for entry in &book.entries {
+        if !entry.enabled {
+            continue;
+        }
+        if entry.constant {
+            match entry.position {
+                LorebookPosition::BeforeChar => stable_before.push(entry.clone()),
+                LorebookPosition::AfterChar => stable_after.push(entry.clone()),
+            }
+            continue;
+        }
+        if entry.probability < 100 && probability_roll(state.turn, &entry.id) >= entry.probability {
+            continue;
+        }
+        if entry_matches(&corpus_raw, &corpus_folded, entry) {
+            candidates.push(entry.clone());
+        }
+    }
+
+    // Budget admission: higher priority (lower value) first, ties by lower
+    // insertion order; an entry that does not fit is dropped whole — the
+    // provider's final bound must never be the one squeezing lore mid-text.
+    candidates.sort_by_key(|entry| (entry.priority.unwrap_or(i64::MAX), entry.insertion_order));
+    let mut triggered = Vec::new();
+    let mut used = 0_usize;
+    for entry in candidates {
+        let cost = estimate_tokens(&entry.content);
+        if used + cost > book.token_budget as usize {
+            continue;
+        }
+        used += cost;
+        triggered.push(entry);
+    }
+
+    // Inside the triggered block, before_char entries come first; each group
+    // keeps its own insertion order.
+    triggered.sort_by_key(|entry| (before_first(entry.position), entry.insertion_order));
+    stable_before.sort_by_key(|entry| entry.insertion_order);
+    stable_after.sort_by_key(|entry| entry.insertion_order);
+    SelectedLore {
+        stable_before,
+        stable_after,
+        triggered,
+    }
+}
+
+/// Render one injection block: raw entry contents separated by blank lines,
+/// with no per-entry headers — matching World Info's content-only convention
+/// and keeping the prompt free of scaffolding the model would echo.
+pub fn render_lore_block(entries: &[LorebookEntry]) -> String {
+    let mut out = String::from("# Lore\n");
+    for (index, entry) in entries.iter().enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        out.push_str(entry.content.trim());
+        out.push('\n');
+    }
+    out
+}
+
+/// The text keyword scans run against: the last `scan_depth` narrations plus
+/// the live player action and selected choice.
+fn scan_corpus(
+    state: &GameState,
+    history: &[story_model::HistoryEntry],
+    scan_depth: u32,
+    player_action: Option<&ParsedAction>,
+    player_choice: Option<&Choice>,
+) -> String {
+    let mut corpus = String::new();
+    let start = history.len().saturating_sub(scan_depth as usize);
+    for entry in &history[start..] {
+        corpus.push_str(&entry.narration);
+        corpus.push('\n');
+    }
+    if let Some(action) = player_action {
+        corpus.push_str(&action.original_text);
+        corpus.push('\n');
+        if let Some(intent) = &action.intent {
+            corpus.push_str(intent);
+            corpus.push('\n');
+        }
+    }
+    if let Some(choice) = player_choice {
+        corpus.push_str(&choice.label);
+        corpus.push('\n');
+        corpus.push_str(&choice.intent);
+        corpus.push('\n');
+    }
+    let _ = state; // reserved: scene/location id keys in a later tier
+    corpus
+}
+
+/// Evaluate one entry against the corpus: any primary key, then the selective
+/// secondary-key gate. An entry without secondary keys is primary-only.
+fn entry_matches(corpus_raw: &str, corpus_folded: &str, entry: &LorebookEntry) -> bool {
+    if !any_key(corpus_raw, corpus_folded, &entry.keys, entry.case_sensitive) {
+        return false;
+    }
+    if entry.secondary_keys.is_empty() {
+        return true;
+    }
+    let secondary_any = any_key(
+        corpus_raw,
+        corpus_folded,
+        &entry.secondary_keys,
+        entry.case_sensitive,
+    );
+    let secondary_all = entry
+        .secondary_keys
+        .iter()
+        .all(|key| key_in_corpus(corpus_raw, corpus_folded, key, entry.case_sensitive));
+    match entry.logic {
+        LorebookLogic::AndAny => secondary_any,
+        LorebookLogic::AndAll => secondary_all,
+        LorebookLogic::NotAny => !secondary_any,
+        LorebookLogic::NotAll => !secondary_all,
+    }
+}
+
+fn any_key(corpus_raw: &str, corpus_folded: &str, keys: &[String], case_sensitive: bool) -> bool {
+    keys.iter()
+        .any(|key| key_in_corpus(corpus_raw, corpus_folded, key, case_sensitive))
+}
+
+fn key_in_corpus(corpus_raw: &str, corpus_folded: &str, key: &str, case_sensitive: bool) -> bool {
+    let key = key.trim();
+    if key.is_empty() {
+        return false;
+    }
+    if case_sensitive {
+        corpus_raw.contains(key)
+    } else {
+        corpus_folded.contains(&key.to_lowercase())
+    }
+}
+
+/// Deterministic 0..100 roll for `(turn, entry id)`. Same turn + entry always
+/// rolls the same, so engine retries never flip a probability decision.
+fn probability_roll(turn: u32, entry_id: &str) -> u32 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    turn.hash(&mut hasher);
+    entry_id.hash(&mut hasher);
+    (hasher.finish() % 100) as u32
+}
+
+fn before_first(position: LorebookPosition) -> i64 {
+    match position {
+        LorebookPosition::BeforeChar => 0,
+        LorebookPosition::AfterChar => 1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use story_model::{LocationId, Lorebook, LorebookPosition, TimeSlot};
+
+    fn entry(id: &str, keys: &[&str], content: &str) -> LorebookEntry {
+        LorebookEntry {
+            id: id.to_string(),
+            keys: keys.iter().map(|key| key.to_string()).collect(),
+            secondary_keys: Vec::new(),
+            logic: LorebookLogic::AndAny,
+            content: content.to_string(),
+            constant: false,
+            enabled: true,
+            insertion_order: 100,
+            position: LorebookPosition::BeforeChar,
+            case_sensitive: false,
+            probability: 100,
+            priority: None,
+            comment: None,
+            prevent_recursion: false,
+            exclude_recursion: false,
+        }
+    }
+
+    fn state_with(history: &[&str]) -> GameState {
+        let mut state = crate::tests_support::sample_game_state();
+        state.turn = 7;
+        state.history = history
+            .iter()
+            .enumerate()
+            .map(|(index, narration)| {
+                crate::tests_support::sample_history_entry(index as u32 + 1, narration)
+            })
+            .collect();
+        state
+    }
+
+    fn book(entries: Vec<LorebookEntry>) -> Lorebook {
+        Lorebook {
+            name: "test".to_string(),
+            entries,
+            ..Lorebook::default()
+        }
+    }
+
+    fn pack_with(book: Lorebook) -> StoryPack {
+        let mut pack = crate::tests_support::sample_pack();
+        pack.lorebook = book;
+        pack
+    }
+
+    #[test]
+    fn keyed_entry_triggers_on_narration_text() {
+        let mut pack = pack_with(book(vec![entry("expo", &["전시회"], "전시회의 기억.")]));
+        pack.lorebook.entries[0].position = LorebookPosition::AfterChar;
+        let state = state_with(&["그날 전시회 이야기가 나왔다."]);
+
+        let selected = select_lore(&pack, &state, &state.history, None, None);
+        assert_eq!(selected.triggered.len(), 1);
+        assert_eq!(selected.triggered[0].id, "expo");
+    }
+
+    #[test]
+    fn unmatched_entry_stays_out() {
+        let pack = pack_with(book(vec![entry("expo", &["전시회"], "전시회의 기억.")]));
+        let state = state_with(&["카페 창밖의 비만 보였다."]);
+        assert!(
+            select_lore(&pack, &state, &state.history, None, None)
+                .triggered
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn matching_is_case_folded_unless_case_sensitive() {
+        let pack = pack_with(book(vec![entry("folded", &["Exhibition"], "x"), {
+            let mut sensitive = entry("sensitive", &["Exhibition"], "y");
+            sensitive.case_sensitive = true;
+            sensitive
+        }]));
+        let state = state_with(&["the exhibition was crowded."]);
+        let selected = select_lore(&pack, &state, &state.history, None, None);
+        let ids: Vec<&str> = selected.triggered.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["folded"],
+            "case-sensitive key must not match lowercase text"
+        );
+    }
+
+    #[test]
+    fn constant_entries_ignore_scans_and_split_by_position() {
+        let mut pack = pack_with(book(vec![
+            {
+                let mut always = entry("always", &["없는키"], "상시 설정.");
+                always.constant = true;
+                always
+            },
+            {
+                let mut after = entry("after", &["없는키"], "캐논 뒤 상시.");
+                after.constant = true;
+                after.position = LorebookPosition::AfterChar;
+                after
+            },
+        ]));
+        pack.lorebook.entries[0].position = LorebookPosition::BeforeChar;
+        let state = state_with(&["아무 키도 없는 이야기."]);
+
+        let selected = select_lore(&pack, &state, &state.history, None, None);
+        assert_eq!(selected.stable_before.len(), 1);
+        assert_eq!(selected.stable_after.len(), 1);
+        assert!(selected.triggered.is_empty());
+    }
+
+    #[test]
+    fn secondary_keys_gate_by_logic() {
+        let mut rain = entry("rain", &["비"], "빗소리.");
+        rain.secondary_keys = vec!["우산".to_string()];
+        let pack = pack_with(book(vec![rain]));
+
+        let with_both = state_with(&["비가 오고 우산을 챙겼다."]);
+        assert_eq!(
+            select_lore(&pack, &with_both, &with_both.history, None, None)
+                .triggered
+                .len(),
+            1,
+            "AND_ANY passes when a secondary key also matches"
+        );
+
+        let rain_only = state_with(&["비만 내렸다."]);
+        assert!(
+            select_lore(&pack, &rain_only, &rain_only.history, None, None)
+                .triggered
+                .is_empty(),
+            "AND_ANY fails without any secondary key"
+        );
+    }
+
+    #[test]
+    fn budget_drops_lowest_priority_entries_whole() {
+        let mut small = entry("small", &["키"], "짧은 내용.");
+        small.priority = Some(0);
+        let mut big = entry("big", &["키"], &"긴 내용 ".repeat(300));
+        big.priority = Some(9);
+        let mut lorebook = book(vec![big, small]);
+        lorebook.token_budget = 100; // fits `small`, never `big`
+        let pack = pack_with(lorebook);
+        let state = state_with(&["키워드 등장."]);
+
+        let selected = select_lore(&pack, &state, &state.history, None, None);
+        let ids: Vec<&str> = selected.triggered.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["small"],
+            "high priority (low value) wins the budget"
+        );
+    }
+
+    #[test]
+    fn probability_roll_is_deterministic_per_turn_and_entry() {
+        assert_eq!(probability_roll(7, "expo"), probability_roll(7, "expo"));
+        assert_ne!(
+            probability_roll(7, "expo"),
+            probability_roll(8, "expo"),
+            "different turns re-roll (over the same 0..100 space)"
+        );
+    }
+
+    #[test]
+    fn disabled_entries_never_trigger() {
+        let mut off = entry("off", &["전시회"], "x");
+        off.enabled = false;
+        let pack = pack_with(book(vec![off]));
+        let state = state_with(&["전시회를 말했다."]);
+        assert!(
+            select_lore(&pack, &state, &state.history, None, None)
+                .triggered
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn empty_book_short_circuits() {
+        let pack = pack_with(Lorebook::default());
+        let state = state_with(&["전시회를 말했다."]);
+        assert!(select_lore(&pack, &state, &state.history, None, None).is_empty());
+    }
+
+    // Keep unused-import lints honest for the types only used in signatures.
+    #[test]
+    fn type_witness() {
+        let _map: BTreeMap<String, String> = BTreeMap::new();
+        let _loc = LocationId("x".to_string());
+        let _slot = TimeSlot::Evening;
+    }
+}

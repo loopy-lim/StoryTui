@@ -205,6 +205,9 @@ fn build_user(
 ) -> String {
     let mut s = String::new();
     let full = recent;
+    // Lorebook selection happens first: constant entries join the stable
+    // prefix below, triggered entries form the turn-variable lore block.
+    let lore = crate::lorebook::select_lore(pack, state, full, player_action, player_choice);
     let recent_start = full.len().saturating_sub(RECENT_TURN_WINDOW);
     // `earlier` is the narrative arc before the crisp recent window. It is
     // rendered below as a compact recap so the model keeps long-term continuity
@@ -232,12 +235,29 @@ fn build_user(
     s.push_str(&pack.world_md);
     s.push_str("\n\n# Style\n");
     s.push_str(&pack.style_md);
+    // Constant `before_char` lore: turn-invariant, so it stays in the stable
+    // prefix at its canonical position.
+    if !lore.stable_before.is_empty() {
+        s.push('\n');
+        s.push_str(&crate::lorebook::render_lore_block(&lore.stable_before));
+    }
 
     // Keep pack-owned, turn-invariant material at the front of the user
     // message. Local runtimes can reuse this stable prefix across turns while
     // all state-, history-, and recall-dependent material stays below it.
     s.push_str("\n\n# Character canon and voice (pack-owned)\n");
     s.push_str(&character_canon_context(pack));
+    // Constant `after_char` lore keeps its stable-prefix position; the
+    // keyword-triggered entries follow in one turn-variable block (module
+    // docs explain why they are not split back into the prefix).
+    if !lore.stable_after.is_empty() {
+        s.push('\n');
+        s.push_str(&crate::lorebook::render_lore_block(&lore.stable_after));
+    }
+    if !lore.triggered.is_empty() {
+        s.push('\n');
+        s.push_str(&crate::lorebook::render_lore_block(&lore.triggered));
+    }
 
     s.push_str("\n# Story progression rules (engine-authoritative)\n");
     s.push_str(&progression_context(pack));
@@ -817,6 +837,7 @@ mod tests {
 
     fn minimal_fixture() -> (StoryPack, GameState) {
         let pack = StoryPack {
+            lorebook: story_model::Lorebook::default(),
             metadata: story_model::PackMetadata {
                 schema_version: semver::Version::parse("1.0.0").unwrap(),
                 story_id: "t".to_string(),

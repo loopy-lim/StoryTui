@@ -231,7 +231,9 @@ impl<'a> LoadCtx<'a> {
             });
         }
 
+        let lorebook = self.load_lorebook();
         let pack = StoryPack {
+            lorebook,
             metadata,
             characters,
             rules,
@@ -402,6 +404,66 @@ impl<'a> LoadCtx<'a> {
                 self.errors.push(parse_error(label, &e, &src));
                 None
             }
+        }
+    }
+
+    /// Read the optional `lorebook.toml`. An absent file is an empty book; a
+    /// present-but-invalid file records its errors and yields an empty book so
+    /// the rest of the load still surfaces every other defect.
+    fn load_lorebook(&mut self) -> story_model::Lorebook {
+        let path = self.root.join("lorebook.toml");
+        if !path.is_file() {
+            return story_model::Lorebook::default();
+        }
+        let Some(text) = self.read_text("lorebook.toml", &path) else {
+            return story_model::Lorebook::default();
+        };
+        match toml::from_str::<story_model::Lorebook>(&text) {
+            Ok(book) => {
+                validate_lorebook(&book, &mut self.errors);
+                book
+            }
+            Err(error) => {
+                self.errors
+                    .push(parse_error("lorebook.toml", &error, &text));
+                story_model::Lorebook::default()
+            }
+        }
+    }
+}
+
+/// Structural checks the serde types cannot express: unique ids, non-empty
+/// content, in-range probability, and every non-constant entry carrying at
+/// least one key (a keyless non-constant entry could never trigger).
+fn validate_lorebook(book: &story_model::Lorebook, errors: &mut Vec<PackError>) {
+    let mut seen = std::collections::BTreeSet::new();
+    for (index, entry) in book.entries.iter().enumerate() {
+        let label = if entry.id.trim().is_empty() {
+            format!("entries[{index}]")
+        } else if !seen.insert(entry.id.as_str()) {
+            errors.push(PackError::reference(format!(
+                "중복 lorebook 엔트리 id: {}",
+                entry.id
+            )));
+            continue;
+        } else {
+            entry.id.clone()
+        };
+        if entry.content.trim().is_empty() {
+            errors.push(PackError::reference(format!(
+                "lorebook 엔트리 {label}의 content가 비어 있습니다"
+            )));
+        }
+        if entry.probability > 100 {
+            errors.push(PackError::reference(format!(
+                "lorebook 엔트리 {label}의 probability는 0..=100이어야 합니다 ({}).",
+                entry.probability
+            )));
+        }
+        if !entry.constant && entry.keys.iter().all(|key| key.trim().is_empty()) {
+            errors.push(PackError::reference(format!(
+                "lorebook 엔트리 {label}는 constant가 아니면서 키가 없어 도달할 수 없습니다"
+            )));
         }
     }
 }

@@ -309,6 +309,7 @@ pub(crate) fn minimal_pack(
 ) -> StoryPack {
     use story_model::PromptFragments;
     StoryPack {
+        lorebook: story_model::Lorebook::default(),
         metadata,
         characters,
         rules,

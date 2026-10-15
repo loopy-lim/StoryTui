@@ -89,6 +89,7 @@ fn sample_pack() -> StoryPack {
         .allowed_flags
         .extend(["f-brave", "f-met"].map(String::from));
     StoryPack {
+        lorebook: story_model::Lorebook::default(),
         metadata,
         characters,
         rules,

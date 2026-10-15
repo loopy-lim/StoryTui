@@ -98,6 +98,7 @@ fn sample_pack() -> StoryPack {
         .extend(["f-brave", "f-met"].map(String::from));
 
     StoryPack {
+        lorebook: story_model::Lorebook::default(),
         metadata,
         characters,
         rules,

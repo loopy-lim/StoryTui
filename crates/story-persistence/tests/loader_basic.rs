@@ -287,3 +287,84 @@ fn choice_count_outside_provider_contract_is_rejected() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// optional lorebook.toml
+// ---------------------------------------------------------------------------
+
+#[test]
+fn optional_lorebook_loads_into_the_pack() {
+    let dir = build_valid_pack();
+    write(
+        dir.path(),
+        "lorebook.toml",
+        r#"
+name = "유나의 기억"
+scan_depth = 3
+token_budget = 1500
+
+[[entries]]
+id = "expo"
+keys = ["전시회"]
+content = "3년 전 헤어짐의 계기."
+insertion_order = 10
+
+[[entries]]
+id = "always"
+content = "상시 설정."
+constant = true
+"#,
+    );
+    let pack = PackLoader::load(dir.path()).expect("pack with lorebook loads");
+    assert_eq!(pack.lorebook.entries.len(), 2);
+    assert_eq!(pack.lorebook.scan_depth, 3);
+    assert_eq!(pack.lorebook.token_budget, 1500);
+    assert_eq!(pack.lorebook.entries[0].id, "expo");
+    assert!(pack.lorebook.entries[1].constant);
+}
+
+#[test]
+fn absent_lorebook_is_an_empty_book() {
+    let dir = build_valid_pack();
+    let pack = PackLoader::load(dir.path()).expect("pack loads");
+    assert!(
+        pack.lorebook.is_empty(),
+        "no lorebook.toml means no entries"
+    );
+    assert_eq!(
+        pack.lorebook.scan_depth,
+        story_model::DEFAULT_LOREBOOK_SCAN_DEPTH
+    );
+}
+
+#[test]
+fn invalid_lorebook_entries_are_reported() {
+    let dir = build_valid_pack();
+    write(
+        dir.path(),
+        "lorebook.toml",
+        r#"
+[[entries]]
+id = "dup"
+keys = []
+content = "도달 불가 엔트리."
+
+[[entries]]
+id = "dup"
+keys = ["전시회"]
+content = "중복 id."
+"#,
+    );
+    let err = PackLoader::load(dir.path()).expect_err("keyless non-constant + dup id must fail");
+    let text = err.to_string();
+    assert!(text.contains("도달할 수 없습니다"), "{text}");
+    assert!(text.contains("중복 lorebook"), "{text}");
+}
+
+#[test]
+fn malformed_lorebook_toml_fails_the_load() {
+    let dir = build_valid_pack();
+    write(dir.path(), "lorebook.toml", "name = ");
+    let err = PackLoader::load(dir.path()).expect_err("malformed lorebook must fail");
+    assert!(err.to_string().contains("lorebook.toml"), "{err}");
+}

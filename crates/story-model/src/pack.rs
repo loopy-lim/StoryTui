@@ -20,7 +20,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{CharacterId, LocationId, RelationshipStage, StoryRules, TimeSlot};
+use crate::{CharacterId, LocationId, Lorebook, RelationshipStage, StoryRules, TimeSlot};
 
 /// Pack schema version this build of `story-model` writes and understands.
 ///
@@ -173,6 +173,10 @@ pub struct StoryPack {
     pub opening_md: String,
     /// `prompts/{system,director,writer}.md` bodies.
     pub prompts: PromptFragments,
+    /// Keyword-triggered lorebook from the optional `lorebook.toml`. Absent
+    /// file means an empty book — packs play identically without one.
+    #[serde(default)]
+    pub lorebook: Lorebook,
     /// Canonical absolute root directory of the Pack on disk. Carried for
     /// diagnostics only — never used by the deterministic engine.
     pub pack_root: PathBuf,
@@ -291,6 +295,7 @@ mod tests {
                 director: "director.".to_string(),
                 writer: "writer.".to_string(),
             },
+            lorebook: Lorebook::default(),
             pack_root: PathBuf::from("/tmp/rainy-reunion"),
         };
         let json = serde_json::to_string(&pack).unwrap();

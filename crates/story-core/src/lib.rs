@@ -10,6 +10,7 @@ pub mod engine;
 pub mod engine_cmd;
 pub mod error;
 pub mod eval;
+pub mod lorebook;
 pub mod memory;
 pub mod memory_selector;
 pub mod narration_quality;

@@ -192,6 +192,7 @@ mod tests {
             },
         );
         StoryPack {
+            lorebook: story_model::Lorebook::default(),
             metadata,
             characters,
             rules,
