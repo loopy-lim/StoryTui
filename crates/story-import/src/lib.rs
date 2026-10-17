@@ -12,6 +12,7 @@
 //!   loader cannot drift apart.
 
 pub mod card;
+pub mod chat;
 pub mod macros;
 pub mod normalize;
 pub mod report;

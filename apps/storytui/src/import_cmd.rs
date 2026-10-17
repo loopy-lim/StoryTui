@@ -15,6 +15,8 @@ pub fn usage() -> String {
   --player-name NAME    {{user}} 매크로 치환에 쓸 호칭 (기본: 플레이어)
   --language TAG        story.toml 언어 태그 (기본: ko-KR)
   --lorebook PATH       병합할 World Info(로어북) JSON
+  --chat PATH           ST 채팅 내보내기(JSONL/객체)를 이력으로 저장
+  --save-dir PATH       --chat 저장 슬롯 위치 (기본: saves)
   --normalize           Director 정규화 패스 실행 (생성 1회, 기본 OFF)
   --provider-config PATH  프로바이더 설정 TOML (기본: config/storytui*.toml)
   --provider NAME       --normalize가 쓸 프로필 이름 (기본: [provider])
@@ -30,6 +32,8 @@ pub async fn run(args: &[String]) -> Result<(), String> {
     let mut out: Option<PathBuf> = None;
     let mut options = ImportOptions::default();
     let mut normalize = false;
+    let mut chat: Option<PathBuf> = None;
+    let mut save_dir = "saves".to_string();
     let mut provider_config: Option<PathBuf> = None;
     let mut provider_name: Option<String> = None;
     let mut index = 0;
@@ -53,6 +57,12 @@ pub async fn run(args: &[String]) -> Result<(), String> {
                     Some(PathBuf::from(take_value(args, &mut index, "--lorebook")?));
             }
             "--normalize" => normalize = true,
+            "--chat" => {
+                chat = Some(PathBuf::from(take_value(args, &mut index, "--chat")?));
+            }
+            "--save-dir" => {
+                save_dir = take_value(args, &mut index, "--save-dir")?;
+            }
             "--provider-config" => {
                 provider_config = Some(PathBuf::from(take_value(
                     args,
@@ -110,6 +120,17 @@ pub async fn run(args: &[String]) -> Result<(), String> {
             .report
             .write(&output.pack_dir.join("import-report.md"))?;
     }
+    if let Some(chat_path) = chat {
+        seed_chat_history(
+            &chat_path,
+            &output.pack_dir,
+            std::path::Path::new(&save_dir),
+            &mut output.report,
+        )?;
+        output
+            .report
+            .write(&output.pack_dir.join("import-report.md"))?;
+    }
 
     let report = &output.report;
     println!("가져오기 완료: {}", output.pack_dir.display());
@@ -124,7 +145,81 @@ pub async fn run(args: &[String]) -> Result<(), String> {
         println!("  경고: {warning}");
     }
     println!();
-    println!("실행: storytui --pack {}", output.pack_dir.display());
+    println!(
+        "실행: storytui --pack {} (게임 중 l → 'imported-chat' 슬롯으로 이어하기)",
+        output.pack_dir.display()
+    );
+    Ok(())
+}
+
+/// Convert a chat export into history entries and write them as the
+/// `imported-chat` save slot of the imported pack. The pack itself stays
+/// text-only (ADR-003): the save lives in the save store, not the pack.
+fn seed_chat_history(
+    chat_path: &std::path::Path,
+    pack_dir: &std::path::Path,
+    save_root: &std::path::Path,
+    report: &mut story_import::report::ImportReport,
+) -> Result<(), String> {
+    let text = std::fs::read_to_string(chat_path).map_err(|error| {
+        format!(
+            "채팅 파일을 읽지 못했습니다 ({}): {error}",
+            chat_path.display()
+        )
+    })?;
+    let turns = story_import::chat::parse_chat(&text, report)?;
+
+    let entries: Vec<story_model::HistoryEntry> = turns
+        .iter()
+        .enumerate()
+        .map(|(index, turn)| story_model::HistoryEntry {
+            id: story_model::uuid::Uuid::new_v4(),
+            turn: index as u32 + 1,
+            scene_id: "imported-chat".to_string(),
+            created_at: story_model::chrono::Utc::now(),
+            narration: turn.narration.clone(),
+            player_action: turn
+                .player_action
+                .as_ref()
+                .map(|text| story_model::ParsedAction {
+                    action_type: story_model::ActionType::GeneralAction,
+                    target: None,
+                    intent: None,
+                    tone: None,
+                    content: text.clone(),
+                    original_text: text.clone(),
+                    confidence: Some(0.0),
+                }),
+            choices: Vec::new(),
+            applied_patch: story_model::StatePatch::default(),
+            generation_id: story_model::uuid::Uuid::new_v4(),
+        })
+        .collect();
+    let turn_count = entries.len();
+
+    let pack = story_persistence::PackLoader::load(pack_dir)
+        .map_err(|error| format!("임포트된 팩 로드 실패: {error}"))?;
+    let mut engine = story_core::engine::EngineState::initial(&pack);
+    engine.game.history = entries;
+    engine.game.turn = turn_count as u32;
+
+    let save_store = story_persistence::SaveStore::open(save_root).map_err(|error| {
+        format!(
+            "세이브 디렉터리를 열지 못했습니다 ({}): {error}",
+            save_root.display()
+        )
+    })?;
+    crate::host::saves::save_engine_snapshot(
+        &save_store,
+        &engine,
+        "imported-chat".to_string(),
+        Some(format!("임포트된 채팅 이력 {turn_count}턴")),
+    )?;
+    report.mapped.push(format!(
+        "채팅 이력 {turn_count}턴 → '{}/imported-chat' 슬롯",
+        save_root.display()
+    ));
+    println!("  채팅 이력: {turn_count}턴 → imported-chat 슬롯");
     Ok(())
 }
 

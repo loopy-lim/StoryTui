@@ -25,7 +25,7 @@ use storytui::config::{RuntimeConfig, UserSettings, load_user_settings, save_use
 
 mod diagnostics;
 mod images;
-mod saves;
+pub(crate) mod saves;
 mod settings;
 
 type UiTerminal = Terminal<CrosstermBackend<Stdout>>;
