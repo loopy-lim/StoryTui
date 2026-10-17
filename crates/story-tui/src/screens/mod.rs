@@ -1,5 +1,6 @@
 //! Screen renderers for `story-tui`.
 
+pub mod greeting;
 pub mod home;
 pub mod import;
 pub mod keymap;

@@ -212,6 +212,13 @@ pub struct App {
     import_request: Option<String>,
     /// Set when the player confirms the report; the host swaps the pack in.
     pack_swap_request: Option<String>,
+    /// Alternate openings for the current pack: index 0 is the pack opening.
+    /// Empty = no picker; 새 게임 starts immediately.
+    pub(crate) greetings: Vec<String>,
+    /// Greeting picker modal (`Some` = visible).
+    greeting_picker: Option<usize>,
+    /// The greeting the player picked; the host applies it before starting.
+    greeting_selection: Option<usize>,
     /// Chronological narration stack shown in the main story pane. Writes
     /// MUST go through [`Self::replace_story_stack`] (or `set_lists`) so the
     /// render cache is invalidated — the version field keys that cache.
@@ -281,6 +288,9 @@ impl App {
             import_dialog: None,
             import_request: None,
             pack_swap_request: None,
+            greetings: Vec::new(),
+            greeting_picker: None,
+            greeting_selection: None,
             story_stack: Vec::new(),
             story_stack_version: 0,
             stack_lines_cache: None,
@@ -393,6 +403,49 @@ impl App {
     /// Consume a confirmed pack directory; the host swaps it in.
     pub fn take_pack_swap_request(&mut self) -> Option<String> {
         self.pack_swap_request.take()
+    }
+
+    /// Supply the alternate-opening labels (index 0 = pack opening). Call at
+    /// startup and after a pack swap.
+    pub fn set_greetings(&mut self, greetings: Vec<String>) {
+        self.greetings = greetings;
+    }
+
+    /// Consume the picked greeting index (`None` = default opening).
+    pub fn take_greeting_selection(&mut self) -> Option<usize> {
+        self.greeting_selection.take()
+    }
+
+    /// Open the greeting picker (host already knows the pack has greetings).
+    pub fn open_greeting_picker(&mut self) {
+        if self.greetings.is_empty() {
+            return;
+        }
+        self.greeting_picker = Some(0);
+    }
+
+    /// Keys while the greeting picker owns the screen.
+    fn handle_greeting_picker_key(&mut self, key: KeyEvent) {
+        let Some(selected) = self.greeting_picker.as_mut() else {
+            return;
+        };
+        let last = self.greetings.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Esc => self.greeting_picker = None,
+            KeyCode::Up | KeyCode::Char('k' | 'ㅏ') => {
+                *selected = selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j' | 'ㅓ') => {
+                *selected = (*selected + 1).min(last);
+            }
+            KeyCode::Enter => {
+                let picked = *selected;
+                self.greeting_picker = None;
+                self.greeting_selection = Some(picked);
+                self.home_request = Some(HomeRequest::StartNew);
+            }
+            _ => {}
+        }
     }
 
     /// Present a finished import (or its failure) in the dialog.
@@ -738,6 +791,10 @@ impl App {
         key: KeyEvent,
         pending_generation_id: Option<Uuid>,
     ) -> Option<EngineCommand> {
+        if self.greeting_picker.is_some() {
+            self.handle_greeting_picker_key(key);
+            return None;
+        }
         if self.import_dialog.is_some() {
             self.handle_import_dialog_key(key);
             return None;
@@ -1017,6 +1074,14 @@ impl App {
         if let Some(view) = view {
             crate::screens::import::render_import_dialog(frame, area, view);
         }
+        if let Some(selected) = self.greeting_picker {
+            crate::screens::greeting::render_greeting_picker(
+                frame,
+                area,
+                &self.greetings,
+                selected,
+            );
+        }
     }
 
     fn render_base(&mut self, frame: &mut Frame, area: Rect) {
@@ -1109,9 +1174,9 @@ impl App {
 
     /// Handle mouse-wheel scrolling without changing the selected choice.
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
-        // The import dialog is a keyboard-only modal: clicks must not reach
-        // the home menu or story screen underneath it.
-        if self.import_dialog.is_some() {
+        // The import dialog and greeting picker are keyboard-only modals:
+        // clicks must not reach the home menu or story screen underneath.
+        if self.import_dialog.is_some() || self.greeting_picker.is_some() {
             return;
         }
         if self.save_load.is_some() {
@@ -1283,6 +1348,11 @@ impl App {
     fn choose_home(&mut self, selection: usize) {
         match selection {
             0 => {
+                // Alternate openings gate the start: pick one first.
+                if !self.greetings.is_empty() {
+                    self.open_greeting_picker();
+                    return;
+                }
                 self.home_visible = false;
                 self.home_request = Some(HomeRequest::StartNew);
             }
@@ -2231,5 +2301,65 @@ mod tests {
         assert!(out.contains("카드 가져오기"), "modal title renders: {out}");
         assert!(out.contains("> stories/card.png"), "path renders: {out}");
         assert!(out.contains("시작 메뉴"), "home still visible underneath");
+    }
+
+    #[test]
+    fn greetings_gate_new_game_and_picker_requests_start() {
+        let mut app = App::new(sample_view(0));
+        app.show_home();
+        app.set_greetings(vec![
+            "기본 오프닝".to_string(),
+            "비 오는 날의 인사".to_string(),
+            "3년 전의 재회".to_string(),
+        ]);
+
+        // Enter on 새 게임 opens the picker instead of starting.
+        app.handle_key(key(KeyCode::Enter), None);
+        assert!(app.greeting_picker.is_some(), "picker opens");
+        assert!(app.take_home_request().is_none(), "start is gated");
+
+        // Down twice → index 2, Enter requests StartNew with the pick.
+        app.handle_key(key(KeyCode::Down), None);
+        app.handle_key(key(KeyCode::Down), None);
+        app.handle_key(key(KeyCode::Enter), None);
+        assert_eq!(app.take_greeting_selection(), Some(2));
+        assert!(matches!(
+            app.take_home_request(),
+            Some(HomeRequest::StartNew)
+        ));
+        assert!(
+            app.greeting_picker.is_none(),
+            "picker closes after the pick"
+        );
+    }
+
+    #[test]
+    fn greeting_picker_esc_cancels_the_start() {
+        let mut app = App::new(sample_view(0));
+        app.show_home();
+        app.set_greetings(vec!["기본 오프닝".to_string(), "다른 인사".to_string()]);
+        app.handle_key(key(KeyCode::Enter), None);
+        app.handle_key(key(KeyCode::Esc), None);
+        assert!(app.greeting_picker.is_none());
+        assert!(app.take_greeting_selection().is_none());
+        assert!(
+            app.take_home_request().is_none(),
+            "canceled pick never starts"
+        );
+        // Home is still visible; a plain Enter now starts with the default.
+        app.handle_key(key(KeyCode::Enter), None);
+        assert!(app.greeting_picker.is_some(), "새 게임 re-opens the picker");
+    }
+
+    #[test]
+    fn no_greetings_starts_immediately() {
+        let mut app = App::new(sample_view(0));
+        app.show_home();
+        app.handle_key(key(KeyCode::Enter), None);
+        assert!(app.greeting_picker.is_none(), "no picker without greetings");
+        assert!(matches!(
+            app.take_home_request(),
+            Some(HomeRequest::StartNew)
+        ));
     }
 }

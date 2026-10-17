@@ -189,6 +189,7 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
     refresh_scene_images(&mut app, &pack, &engine, &mut scene_image_cache);
     app.set_lists(&engine.game.history, &engine.game.memories);
     app.set_can_continue(resume_engine.is_some());
+    app.set_greetings(greeting_labels(&pack));
     {
         // The roster is exactly the load()-assembled set: base profile first,
         // then every `[[providers]]` entry — never prepended again, or the
@@ -459,8 +460,39 @@ fn swap_pack(
     app.set_lists(&engine.game.history, &engine.game.memories);
     app.follow_story_end();
     app.set_can_continue(false);
+    app.set_greetings(greeting_labels(pack));
     refresh_scene_images(app, pack, engine, scene_images);
     tracing::info!(pack = %pack_dir, "switched to the imported pack");
+}
+
+/// Alternate-opening labels for the picker: index 0 is always the pack's own
+/// opening; `greetings/N.md` follow (importer convention, contiguous).
+fn greeting_labels(pack: &StoryPack) -> Vec<String> {
+    let mut labels = vec!["기본 오프닝".to_string()];
+    for index in 1..=64 {
+        let path = pack.pack_root.join("greetings").join(format!("{index}.md"));
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            break;
+        };
+        let first = text
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("대체 오프닝");
+        let label: String = first.chars().take(40).collect();
+        labels.push(label);
+    }
+    labels
+}
+
+/// Read the greeting file the player picked (`index > 0`; 0 keeps the pack
+/// opening).
+fn read_greeting(pack: &StoryPack, index: usize) -> Option<String> {
+    if index == 0 {
+        return None;
+    }
+    let path = pack.pack_root.join("greetings").join(format!("{index}.md"));
+    std::fs::read_to_string(path).ok()
 }
 
 /// Refresh the scene image cache and push its update into the view: set a new
@@ -584,6 +616,15 @@ async fn handle_ui_requests(
     if let Some(request) = app.take_home_request() {
         match request {
             HomeRequest::StartNew => {
+                // An alternate opening pick rewrites opening_md for this
+                // session (the same host-owned pack mutation the player
+                // profile already does).
+                if let Some(index) = app.take_greeting_selection()
+                    && index > 0
+                    && let Some(text) = read_greeting(pack, index)
+                {
+                    pack.opening_md = text;
+                }
                 let mut new_engine = EngineState::initial(pack);
                 new_engine.use_director_writer = config.use_director_writer;
                 *engine = new_engine;

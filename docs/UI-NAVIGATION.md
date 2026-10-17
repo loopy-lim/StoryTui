@@ -20,6 +20,9 @@ stateDiagram-v2
     Error: 오류 오버레이
 
     [*] --> Home
+    Home --> GreetingPicker: 새 게임 (greetings/*.md 있을 때)
+    GreetingPicker: 오프닝 선택 (↑↓ · Enter · Esc)
+    GreetingPicker --> Story: Enter · 선택한 오프닝으로 새 게임
     Home --> Story: Enter · 새 게임(N) / 이어하기(자동저장 있을 때)
     Home --> ImportDialog: 메뉴 "카드 가져오기" Enter
     ImportDialog --> ImportDialog: 경로 입력 · Enter 임포트 (호스트가 백그라운드 실행)
@@ -82,6 +85,13 @@ stateDiagram-v2
 | `i/ㅑ` | **장면 이미지 켜기/끄기** | user-settings.toml |
 | 상태 블록 | TTS(v) 상태·백엔드·보이스, 이미지 프로토콜(kitty 등) 표시 | — |
 | `Esc` | 닫기 · `q` 종료 | — |
+
+### 오프닝 선택 (greetings)
+
+- 임포트된 팩에 `greetings/N.md`가 있으면 새 게임 시 오프닝 선택 모달이 먼저 뜬다
+  (0번은 항상 팩 기본 오프닝 = first_mes)
+- `↑↓`/`k·j` 이동, `Enter` 확정, `Esc` 취소(시작하지 않음)
+- 선택한 인사는 그 세션의 `opening.md`로 사용되며 팩 파일은 변경되지 않는다
 
 ### 카드 가져오기 (시작 메뉴)
 
