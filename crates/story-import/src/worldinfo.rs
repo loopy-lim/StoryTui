@@ -190,6 +190,12 @@ fn embedded_entry(
             .get("vectorized")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
+        if vectorized {
+            notes.push((
+                subject.clone(),
+                "vectorized는 임베딩 대신 어휘 유사도로 근사 실행".to_string(),
+            ));
+        }
         // Timers: ST counts messages; saturate into u32.
         sticky = map
             .get("sticky")

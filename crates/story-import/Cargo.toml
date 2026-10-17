@@ -15,6 +15,7 @@ story-provider.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
+story-core.workspace = true
 png.workspace = true
 tempfile.workspace = true
 tokio.workspace = true

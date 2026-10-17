@@ -3213,6 +3213,7 @@ dependencies = [
  "png 0.17.16",
  "serde",
  "serde_json",
+ "story-core",
  "story-model",
  "story-persistence",
  "story-provider",
