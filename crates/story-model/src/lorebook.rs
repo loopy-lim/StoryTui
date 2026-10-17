@@ -96,7 +96,35 @@ pub struct LorebookEntry {
     /// ST `excludeRecursion`).
     #[serde(default)]
     pub exclude_recursion: bool,
+    /// Turns the entry stays force-included after its last trigger
+    /// (ST `sticky`). `0` disables.
+    #[serde(default)]
+    pub sticky: u32,
+    /// Turns after the sticky window before the entry may trigger again
+    /// (ST `cooldown`). `0` disables.
+    #[serde(default)]
+    pub cooldown: u32,
+    /// 1-based recursion pass the entry may first fire in. `0` also fires in
+    /// the direct pass (ST `delayUntilRecursion`, pass-based approximation).
+    #[serde(default)]
+    pub delay: u32,
+    /// ST `vectorized`: keys first, then a lexical-similarity fallback against
+    /// the scan corpus (embedding search approximated lexically).
+    #[serde(default)]
+    pub vectorized: bool,
 }
+
+/// One lorebook activation recorded per turn for sticky/cooldown timers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LorebookActivation {
+    /// Turn the entry was selected for (the turn whose prompt includes it).
+    pub turn: u32,
+    /// Activated entry id.
+    pub entry_id: String,
+}
+
+/// Activation ledger cap: newest entries kept, oldest dropped.
+pub const LOREBOOK_LEDGER_CAP: usize = 128;
 
 fn default_logic() -> LorebookLogic {
     LorebookLogic::AndAny
@@ -182,6 +210,10 @@ mod tests {
             comment: None,
             prevent_recursion: false,
             exclude_recursion: false,
+            sticky: 0,
+            cooldown: 0,
+            delay: 0,
+            vectorized: false,
         }
     }
 

@@ -153,6 +153,10 @@ fn embedded_entry(
     let mut position = None;
     let mut exclude_recursion = false;
     let mut prevent_recursion = false;
+    let mut sticky = 0_u32;
+    let mut cooldown = 0_u32;
+    let mut delay = 0_u32;
+    let mut vectorized = false;
     if let Some(map) = extensions.as_object() {
         if let Some(code) = map
             .get("selectiveLogic")
@@ -182,12 +186,26 @@ fn embedded_entry(
                 "depth 삽입은 미지원 — 기본 위치로 주입".to_string(),
             ));
         }
-        if map.get("vectorized").and_then(serde_json::Value::as_bool) == Some(true) {
-            notes.push((
-                subject.clone(),
-                "vectorized(임베딩 검색)는 미지원 — 키워드 매칭만 실행".to_string(),
-            ));
-        }
+        vectorized = map
+            .get("vectorized")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        // Timers: ST counts messages; saturate into u32.
+        sticky = map
+            .get("sticky")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0)
+            .clamp(0, u32::MAX as i64) as u32;
+        cooldown = map
+            .get("cooldown")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0)
+            .clamp(0, u32::MAX as i64) as u32;
+        delay = map
+            .get("delayUntilRecursion")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0)
+            .clamp(0, u32::MAX as i64) as u32;
         exclude_recursion = map
             .get("excludeRecursion")
             .and_then(serde_json::Value::as_bool)
@@ -234,6 +252,10 @@ fn embedded_entry(
         comment: entry.comment,
         prevent_recursion,
         exclude_recursion,
+        sticky,
+        cooldown,
+        delay,
+        vectorized,
     })
 }
 
@@ -271,23 +293,19 @@ fn standalone_entry(
         _ => 100,
     };
     let position = position_from_st_code(entry.position.unwrap_or(0), notes);
-    for (label, value) in [
-        ("sticky", entry.sticky),
-        ("cooldown", entry.cooldown),
-        ("delay", entry.delay),
-        ("delayUntilRecursion", entry.delay_until_recursion),
-    ] {
-        if value.is_some_and(|v| v != 0) {
-            notes.push((
-                subject.clone(),
-                format!("{label} 타이머는 미지원 — 항상 즉시 대상으로 취급"),
-            ));
-        }
-    }
-    if entry.vectorized {
+    // Timers execute now: a turn-based approximation of ST's message counters.
+    let sticky = entry.sticky.unwrap_or(0).clamp(0, u32::MAX as i64) as u32;
+    let cooldown = entry.cooldown.unwrap_or(0).clamp(0, u32::MAX as i64) as u32;
+    let delay = entry
+        .delay_until_recursion
+        .or(entry.delay)
+        .unwrap_or(0)
+        .clamp(0, u32::MAX as i64) as u32;
+    let vectorized = entry.vectorized;
+    if vectorized {
         notes.push((
             subject.clone(),
-            "vectorized(임베딩 검색)는 미지원 — 키워드 매칭만 실행".to_string(),
+            "vectorized는 임베딩 대신 어휘 유사도로 근사 실행".to_string(),
         ));
     }
 
@@ -307,6 +325,10 @@ fn standalone_entry(
         comment: entry.comment,
         prevent_recursion: entry.prevent_recursion,
         exclude_recursion: entry.exclude_recursion,
+        sticky,
+        cooldown,
+        delay,
+        vectorized,
     })
 }
 

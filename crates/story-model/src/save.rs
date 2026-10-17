@@ -109,6 +109,7 @@ mod tests {
             last_choice: None,
             revision: 0,
             stable_generation_id: None,
+            lorebook_activations: Vec::new(),
         }
         .with_primary_character()
     }

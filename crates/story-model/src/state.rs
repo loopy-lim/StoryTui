@@ -97,4 +97,8 @@ pub struct GameState {
     pub revision: u64,
     /// Generation id of the last stable/accepted generation, if any.
     pub stable_generation_id: Option<uuid::Uuid>,
+    /// Lorebook activation ledger — drives sticky/cooldown timers. Absent in
+    /// older saves (serde default keeps them loadable).
+    #[serde(default)]
+    pub lorebook_activations: Vec<crate::LorebookActivation>,
 }

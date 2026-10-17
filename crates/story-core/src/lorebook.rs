@@ -50,6 +50,11 @@ impl SelectedLore {
 /// deterministic; chains deeper than this simply do not fire.
 pub const MAX_RECURSION_PASSES: u32 = 3;
 
+/// Lexical cosine threshold for `vectorized` entries to fire without a key
+/// hit. Deliberately conservative — embeddings approximate, this approximates
+/// the approximation.
+pub const LEXICAL_ACTIVATION_THRESHOLD: f32 = 0.15;
+
 /// Scan + select lorebook entries for this turn.
 ///
 /// Deterministic: the same inputs always yield the same selection — the
@@ -104,14 +109,51 @@ pub fn select_lore(
         pending.insert(entry.id.as_str(), entry);
     }
 
+    // Turn the selection is for: the reducer records activations for this
+    // turn after building the request, so timers compare against `upcoming`.
+    let upcoming = state.turn + 1;
+
     // Direct pass against the story corpus.
     let direct: Vec<&LorebookEntry> = pending.values().copied().collect();
     for entry in direct {
-        if entry.probability < 100 && probability_roll(state.turn, &entry.id) >= entry.probability {
+        // `delay > 0` entries only ever fire from a recursion pass.
+        if entry.delay > 0 {
+            continue;
+        }
+        // sticky keeps an entry force-included for its window; cooldown bars
+        // re-triggering during the window after that.
+        if sticky_window_active(
+            &state.lorebook_activations,
+            &entry.id,
+            upcoming,
+            entry.sticky,
+        ) {
+            pending.remove(entry.id.as_str());
+            candidates.push(entry.clone());
+            if !entry.prevent_recursion {
+                recursion_corpus.push_str(entry.content.trim());
+                recursion_corpus.push('\n');
+            }
+            continue;
+        }
+        if cooldown_window_active(
+            &state.lorebook_activations,
+            &entry.id,
+            upcoming,
+            entry.sticky + entry.cooldown,
+        ) {
             pending.remove(entry.id.as_str());
             continue;
         }
-        if !entry_matches(&corpus_raw, &corpus_folded, entry) {
+        let keyword_hit = entry_matches(&corpus_raw, &corpus_folded, entry);
+        if !keyword_hit
+            && !(entry.vectorized
+                && lexical_similarity(&corpus_raw, &entry.content) >= LEXICAL_ACTIVATION_THRESHOLD)
+        {
+            continue;
+        }
+        if entry.probability < 100 && probability_roll(state.turn, &entry.id) >= entry.probability {
+            pending.remove(entry.id.as_str());
             continue;
         }
         candidates.push(entry.clone());
@@ -133,13 +175,19 @@ pub fn select_lore(
     // pass budget runs out.
     if book.recursive_scanning {
         let mut recursion_folded = recursion_corpus.to_lowercase();
-        for _ in 0..MAX_RECURSION_PASSES {
+        for pass in 0..MAX_RECURSION_PASSES {
             if pending.is_empty() {
                 break;
             }
+            // `delay` counts 1-based recursion passes: an entry with delay = N
+            // may first fire on pass N (never in the direct pass).
+            let round: Vec<&LorebookEntry> = pending
+                .values()
+                .copied()
+                .filter(|entry| entry.delay == 0 || entry.delay <= pass + 1)
+                .collect();
             let mut fired_this_pass = false;
             let mut corpus_delta = String::new();
-            let round: Vec<&LorebookEntry> = pending.values().copied().collect();
             for entry in round {
                 if !entry_matches(&recursion_corpus, &recursion_folded, entry) {
                     continue;
@@ -288,6 +336,79 @@ fn probability_roll(turn: u32, entry_id: &str) -> u32 {
     (hasher.finish() % 100) as u32
 }
 
+/// `true` when an activation inside the sticky window force-includes the
+/// entry for `upcoming` (ST `sticky`: stays in context N turns after firing).
+fn sticky_window_active(
+    ledger: &[story_model::LorebookActivation],
+    entry_id: &str,
+    upcoming: u32,
+    sticky: u32,
+) -> bool {
+    sticky > 0
+        && ledger.iter().any(|record| {
+            record.entry_id == entry_id && upcoming.saturating_sub(record.turn) <= sticky
+        })
+}
+
+/// `true` when the entry is still inside its post-trigger cooldown window
+/// (sticky window first, then `cooldown` turns of silence).
+fn cooldown_window_active(
+    ledger: &[story_model::LorebookActivation],
+    entry_id: &str,
+    upcoming: u32,
+    window: u32,
+) -> bool {
+    window > 0
+        && ledger.iter().any(|record| {
+            record.entry_id == entry_id && upcoming.saturating_sub(record.turn) <= window
+        })
+}
+
+/// Lexical cosine over alphanumeric tokens — the deterministic stand-in for
+/// embedding similarity on `vectorized` entries. Conservative threshold:
+/// firing on generic overlap would inject lore every turn.
+fn lexical_similarity(corpus: &str, content: &str) -> f32 {
+    let corpus_tokens = lexical_tokens(corpus);
+    if corpus_tokens.is_empty() {
+        return 0.0;
+    }
+    let mut corpus_counts: std::collections::BTreeMap<&str, u32> = Default::default();
+    for token in &corpus_tokens {
+        *corpus_counts.entry(token.as_str()).or_insert(0) += 1;
+    }
+    let mut content_counts: std::collections::BTreeMap<String, u32> = Default::default();
+    let mut total = 0_u32;
+    for token in lexical_tokens(content) {
+        total += 1;
+        *content_counts.entry(token).or_insert(0) += 1;
+    }
+    if total == 0 {
+        return 0.0;
+    }
+    let dot: u64 = content_counts
+        .iter()
+        .map(|(token, count)| {
+            let corpus_count = corpus_counts.get(token.as_str()).copied().unwrap_or(0) as u64;
+            corpus_count * u64::from(*count)
+        })
+        .sum();
+    let content_norm = f64::from(total).sqrt();
+    let corpus_norm = f64::sqrt(corpus_counts.values().map(|c| u64::from(*c)).sum::<u64>() as f64);
+    if corpus_norm == 0.0 {
+        return 0.0;
+    }
+    (dot as f64 / (content_norm * corpus_norm)) as f32
+}
+
+/// Lowercased alphanumeric tokens of at least two chars (Hangul included via
+/// `is_alphanumeric`).
+fn lexical_tokens(text: &str) -> Vec<String> {
+    text.split(|ch: char| !ch.is_alphanumeric())
+        .map(|token| token.trim().to_lowercase())
+        .filter(|token| token.chars().count() >= 2)
+        .collect()
+}
+
 fn before_first(position: LorebookPosition) -> i64 {
     match position {
         LorebookPosition::BeforeChar => 0,
@@ -318,6 +439,10 @@ mod tests {
             comment: None,
             prevent_recursion: false,
             exclude_recursion: false,
+            sticky: 0,
+            cooldown: 0,
+            delay: 0,
+            vectorized: false,
         }
     }
 
@@ -591,5 +716,146 @@ mod tests {
         // direct + MAX_RECURSION_PASSES(3) activations: a..=d fire, e needs a 4th pass.
         assert_eq!(ids.len(), 4, "chain depth is capped: {ids:?}");
         assert!(!ids.contains(&"e"), "the fifth link stays out: {ids:?}");
+    }
+
+    // --- timers (sticky/cooldown/delay) + vectorized -------------------------
+
+    fn ledger(pairs: &[(u32, &str)]) -> Vec<story_model::LorebookActivation> {
+        pairs
+            .iter()
+            .map(|(turn, id)| story_model::LorebookActivation {
+                turn: *turn,
+                entry_id: id.to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sticky_keeps_entry_active_inside_its_window() {
+        let mut sticky = entry("sticky", &["전시회"], "전시회의 기억.");
+        sticky.sticky = 2;
+        let pack = pack_with(book(vec![sticky]));
+        // Turn 8 upcoming (state turn 7); last fired turn 7 → inside the window.
+        let mut state = state_with(&["아무 키도 없는 장면."]);
+        state.lorebook_activations = ledger(&[(7, "sticky")]);
+
+        let selected = select_lore(&pack, &state, &state.history, None, None);
+        assert_eq!(
+            selected.triggered.len(),
+            1,
+            "sticky fires with no key in the story text"
+        );
+
+        // Window expired: last fired turn 5, window 2, upcoming 8 → 8-5 = 3 > 2.
+        state.lorebook_activations = ledger(&[(5, "sticky")]);
+        assert!(
+            select_lore(&pack, &state, &state.history, None, None)
+                .triggered
+                .is_empty(),
+            "sticky outside the window no longer force-fires"
+        );
+    }
+
+    #[test]
+    fn cooldown_blocks_retriggering_after_the_window() {
+        let mut gated = entry("gated", &["전시회"], "전시회의 기억.");
+        gated.cooldown = 3;
+        let pack = pack_with(book(vec![gated]));
+        let history = ["전시회 이야기를 다시 꺼냈다."];
+
+        // Inside cooldown (fired turn 7, upcoming 8, window 3): key matches but blocked.
+        let mut state = state_with(&history);
+        state.lorebook_activations = ledger(&[(7, "gated")]);
+        assert!(
+            select_lore(&pack, &state, &state.history, None, None)
+                .triggered
+                .is_empty(),
+            "cooldown bars a key match inside the window"
+        );
+
+        // Cooldown over (fired turn 4, upcoming 8 → 8-4 = 4 > 3 → allowed).
+        state.lorebook_activations = ledger(&[(4, "gated")]);
+        assert_eq!(
+            select_lore(&pack, &state, &state.history, None, None)
+                .triggered
+                .len(),
+            1,
+            "after the cooldown window the entry fires again"
+        );
+    }
+
+    #[test]
+    fn delay_defers_activation_to_a_recursion_pass() {
+        let mut deferred = entry("deferred", &["전시회"], "전시회의 기억.");
+        deferred.delay = 1;
+        let mut opener = entry("opener", &["비"], "그날 전시회 이야기가 떠올랐다.");
+        opener.prevent_recursion = false;
+        let pack = pack_with(recursive_book(vec![opener, deferred]));
+
+        // Direct story text HAS the key — still blocked in the direct pass.
+        let state = state_with(&["전시회를 말했다."]);
+        let selected = select_lore(&pack, &state, &state.history, None, None);
+        let ids: Vec<&str> = selected.triggered.iter().map(|e| e.id.as_str()).collect();
+        assert!(
+            !ids.contains(&"deferred"),
+            "delay > 0 never fires directly: {ids:?}"
+        );
+
+        // Recursion pass 1 satisfies delay = 1 via opener's content.
+        let indirect = state_with(&["비가 그쳤다."]);
+        let selected = select_lore(&pack, &indirect, &indirect.history, None, None);
+        let ids: Vec<&str> = selected.triggered.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["opener", "deferred"],
+            "fires on recursion pass 1: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn vectorized_entries_fire_on_lexical_overlap() {
+        let mut vector = entry(
+            "vector",
+            &[],
+            "전시회 포스터가 붙은 카페 골목, 두 사람의 추억이 깃든 곳.",
+        );
+        vector.vectorized = true;
+        let mut unrelated = entry("unrelated", &[], "우주 정거장의 무중력 실험실.");
+        unrelated.vectorized = true;
+        let pack = pack_with(book(vec![vector, unrelated]));
+        let state = state_with(&["카페 골목 끝의 전시회 포스터를 바라보았다."]);
+
+        let selected = select_lore(&pack, &state, &state.history, None, None);
+        let ids: Vec<&str> = selected.triggered.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["vector"],
+            "lexical overlap fires the related entry only: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn reduce_records_activation_ledger_for_turn_starts() {
+        use crate::engine_cmd::EngineCommand;
+
+        let mut pack = crate::tests_support::sample_pack();
+        // A constant entry: the opening turn has no corpus, so only constants fire.
+        let mut always = entry("expo", &[], "항상 포함되는 설정.");
+        always.constant = true;
+        pack.lorebook = book(vec![always]);
+        let state = crate::engine::EngineState::initial(&pack);
+
+        let transition = crate::engine::reduce(&state, EngineCommand::StartNewGame, &pack)
+            .expect("start new game");
+        assert!(
+            transition
+                .state
+                .game
+                .lorebook_activations
+                .iter()
+                .any(|record| record.entry_id == "expo"),
+            "opening request records its lore activations: {:?}",
+            transition.state.game.lorebook_activations
+        );
     }
 }

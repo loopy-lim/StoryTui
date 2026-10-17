@@ -54,6 +54,7 @@ fn sample_payload(turn: u32) -> SavePayload {
         last_choice: None,
         revision: turn as u64,
         stable_generation_id: None,
+        lorebook_activations: Vec::new(),
     };
     let _ = &mut state;
     SavePayload {

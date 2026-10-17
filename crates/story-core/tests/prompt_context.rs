@@ -204,6 +204,7 @@ fn fixture(reversed: bool) -> (StoryPack, GameState, Vec<HistoryEntry>) {
         last_choice: None,
         revision: 2,
         stable_generation_id: None,
+        lorebook_activations: Vec::new(),
     };
 
     let recent = vec![
@@ -659,6 +660,10 @@ fn lore_entry(
         comment: None,
         prevent_recursion: false,
         exclude_recursion: false,
+        sticky: 0,
+        cooldown: 0,
+        delay: 0,
+        vectorized: false,
     }
 }
 

@@ -275,7 +275,7 @@ pub fn reduce(
     cmd: EngineCommand,
     pack: &StoryPack,
 ) -> Result<Transition, CoreError> {
-    match cmd {
+    let mut transition = match cmd {
         EngineCommand::StartNewGame => reduce_start_new_game(state, pack),
         EngineCommand::SubmitChoice { choice_id } => {
             if state.use_director_writer {
@@ -316,6 +316,74 @@ pub fn reduce(
         }
         EngineCommand::DismissError => Ok(reduce_dismiss_error(state, pack)),
         EngineCommand::Quit => Ok(Transition::identity(clone_state(state))),
+    }?;
+    record_lorebook_activations(pack, &mut transition);
+    Ok(transition)
+}
+
+/// Record this turn's lorebook activations on the game state so sticky and
+/// cooldown timers can be evaluated deterministically on later turns. Runs
+/// only for genuine turn-start requests — choice-refresh repairs and the
+/// Writer stage of an already-recorded turn are skipped.
+fn record_lorebook_activations(pack: &StoryPack, transition: &mut Transition) {
+    if pack.lorebook.is_empty() {
+        return;
+    }
+    let starts_turn = transition.effects.iter().any(|effect| {
+        matches!(
+            effect,
+            EngineEffect::RequestGeneration { .. } | EngineEffect::RequestDirector { .. }
+        )
+    }) && !transition
+        .state
+        .pending
+        .as_ref()
+        .is_some_and(|pending| pending.choice_refresh);
+    if !starts_turn {
+        return;
+    }
+    let state = &transition.state;
+    let upcoming = state
+        .pending
+        .as_ref()
+        .map_or(state.game.turn + 1, |pending| pending.requested_at_turn + 1);
+    let selected = crate::lorebook::select_lore(
+        pack,
+        &state.game,
+        &state.game.history,
+        state
+            .pending
+            .as_ref()
+            .and_then(|pending| pending.player_action.as_ref()),
+        None,
+    );
+    // Every entry visible this turn (constants included) lands in the ledger.
+    let mut ids: Vec<String> = selected
+        .stable_before
+        .iter()
+        .chain(selected.stable_after.iter())
+        .chain(selected.triggered.iter())
+        .map(|entry| entry.id.clone())
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+    ids.sort();
+    let game = &mut transition.state.game;
+    // One batch per turn: a re-request of the same turn replaces its entries.
+    game.lorebook_activations
+        .retain(|record| record.turn != upcoming);
+    for entry_id in ids {
+        game.lorebook_activations
+            .push(story_model::LorebookActivation {
+                turn: upcoming,
+                entry_id,
+            });
+    }
+    game.lorebook_activations.sort_by_key(|record| record.turn);
+    if game.lorebook_activations.len() > story_model::LOREBOOK_LEDGER_CAP {
+        let excess = game.lorebook_activations.len() - story_model::LOREBOOK_LEDGER_CAP;
+        game.lorebook_activations.drain(0..excess);
     }
 }
 
@@ -1840,6 +1908,7 @@ fn build_initial_game_state(pack: &StoryPack) -> GameState {
         last_choice: None,
         revision: 0,
         stable_generation_id: None,
+        lorebook_activations: Vec::new(),
     }
 }
 

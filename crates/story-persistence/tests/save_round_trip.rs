@@ -76,6 +76,7 @@ fn make_state(turn: u32) -> GameState {
         last_choice: None,
         revision: turn as u64,
         stable_generation_id: Some(uuid::Uuid::nil()),
+        lorebook_activations: Vec::new(),
     }
 }
 

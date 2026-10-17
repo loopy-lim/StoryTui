@@ -1445,6 +1445,7 @@ fn commit_turn_still_applies_patch() {
             last_choice: None,
             revision: 0,
             stable_generation_id: None,
+            lorebook_activations: Vec::new(),
         },
         change_log: Vec::new(),
         warnings: Vec::new(),

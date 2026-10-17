@@ -63,6 +63,7 @@ fn hand_built_state() -> GameState {
         last_choice: None,
         revision: 5,
         stable_generation_id: None,
+        lorebook_activations: Vec::new(),
     }
 }
 

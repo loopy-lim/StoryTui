@@ -111,6 +111,7 @@ fn base_state_with(memories: Vec<MemoryEntry>) -> GameState {
         last_choice: None,
         revision: 0,
         stable_generation_id: None,
+        lorebook_activations: Vec::new(),
     }
 }
 

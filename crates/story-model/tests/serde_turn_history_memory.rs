@@ -278,5 +278,6 @@ pub fn sample_game_state() -> GameState {
         }),
         revision: 7,
         stable_generation_id: Some(uuid::Uuid::nil()),
+        lorebook_activations: Vec::new(),
     }
 }

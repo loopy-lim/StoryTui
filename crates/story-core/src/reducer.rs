@@ -830,6 +830,7 @@ pub(crate) mod tests_support {
             last_choice: None,
             revision: 5,
             stable_generation_id: None,
+            lorebook_activations: Vec::new(),
         };
         let rules = rules();
         (state, rules)

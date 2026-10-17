@@ -65,6 +65,7 @@ fn state_with() -> GameState {
         last_choice: None,
         revision: 1,
         stable_generation_id: None,
+        lorebook_activations: Vec::new(),
     }
 }
 

@@ -165,6 +165,7 @@ pub fn sample_game_state() -> GameState {
         last_choice: None,
         revision: 0,
         stable_generation_id: None,
+        lorebook_activations: Vec::new(),
     }
 }
 

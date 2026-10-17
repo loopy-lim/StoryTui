@@ -69,8 +69,8 @@ pub use error::CoreError;
 pub use history::HistoryEntry;
 pub use id::{CharacterId, EventId, FlagId, ItemId, LocationId};
 pub use lorebook::{
-    DEFAULT_LOREBOOK_SCAN_DEPTH, DEFAULT_LOREBOOK_TOKEN_BUDGET, Lorebook, LorebookEntry,
-    LorebookLogic, LorebookPosition,
+    DEFAULT_LOREBOOK_SCAN_DEPTH, DEFAULT_LOREBOOK_TOKEN_BUDGET, LOREBOOK_LEDGER_CAP, Lorebook,
+    LorebookActivation, LorebookEntry, LorebookLogic, LorebookPosition,
 };
 pub use memory::{MemoryEntry, MemoryFact};
 pub use pack::{

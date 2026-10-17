@@ -50,6 +50,7 @@ fn state(turn: u32) -> GameState {
         last_choice: None,
         revision: turn as u64,
         stable_generation_id: None,
+        lorebook_activations: Vec::new(),
     }
 }
 
