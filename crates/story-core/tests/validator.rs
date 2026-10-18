@@ -1,7 +1,9 @@
 //! Boundary-table tests for the 8-stage patch validator (W3.3 / ST-007).
 //!
-//! Each row asserts that a specific class of violation is rejected with the
-//! documented reason code, and that a just-in-bounds patch is accepted.
+//! Stage 2 (reference): an unknown id is *dropped* — the sanitized patch
+//! loses the entry, and each drop is audited as one warning plus one
+//! `Rejected` change-log entry. Stages 3–5: a violation is rejected with the
+//! documented reason code, and a just-in-bounds patch is accepted.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -13,9 +15,9 @@ use story_core::error::{
 };
 use story_core::validator::{ValidationOutcome, validate};
 use story_model::{
-    CharacterId, CharacterState, Emotion, EventDef, EventEffects, EventId, GameState, Int16Range,
-    LocationDef, LocationId, NumberVarDef, RelationshipStage, SAVE_SCHEMA_VERSION, StatePatch,
-    StoryRules, StringVarDef,
+    ChangeDecision, CharacterId, CharacterState, Emotion, EventDef, EventEffects, EventId,
+    GameState, Int16Range, LocationDef, LocationId, NumberVarDef, RelationshipStage,
+    SAVE_SCHEMA_VERSION, StatePatch, StoryRules, StringVarDef,
 };
 
 const GEN_ID: uuid::Uuid = uuid::Uuid::nil();
@@ -188,83 +190,173 @@ fn in_bounds_delta_validates() {
 }
 
 // ---------------------------------------------------------------------------
-// Stage 2: Reference
+// Stage 2: Reference — unknown references are dropped, not rejected
 // ---------------------------------------------------------------------------
 
+/// The full drop contract, exercised on `set_strings` (the shape that
+/// triggered the live failure this policy fixes): the unknown key leaves the
+/// sanitized patch, the known key survives, and the drop is audited as one
+/// warning plus one `Rejected` change-log entry carrying the stage-2 code.
 #[test]
-fn unknown_character_is_rejected() {
-    let st = fresh_state();
-    let rules = fresh_rules();
-    let mut patch = StatePatch::default();
-    patch
-        .affection_delta
-        .insert(CharacterId("c-ghost".to_string()), 1);
-    let err = run(&st, &rules, &patch).unwrap_err();
-    assert_eq!(reason(&err), Some(PATCH_UNKNOWN_CHARACTER));
-}
-
-#[test]
-fn unknown_flag_is_rejected() {
-    let st = fresh_state();
-    let rules = fresh_rules();
-    let mut patch = StatePatch::default();
-    patch.set_flags.insert("f-mystery".to_string(), true);
-    let err = run(&st, &rules, &patch).unwrap_err();
-    assert_eq!(reason(&err), Some(PATCH_UNKNOWN_FLAG));
-}
-
-#[test]
-fn unknown_number_var_is_rejected() {
-    let st = fresh_state();
-    let rules = fresh_rules();
-    let mut patch = StatePatch::default();
-    patch.number_delta.insert("nonexistent".to_string(), 1);
-    let err = run(&st, &rules, &patch).unwrap_err();
-    assert_eq!(reason(&err), Some(PATCH_UNKNOWN_NUMBER));
-}
-
-#[test]
-fn unknown_string_var_is_rejected() {
+fn unknown_string_var_is_dropped_with_audit() {
     let st = fresh_state();
     let rules = fresh_rules();
     let mut patch = StatePatch::default();
     patch
         .set_strings
         .insert("nonexistent".to_string(), "formal".to_string());
-    let err = run(&st, &rules, &patch).unwrap_err();
-    assert_eq!(reason(&err), Some(PATCH_UNKNOWN_STRING));
+    patch
+        .set_strings
+        .insert("address_form".to_string(), "formal".to_string());
+    let outcome = run(&st, &rules, &patch).expect("unknown reference drops the entry, not the patch");
+    assert!(
+        !outcome.sanitized.set_strings.contains_key("nonexistent"),
+        "dropped key absent from sanitized patch"
+    );
+    assert_eq!(
+        outcome.sanitized.set_strings.get("address_form").map(String::as_str),
+        Some("formal"),
+        "known key survives alongside the drop"
+    );
+    assert_eq!(outcome.warnings.len(), 1);
+    assert_eq!(outcome.warnings[0].code, PATCH_UNKNOWN_STRING);
+    assert!(
+        outcome.warnings[0].detail.contains("\"nonexistent\""),
+        "detail quotes the dropped key with its exact value: {}",
+        outcome.warnings[0].detail
+    );
+    assert_eq!(outcome.change_log.len(), 1);
+    let entry = &outcome.change_log[0];
+    assert_eq!(entry.decision, ChangeDecision::Rejected);
+    assert_eq!(entry.reason_code.as_deref(), Some(PATCH_UNKNOWN_STRING));
+    assert!(entry.applied.is_none(), "dropped entries apply nothing");
+    assert_eq!(entry.generation_id, GEN_ID);
+    assert_eq!(entry.turn, st.turn, "audit entries stamp the current turn");
 }
 
 #[test]
-fn unknown_item_is_rejected() {
+fn unknown_character_is_dropped() {
+    let st = fresh_state();
+    let rules = fresh_rules();
+    let mut patch = StatePatch::default();
+    patch
+        .affection_delta
+        .insert(CharacterId("c-ghost".to_string()), 1);
+    patch
+        .trust_delta
+        .insert(CharacterId("c-namu".to_string()), 1);
+    let outcome = run(&st, &rules, &patch).expect("unknown character drops its entry");
+    assert!(outcome.sanitized.affection_delta.is_empty());
+    assert_eq!(
+        outcome.sanitized.trust_delta.get(&CharacterId("c-namu".to_string())),
+        Some(&1),
+        "known character's delta survives"
+    );
+    assert_eq!(outcome.warnings[0].code, PATCH_UNKNOWN_CHARACTER);
+}
+
+#[test]
+fn empty_string_key_is_dropped() {
+    // Regression: a local model emitted a set_strings entry whose key was
+    // effectively empty; before the drop policy the whole turn failed with
+    // patch_unknown_string and only the [R] full re-roll could recover.
+    let st = fresh_state();
+    let rules = fresh_rules();
+    let mut patch = StatePatch::default();
+    patch.set_strings.insert(String::new(), "formal".to_string());
+    let outcome = run(&st, &rules, &patch).expect("empty key drops, turn survives");
+    assert!(outcome.sanitized.set_strings.is_empty());
+    assert_eq!(outcome.warnings[0].code, PATCH_UNKNOWN_STRING);
+}
+
+#[test]
+fn unknown_flag_is_dropped() {
+    let st = fresh_state();
+    let rules = fresh_rules();
+    let mut patch = StatePatch::default();
+    patch.set_flags.insert("f-mystery".to_string(), true);
+    patch.set_flags.insert("met_namu".to_string(), true);
+    let outcome = run(&st, &rules, &patch).expect("unknown flag drops its entry");
+    assert!(!outcome.sanitized.set_flags.contains_key("f-mystery"));
+    assert_eq!(outcome.sanitized.set_flags.get("met_namu"), Some(&true));
+    assert_eq!(outcome.warnings[0].code, PATCH_UNKNOWN_FLAG);
+}
+
+#[test]
+fn unknown_number_var_is_dropped() {
+    let st = fresh_state();
+    let rules = fresh_rules();
+    let mut patch = StatePatch::default();
+    patch.number_delta.insert("nonexistent".to_string(), 1);
+    let outcome = run(&st, &rules, &patch).expect("unknown number var drops its entry");
+    assert!(outcome.sanitized.number_delta.is_empty());
+    assert_eq!(outcome.warnings[0].code, PATCH_UNKNOWN_NUMBER);
+}
+
+#[test]
+fn unknown_item_is_dropped() {
     let st = fresh_state();
     let rules = fresh_rules();
     let mut patch = StatePatch::default();
     patch.inventory_delta.insert("i-sword".to_string(), 1);
-    let err = run(&st, &rules, &patch).unwrap_err();
-    assert_eq!(reason(&err), Some(PATCH_UNKNOWN_ITEM));
+    let outcome = run(&st, &rules, &patch).expect("unknown item drops its entry");
+    assert!(outcome.sanitized.inventory_delta.is_empty());
+    assert_eq!(outcome.warnings[0].code, PATCH_UNKNOWN_ITEM);
 }
 
 #[test]
-fn unknown_event_is_rejected() {
+fn unknown_event_is_dropped() {
     let st = fresh_state();
     let rules = fresh_rules();
     let mut patch = StatePatch::default();
     patch.add_events.insert("e-nope".to_string());
-    let err = run(&st, &rules, &patch).unwrap_err();
-    assert_eq!(reason(&err), Some(PATCH_UNKNOWN_EVENT));
+    patch.add_events.insert("e-rooftop".to_string());
+    let outcome = run(&st, &rules, &patch).expect("unknown event drops its entry");
+    assert!(!outcome.sanitized.add_events.contains("e-nope"));
+    assert!(outcome.sanitized.add_events.contains("e-rooftop"));
+    assert_eq!(outcome.warnings[0].code, PATCH_UNKNOWN_EVENT);
 }
 
 #[test]
-fn unknown_location_is_rejected() {
+fn unknown_location_is_dropped() {
     let st = fresh_state();
     let rules = fresh_rules();
     let patch = StatePatch {
         next_location: Some(LocationId("loc-mars".to_string())),
         ..StatePatch::default()
     };
-    let err = run(&st, &rules, &patch).unwrap_err();
-    assert_eq!(reason(&err), Some(PATCH_UNKNOWN_LOCATION));
+    let outcome = run(&st, &rules, &patch).expect("unknown location drops the move");
+    assert_eq!(outcome.sanitized.next_location, None);
+    assert_eq!(outcome.warnings[0].code, PATCH_UNKNOWN_LOCATION);
+}
+
+#[test]
+fn unknown_refs_across_maps_all_drop_and_known_parts_still_range_check() {
+    // One stray key in every reference-checked field, plus valid entries that
+    // must survive BOTH the drop and the subsequent range stages.
+    let st = fresh_state();
+    let rules = fresh_rules();
+    let mut patch = StatePatch::default();
+    patch
+        .affection_delta
+        .insert(CharacterId("c-ghost".to_string()), 1);
+    patch
+        .affection_delta
+        .insert(CharacterId("c-namu".to_string()), 1);
+    patch.set_strings.insert(String::new(), "x".to_string());
+    patch.set_flags.insert("f-mystery".to_string(), true);
+    patch.inventory_delta.insert("i-sword".to_string(), 1);
+    patch.add_events.insert("e-nope".to_string());
+    let outcome = run(&st, &rules, &patch).expect("turn survives a stray key in every map");
+    assert_eq!(
+        outcome.sanitized.affection_delta.get(&CharacterId("c-namu".to_string())),
+        Some(&1)
+    );
+    assert!(outcome.sanitized.set_strings.is_empty());
+    assert!(outcome.sanitized.set_flags.is_empty());
+    assert!(outcome.sanitized.inventory_delta.is_empty());
+    assert!(outcome.sanitized.add_events.is_empty());
+    assert_eq!(outcome.warnings.len(), 5, "one warning per dropped key");
 }
 
 // ---------------------------------------------------------------------------

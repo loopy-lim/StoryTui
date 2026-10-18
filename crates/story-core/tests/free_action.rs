@@ -133,7 +133,10 @@ fn valid_draft(generation_id: uuid::Uuid, affection_delta: i16) -> GeneratedTurn
 
 fn malformed_draft(generation_id: uuid::Uuid) -> GeneratedTurnDraft {
     let mut patch = StatePatch::default();
-    patch.set_flags.insert("nonexistent_flag".to_string(), true);
+    // A still-hard stage-3 violation: +5 exceeds the ±3 single-turn delta
+    // limit. (Unknown references no longer fail the turn — they are dropped
+    // with an audit entry — so they cannot trigger the failure path here.)
+    patch.affection_delta.insert(cid(), 5);
     GeneratedTurnDraft {
         generation_id,
         narration: "버려진 장면.".to_string(),

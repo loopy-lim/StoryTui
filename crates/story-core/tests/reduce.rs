@@ -144,10 +144,13 @@ fn valid_draft(generation_id: uuid::Uuid, affection_delta: i16) -> GeneratedTurn
     }
 }
 
-/// A draft whose patch references an unknown flag → rejected by the validator.
+/// A draft whose patch violates a still-hard stage-3 rule (+5 exceeds the ±3
+/// single-turn delta limit) → rejected by the validator. Unknown references
+/// are NOT hard failures anymore (they drop with an audit entry), so they
+/// cannot stand in for a malformed draft here.
 fn malformed_draft(generation_id: uuid::Uuid) -> GeneratedTurnDraft {
     let mut patch = StatePatch::default();
-    patch.set_flags.insert("nonexistent_flag".to_string(), true);
+    patch.affection_delta.insert(cid(), 5);
     GeneratedTurnDraft {
         generation_id,
         narration: "버려진 장면.".to_string(),

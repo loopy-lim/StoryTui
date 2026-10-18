@@ -2173,7 +2173,9 @@ fn build_turn_request(
         top_k: 40,
         max_tokens: 2048,
         json_schema: Some(generated_turn_json_schema(
-            pack.default_choice_count() as usize
+            pack.default_choice_count() as usize,
+            &pack.rules,
+            !pack.characters.is_empty(),
         )),
     }
 }
@@ -2181,7 +2183,19 @@ fn build_turn_request(
 /// JSON Schema sent to OpenAI-compatible providers that support structured
 /// output. Rust still performs strict parsing and reducer validation after the
 /// response; this schema prevents common malformed-Qwen/MLX output shapes.
-fn generated_turn_json_schema(choice_count: usize) -> story_model::serde_json::Value {
+///
+/// Reference-keyed patch maps are closed (`maxProperties: 0`) when the pack
+/// defines no matching registry entries: any key the model emitted there
+/// would be invalid, so the schema stops it at the source instead of leaving
+/// it to the validator's drop path. JSON Schema cannot constrain keys to an
+/// id list, which is why non-empty registries stay free-form.
+fn generated_turn_json_schema(
+    choice_count: usize,
+    rules: &StoryRules,
+    has_characters: bool,
+) -> story_model::serde_json::Value {
+    use story_model::serde_json::json;
+    let integer = json!({"type": "integer"});
     story_model::serde_json::json!({
         "type": "object",
         "additionalProperties": false,
@@ -2213,15 +2227,19 @@ fn generated_turn_json_schema(choice_count: usize) -> story_model::serde_json::V
                 "additionalProperties": false,
                 "required": ["affection_delta", "trust_delta", "tension_delta", "relationship_transitions", "set_flags", "number_delta", "set_strings", "inventory_delta", "add_events", "next_location", "next_time_slot", "proposed_route"],
                 "properties": {
-                    "affection_delta": {"type": "object", "maxProperties": 12, "additionalProperties": {"type": "integer"}},
-                    "trust_delta": {"type": "object", "maxProperties": 12, "additionalProperties": {"type": "integer"}},
-                    "tension_delta": {"type": "object", "maxProperties": 12, "additionalProperties": {"type": "integer"}},
-                    "relationship_transitions": {"type": "object", "maxProperties": 12, "additionalProperties": {"type": "string", "maxLength": 40}},
-                    "set_flags": {"type": "object", "maxProperties": 12, "additionalProperties": {"type": "boolean"}},
-                    "number_delta": {"type": "object", "maxProperties": 12, "additionalProperties": {"type": "integer"}},
-                    "set_strings": {"type": "object", "maxProperties": 12, "additionalProperties": {"type": "string", "maxLength": 160}},
-                    "inventory_delta": {"type": "object", "maxProperties": 12, "additionalProperties": {"type": "integer"}},
-                    "add_events": {"type": "array", "maxItems": 8, "items": {"type": "string", "maxLength": 80}},
+                    "affection_delta": keyed_object_schema(!has_characters, integer.clone()),
+                    "trust_delta": keyed_object_schema(!has_characters, integer.clone()),
+                    "tension_delta": keyed_object_schema(!has_characters, integer.clone()),
+                    "relationship_transitions": keyed_object_schema(!has_characters, json!({"type": "string", "maxLength": 40})),
+                    "set_flags": keyed_object_schema(rules.allowed_flags.is_empty(), json!({"type": "boolean"})),
+                    "number_delta": keyed_object_schema(rules.numbers.is_empty(), integer.clone()),
+                    "set_strings": keyed_object_schema(rules.strings.is_empty(), json!({"type": "string", "maxLength": 160})),
+                    "inventory_delta": keyed_object_schema(rules.allowed_items.is_empty(), integer.clone()),
+                    "add_events": if rules.events.is_empty() {
+                        json!({"type": "array", "maxItems": 0})
+                    } else {
+                        json!({"type": "array", "maxItems": 8, "items": {"type": "string", "maxLength": 80}})
+                    },
                     "next_location": {"type": ["string", "null"], "maxLength": 80},
                     "next_time_slot": {"type": ["string", "null"], "maxLength": 40},
                     "proposed_route": {"type": ["string", "null"], "maxLength": 80}
@@ -2248,6 +2266,22 @@ fn generated_turn_json_schema(choice_count: usize) -> story_model::serde_json::V
             }
         }
     })
+}
+
+/// Schema for one reference-keyed patch map. A pack that defines no matching
+/// registry entries makes ANY key invalid, so the schema closes the map
+/// (`maxProperties: 0`) instead of inviting keys the validator must drop;
+/// otherwise the map stays free-form and bounded like before.
+fn keyed_object_schema(
+    registry_empty: bool,
+    value: story_model::serde_json::Value,
+) -> story_model::serde_json::Value {
+    use story_model::serde_json::json;
+    if registry_empty {
+        json!({"type": "object", "maxProperties": 0})
+    } else {
+        json!({"type": "object", "maxProperties": 12, "additionalProperties": value})
+    }
 }
 
 /// Build a [`DirectorRequest`] for the 2-stage path. Mirrors
@@ -2295,7 +2329,9 @@ fn build_director_request(
         // keys. Rust still strict-parses + validates afterward; the provider
         // only attaches this when structured output is enabled.
         json_schema: Some(director_plan_json_schema(
-            pack.default_choice_count() as usize
+            pack.default_choice_count() as usize,
+            &pack.rules,
+            !pack.characters.is_empty(),
         )),
     }
 }
@@ -2307,7 +2343,16 @@ fn build_director_request(
 /// make full strict mode brittle on local guided-decoding servers. The required
 /// set is exactly what makes a plan pass [`crate::director::validate_plan`] —
 /// everything else is guidance the model may include.
-fn director_plan_json_schema(choice_count: usize) -> story_model::serde_json::Value {
+///
+/// Reference-keyed `proposed_patch` maps close the same way the turn schema
+/// does (see [`keyed_object_schema`]), just without the 12-key cap the
+/// Director schema never had.
+fn director_plan_json_schema(
+    choice_count: usize,
+    rules: &StoryRules,
+    has_characters: bool,
+) -> story_model::serde_json::Value {
+    use story_model::serde_json::json;
     story_model::serde_json::json!({
         "type": "object",
         "additionalProperties": false,
@@ -2337,15 +2382,19 @@ fn director_plan_json_schema(choice_count: usize) -> story_model::serde_json::Va
             "proposed_patch": {
                 "type": "object",
                 "properties": {
-                    "affection_delta": {"type": "object", "additionalProperties": {"type": "integer"}},
-                    "trust_delta": {"type": "object", "additionalProperties": {"type": "integer"}},
-                    "tension_delta": {"type": "object", "additionalProperties": {"type": "integer"}},
-                    "relationship_transitions": {"type": "object", "additionalProperties": {"type": "string"}},
-                    "set_flags": {"type": "object", "additionalProperties": {"type": "boolean"}},
-                    "number_delta": {"type": "object", "additionalProperties": {"type": "integer"}},
-                    "set_strings": {"type": "object", "additionalProperties": {"type": "string"}},
-                    "inventory_delta": {"type": "object", "additionalProperties": {"type": "integer"}},
-                    "add_events": {"type": "array", "items": {"type": "string"}},
+                    "affection_delta": keyed_object_schema(!has_characters, json!({"type": "integer"})),
+                    "trust_delta": keyed_object_schema(!has_characters, json!({"type": "integer"})),
+                    "tension_delta": keyed_object_schema(!has_characters, json!({"type": "integer"})),
+                    "relationship_transitions": keyed_object_schema(!has_characters, json!({"type": "string"})),
+                    "set_flags": keyed_object_schema(rules.allowed_flags.is_empty(), json!({"type": "boolean"})),
+                    "number_delta": keyed_object_schema(rules.numbers.is_empty(), json!({"type": "integer"})),
+                    "set_strings": keyed_object_schema(rules.strings.is_empty(), json!({"type": "string"})),
+                    "inventory_delta": keyed_object_schema(rules.allowed_items.is_empty(), json!({"type": "integer"})),
+                    "add_events": if rules.events.is_empty() {
+                        json!({"type": "array", "maxItems": 0})
+                    } else {
+                        json!({"type": "array", "items": {"type": "string"}})
+                    },
                     "next_location": {"type": ["string", "null"]},
                     "next_time_slot": {"type": ["string", "null"]},
                     "proposed_route": {"type": ["string", "null"]}
@@ -2486,12 +2535,60 @@ fn clone_state(state: &EngineState) -> EngineState {
 #[cfg(test)]
 mod tests {
     use super::{
-        Checkpoint, EngineState, apply_resolved_ending, reduce_restore_checkpoint, turn_digest,
+        Checkpoint, EngineState, apply_resolved_ending, director_plan_json_schema,
+        generated_turn_json_schema, reduce_restore_checkpoint, turn_digest,
         upsert_current_checkpoint, validated_turn_digest,
     };
     use story_model::chrono::Utc;
     use story_model::uuid::Uuid;
-    use story_model::{ConditionExpr, EndingDef, HistoryEntry, StatePatch, TurnSummary};
+    use story_model::{ConditionExpr, EndingDef, HistoryEntry, StatePatch, StoryRules, TurnSummary};
+
+    #[test]
+    fn turn_schema_closes_reference_maps_when_the_pack_defines_nothing() {
+        // A pack with empty registries cannot accept ANY key in the
+        // corresponding patch maps; the schema must say so instead of
+        // inviting keys the validator would have to drop.
+        let rules = StoryRules::minimal();
+        assert!(rules.strings.is_empty());
+        let schema = generated_turn_json_schema(3, &rules, false);
+        let patch = &schema["properties"]["state_patch"]["properties"];
+        assert_eq!(patch["set_strings"]["maxProperties"], 0);
+        assert_eq!(patch["set_flags"]["maxProperties"], 0);
+        assert_eq!(patch["number_delta"]["maxProperties"], 0);
+        assert_eq!(patch["inventory_delta"]["maxProperties"], 0);
+        assert_eq!(patch["add_events"]["maxItems"], 0);
+        assert_eq!(patch["affection_delta"]["maxProperties"], 0, "no characters");
+    }
+
+    #[test]
+    fn turn_schema_keeps_reference_maps_open_when_registries_have_entries() {
+        let mut rules = StoryRules::minimal();
+        rules
+            .allowed_flags
+            .insert("met_namu".to_string());
+        rules.strings.insert(
+            "address_form".to_string(),
+            story_model::StringVarDef {
+                id: "address_form".to_string(),
+                max_len: 8,
+                allowed: None,
+            },
+        );
+        let schema = generated_turn_json_schema(3, &rules, true);
+        let patch = &schema["properties"]["state_patch"]["properties"];
+        assert_eq!(patch["set_strings"]["maxProperties"], 12);
+        assert_eq!(patch["set_flags"]["maxProperties"], 12);
+        assert_eq!(patch["affection_delta"]["maxProperties"], 12);
+    }
+
+    #[test]
+    fn director_schema_closes_reference_maps_when_the_pack_defines_nothing() {
+        let rules = StoryRules::minimal();
+        let schema = director_plan_json_schema(3, &rules, false);
+        let patch = &schema["properties"]["proposed_patch"]["properties"];
+        assert_eq!(patch["set_strings"]["maxProperties"], 0);
+        assert_eq!(patch["add_events"]["maxItems"], 0);
+    }
 
     #[test]
     fn turn_digest_prefers_interpretation_then_falls_back_to_first_clause() {

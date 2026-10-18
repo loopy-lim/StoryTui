@@ -12,7 +12,11 @@
 //!    [`StatePatch`]); nothing to do here at runtime.
 //! 2. **Reference** — every id in the patch must exist in either the live
 //!    state (characters) or the rules (flags/numbers/strings/items/events/
-//!    locations).
+//!    locations). Unknown references are *dropped*, not rejected: the JSON
+//!    schema cannot constrain object keys to a pack's id lists, so a stray
+//!    key is an expected model slip and must not discard a whole generation.
+//!    Each drop is audited as a `Rejected` change-log entry plus a
+//!    [`GenerationWarning`].
 //! 3. **Range** — single-turn deltas within `delta_limits`; projected final
 //!    stats within `stat_limits` (no automatic clamping); number deltas within
 //!    the var's `[min, max]`; strings ≤ `max_len` and in `allowed`; projected
@@ -46,48 +50,54 @@ use crate::state_machine::would_permit_relationship_transition;
 /// Output of a successful validation.
 #[derive(Clone, Debug)]
 pub struct ValidationOutcome {
-    /// Sanitized patch safe for the reducer to apply. With the strict
-    /// reject-the-whole-patch policy, this equals the input patch on success.
+    /// Sanitized patch safe for the reducer to apply: identical to the input
+    /// patch minus every unknown-reference entry dropped at stage 2.
     pub sanitized: StatePatch,
-    /// Non-fatal issues discovered during validation.
+    /// Non-fatal issues discovered during validation (one per dropped
+    /// reference, plus any future soft checks).
     pub warnings: Vec<GenerationWarning>,
-    /// Field-level audit entries (mostly populated by the reducer on apply;
-    /// the validator only adds Rejected entries it could not surface as
-    /// warnings — empty under the strict policy).
+    /// Field-level audit entries (one `Rejected` entry per dropped
+    /// reference; the reducer appends its `Applied` entries on apply).
     pub change_log: Vec<StateChangeLog>,
 }
 
 /// Validate a patch against the current state and rules.
 ///
-/// Returns `Err([CoreError::InvalidPatch])` on any hard failure, leaving the
-/// caller's state untouched (atomicity is enforced by the reducer, which only
-/// ever mutates a clone).
+/// Stage 2 drops unknown references (audited — see the module docs); stages
+/// 3–5 return `Err([CoreError::InvalidPatch])` on any hard failure, leaving
+/// the caller's state untouched (atomicity is enforced by the reducer, which
+/// only ever mutates a clone).
 pub fn validate(
     state: &GameState,
     rules: &StoryRules,
     patch: &StatePatch,
-    _generation_id: Uuid,
+    generation_id: Uuid,
 ) -> Result<ValidationOutcome, CoreError> {
     // Stage 2: Reference ----------------------------------------------
-    check_references(state, rules, patch)?;
+    // Unknown references are dropped (with audit), not rejected: one stray
+    // key must not discard a whole generation.
+    let (sanitized, warnings, change_log) =
+        drop_unknown_references(state, rules, patch, generation_id);
 
     // Stage 3: Range ---------------------------------------------------
-    check_ranges(state, rules, patch)?;
+    // Registry lookups below rely on the reference stage having removed
+    // every unknown id from `sanitized`.
+    check_ranges(state, rules, &sanitized)?;
 
     // Stage 4: Permission ---------------------------------------------
-    check_relationship_transitions(state, rules, patch)?;
+    check_relationship_transitions(state, rules, &sanitized)?;
 
     // Stage 5: Transition ---------------------------------------------
-    check_location_transition(state, rules, patch)?;
+    check_location_transition(state, rules, &sanitized)?;
 
     // Stage 6: Cross ---------------------------------------------------
     // Light MVP checks reserved for future expansion; issues here become
     // warnings rather than errors.
 
     Ok(ValidationOutcome {
-        sanitized: patch.clone(),
-        warnings: Vec::new(),
-        change_log: Vec::new(),
+        sanitized,
+        warnings,
+        change_log,
     })
 }
 
@@ -95,86 +105,184 @@ pub fn validate(
 // Stage 2: Reference
 // ---------------------------------------------------------------------------
 
-fn check_references(
+/// Remove every unknown-reference entry from `patch`, returning the
+/// sanitized patch plus one warning and one `Rejected` change-log entry per
+/// dropped key.
+///
+/// The response JSON schema cannot constrain object keys to a pack's id
+/// lists (any server, schema-enforced or not, accepts arbitrary keys), so a
+/// stray key — often empty or a free-text label — is an expected model slip.
+/// Rejecting the whole turn threw away a full generation over one key;
+/// dropping the entry keeps the turn alive and the audit trail explains it.
+fn drop_unknown_references(
     state: &GameState,
     rules: &StoryRules,
     patch: &StatePatch,
-) -> Result<(), CoreError> {
-    for ch in patch.affection_delta.keys() {
-        require_character(state, ch, "affection_delta")?;
+    generation_id: Uuid,
+) -> (StatePatch, Vec<GenerationWarning>, Vec<StateChangeLog>) {
+    let mut sanitized = patch.clone();
+    let mut audit = DropAudit::new(generation_id, state.turn);
+
+    drop_unknown_character_keys(
+        &mut sanitized.affection_delta,
+        state,
+        &mut audit,
+        "affection_delta",
+    );
+    drop_unknown_character_keys(&mut sanitized.trust_delta, state, &mut audit, "trust_delta");
+    drop_unknown_character_keys(&mut sanitized.tension_delta, state, &mut audit, "tension_delta");
+    drop_unknown_character_keys(
+        &mut sanitized.relationship_transitions,
+        state,
+        &mut audit,
+        "relationship_transitions",
+    );
+    drop_unknown_registry_keys(
+        &mut sanitized.set_flags,
+        |flag| rules.allowed_flags.contains(flag),
+        &mut audit,
+        "set_flags",
+        PATCH_UNKNOWN_FLAG,
+    );
+    drop_unknown_registry_keys(
+        &mut sanitized.number_delta,
+        |num| rules.numbers.contains_key(num),
+        &mut audit,
+        "number_delta",
+        PATCH_UNKNOWN_NUMBER,
+    );
+    drop_unknown_registry_keys(
+        &mut sanitized.set_strings,
+        |s| rules.strings.contains_key(s),
+        &mut audit,
+        "set_strings",
+        PATCH_UNKNOWN_STRING,
+    );
+    drop_unknown_registry_keys(
+        &mut sanitized.inventory_delta,
+        |item| rules.allowed_items.contains(item),
+        &mut audit,
+        "inventory_delta",
+        PATCH_UNKNOWN_ITEM,
+    );
+
+    let unknown_events: Vec<String> = sanitized
+        .add_events
+        .iter()
+        .filter(|ev| !rules.events.contains_key(&story_model::EventId((*ev).clone())))
+        .cloned()
+        .collect();
+    for ev in unknown_events {
+        audit.record(
+            format!("state_patch.add_events.{ev}"),
+            story_model::serde_json::Value::String(ev.clone()),
+            PATCH_UNKNOWN_EVENT,
+            format!("add_events dropped unknown event {ev:?}"),
+        );
+        sanitized.add_events.remove(&ev);
     }
-    for ch in patch.trust_delta.keys() {
-        require_character(state, ch, "trust_delta")?;
-    }
-    for ch in patch.tension_delta.keys() {
-        require_character(state, ch, "tension_delta")?;
-    }
-    for ch in patch.relationship_transitions.keys() {
-        require_character(state, ch, "relationship_transitions")?;
-    }
-    for flag in patch.set_flags.keys() {
-        if !rules.allowed_flags.contains(flag) {
-            return Err(CoreError::invalid_patch(
-                PATCH_UNKNOWN_FLAG,
-                format!("set_flags references unknown flag {flag}"),
-            ));
-        }
-    }
-    for num in patch.number_delta.keys() {
-        if !rules.numbers.contains_key(num) {
-            return Err(CoreError::invalid_patch(
-                PATCH_UNKNOWN_NUMBER,
-                format!("number_delta references unknown number variable {num}"),
-            ));
-        }
-    }
-    for s in patch.set_strings.keys() {
-        if !rules.strings.contains_key(s) {
-            return Err(CoreError::invalid_patch(
-                PATCH_UNKNOWN_STRING,
-                format!("set_strings references unknown string variable {s}"),
-            ));
-        }
-    }
-    for item in patch.inventory_delta.keys() {
-        if !rules.allowed_items.contains(item) {
-            return Err(CoreError::invalid_patch(
-                PATCH_UNKNOWN_ITEM,
-                format!("inventory_delta references unknown item {item}"),
-            ));
-        }
-    }
-    for ev in &patch.add_events {
-        if !rules.events.contains_key(&story_model::EventId(ev.clone())) {
-            return Err(CoreError::invalid_patch(
-                PATCH_UNKNOWN_EVENT,
-                format!("add_events references unknown event {ev}"),
-            ));
-        }
-    }
-    if let Some(loc) = &patch.next_location
-        && !rules.locations.contains_key(loc)
+
+    if let Some(loc) = sanitized.next_location.clone()
+        && !rules.locations.contains_key(&loc)
     {
-        return Err(CoreError::invalid_patch(
+        audit.record(
+            format!("state_patch.next_location.{}", loc),
+            story_model::serde_json::Value::String(loc.0.clone()),
             PATCH_UNKNOWN_LOCATION,
-            format!("next_location references unknown location {loc}"),
-        ));
+            format!("next_location dropped unknown location {loc:?}"),
+        );
+        sanitized.next_location = None;
     }
-    Ok(())
+
+    (sanitized, audit.warnings, audit.entries)
 }
 
-fn require_character(
+/// Per-call audit sink for stage-2 drops: one [`GenerationWarning`] and one
+/// `Rejected` [`StateChangeLog`] entry per dropped key.
+struct DropAudit {
+    generation_id: Uuid,
+    turn: u32,
+    warnings: Vec<GenerationWarning>,
+    entries: Vec<StateChangeLog>,
+}
+
+impl DropAudit {
+    fn new(generation_id: Uuid, turn: u32) -> Self {
+        Self {
+            generation_id,
+            turn,
+            warnings: Vec::new(),
+            entries: Vec::new(),
+        }
+    }
+
+    fn record(
+        &mut self,
+        field_path: String,
+        proposed: story_model::serde_json::Value,
+        code: &'static str,
+        detail: String,
+    ) {
+        self.warnings.push(GenerationWarning {
+            code: code.to_string(),
+            detail: detail.clone(),
+        });
+        self.entries.push(StateChangeLog {
+            id: Uuid::new_v4(),
+            generation_id: self.generation_id,
+            turn: self.turn,
+            source: story_model::ChangeSource::LlmPatch,
+            field_path,
+            before: story_model::serde_json::Value::Null,
+            proposed,
+            applied: None,
+            decision: story_model::ChangeDecision::Rejected,
+            rule_id: None,
+            reason_code: Some(code.to_string()),
+        });
+    }
+}
+
+fn drop_unknown_character_keys<V: serde::Serialize>(
+    map: &mut std::collections::BTreeMap<CharacterId, V>,
     state: &GameState,
-    ch: &CharacterId,
+    audit: &mut DropAudit,
     field: &'static str,
-) -> Result<(), CoreError> {
-    if state.characters.contains_key(ch) {
-        Ok(())
-    } else {
-        Err(CoreError::invalid_patch(
+) {
+    let unknown: Vec<CharacterId> = map
+        .keys()
+        .filter(|ch| !state.characters.contains_key(*ch))
+        .cloned()
+        .collect();
+    for ch in unknown {
+        let proposed = story_model::serde_json::to_value(map.get(&ch)).unwrap_or(story_model::serde_json::Value::Null);
+        audit.record(
+            format!("state_patch.{field}.{ch}"),
+            proposed,
             PATCH_UNKNOWN_CHARACTER,
-            format!("{field} references unknown character {ch}"),
-        ))
+            format!("{field} dropped unknown character {ch:?}"),
+        );
+        map.remove(&ch);
+    }
+}
+
+fn drop_unknown_registry_keys<V: serde::Serialize>(
+    map: &mut std::collections::BTreeMap<String, V>,
+    known: impl Fn(&str) -> bool,
+    audit: &mut DropAudit,
+    field: &'static str,
+    code: &'static str,
+) {
+    let unknown: Vec<String> = map.keys().filter(|key| !known(key)).cloned().collect();
+    for key in unknown {
+        let proposed = story_model::serde_json::to_value(map.get(&key)).unwrap_or(story_model::serde_json::Value::Null);
+        audit.record(
+            format!("state_patch.{field}.{key}"),
+            proposed,
+            code,
+            format!("{field} dropped unknown variable {key:?}"),
+        );
+        map.remove(&key);
     }
 }
 

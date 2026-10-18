@@ -66,15 +66,18 @@ pub fn apply_patch(
     generation_id: Uuid,
 ) -> Result<ApplyResult, CoreError> {
     // Stage 1–6: validate. Hard failure → return Err; original untouched.
+    // Stage-2 drops arrive here as `Rejected` change-log entries and ride
+    // into the result's audit trail alongside the reducer's own entries.
     let ValidationOutcome {
         sanitized,
         warnings,
-        ..
+        change_log: dropped_entries,
     } = validate(state, rules, patch, generation_id)?;
 
     // Clone so we never mutate the caller's state.
     let mut next = state.clone();
     let mut log = ChangeLog::new(generation_id, state.turn);
+    log.entries.extend(dropped_entries);
 
     // --- Stage 7a: apply direct patch mutations --------------------------
     apply_direct_mutations(state, &mut next, rules, &sanitized, &mut log);

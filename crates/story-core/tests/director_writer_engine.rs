@@ -168,13 +168,16 @@ fn valid_plan() -> DirectorPlan {
     }
 }
 
-/// A Director plan whose patch references an unknown character (validation
-/// failure). The engine MUST reject it and NOT emit RequestWriter.
-fn bad_plan_unknown_character() -> DirectorPlan {
+/// A Director plan whose patch violates a STILL-hard stage-3 rule: a +5
+/// affection delta exceeds the pack's ±3 single-turn delta limit. The engine
+/// MUST reject it and NOT emit RequestWriter. (Unknown references no longer
+/// reject — they are dropped with an audit entry; see
+/// `unknown_patch_reference_is_dropped_and_writer_still_called`.)
+fn bad_plan_out_of_range_delta() -> DirectorPlan {
     let mut patch = StatePatch::default();
     patch
         .affection_delta
-        .insert(CharacterId("c-ghost".to_string()), 1);
+        .insert(cid(), 5);
     let mut plan = valid_plan();
     plan.proposed_patch = patch;
     plan
@@ -463,7 +466,7 @@ fn accept_director_plan_invalid_restores_checkpoint_and_skips_writer() {
         &t.state,
         EngineCommand::AcceptDirectorPlan {
             generation_id: gid,
-            plan: Box::new(bad_plan_unknown_character()),
+            plan: Box::new(bad_plan_out_of_range_delta()),
         },
         &pack,
     )
@@ -506,6 +509,57 @@ fn accept_director_plan_invalid_restores_checkpoint_and_skips_writer() {
 }
 
 #[test]
+fn unknown_patch_reference_is_dropped_and_writer_still_called() {
+    let (state, pack) = prime_then_enable_director();
+    let submitted = reduce(
+        &state,
+        EngineCommand::SubmitChoice {
+            choice_id: "choice-0".to_string(),
+        },
+        &pack,
+    )
+    .expect("submit");
+    let gid = submitted
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            EngineEffect::RequestDirector { generation_id, .. } => Some(*generation_id),
+            _ => None,
+        })
+        .expect("RequestDirector");
+
+    // The patch references an unknown character: the entry is dropped with
+    // an audit record and the two-stage pipeline continues.
+    let mut patch = StatePatch::default();
+    patch
+        .affection_delta
+        .insert(CharacterId("c-ghost".to_string()), 1);
+    let mut plan = valid_plan();
+    plan.proposed_patch = patch;
+
+    let t = reduce(
+        &submitted.state,
+        EngineCommand::AcceptDirectorPlan {
+            generation_id: gid,
+            plan: Box::new(plan),
+        },
+        &pack,
+    )
+    .expect("accept director (dropped reference)");
+
+    assert!(
+        t.effects
+            .iter()
+            .any(|e| matches!(e, EngineEffect::RequestWriter { .. })),
+        "Writer IS requested when the only defect is a dropped reference"
+    );
+    assert!(
+        t.state.pending.is_some(),
+        "turn stays pending for the writer stage"
+    );
+}
+
+#[test]
 fn retry_after_director_rejection_restarts_at_the_director() {
     let (state, pack) = prime_then_enable_director();
     let submitted = reduce(
@@ -528,7 +582,7 @@ fn retry_after_director_rejection_restarts_at_the_director() {
         &submitted.state,
         EngineCommand::AcceptDirectorPlan {
             generation_id: gid,
-            plan: Box::new(bad_plan_unknown_character()),
+            plan: Box::new(bad_plan_out_of_range_delta()),
         },
         &pack,
     )

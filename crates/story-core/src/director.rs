@@ -304,8 +304,10 @@ mod tests {
     }
 
     #[test]
-    fn invalid_patch_plan_is_rejected_so_writer_not_called() {
-        // affection_delta on an unknown character ⇒ PATCH_UNKNOWN_CHARACTER.
+    fn unknown_patch_reference_is_dropped_so_writer_still_called() {
+        // affection_delta on an unknown character: dropped (with audit), the
+        // same policy as the single-pass path — one stray key must not kill
+        // the whole two-stage pipeline.
         let state = namu_state();
         let pack = sample_pack();
         let mut plan = valid_plan();
@@ -313,11 +315,25 @@ mod tests {
         plan.proposed_patch
             .affection_delta
             .insert(story_model::CharacterId("c-ghost".to_string()), 5);
-        let err = validate_plan(&plan, &state, &pack).expect_err("must reject");
-        assert_eq!(
-            err.reason_code(),
-            Some("patch_unknown_character"),
-            "expected patch_unknown_character, got {err:?}"
+        let validated = validate_plan(&plan, &state, &pack).expect("plan survives the drop");
+        let warning = validated
+            .dry_run
+            .warnings
+            .iter()
+            .find(|w| w.code == "patch_unknown_character")
+            .expect("drop is audited as a warning");
+        assert!(
+            warning.detail.contains("c-ghost"),
+            "detail names the dropped key: {}",
+            warning.detail
+        );
+        assert!(
+            !validated
+                .dry_run
+                .state
+                .characters
+                .contains_key(&story_model::CharacterId("c-ghost".to_string())),
+            "no character was invented by the dropped delta"
         );
     }
 
