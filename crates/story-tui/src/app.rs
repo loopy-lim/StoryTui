@@ -31,9 +31,9 @@ use crate::screens::home::{menu_selection_at, render_home};
 use crate::screens::save_load::render_save_load;
 use crate::screens::settings::{SettingsView, render_settings};
 use crate::screens::story::{
-    ListMode, StoryStackEntry, choice_index_at, home_shortcut_at, markdown_lines,
-    model_picker_scroll, render_list, render_model_picker, render_provider_picker, render_story,
-    story_stack_text, streaming_entry_lines,
+    ListMode, ModelRoleHints, StoryStackEntry, choice_index_at, home_shortcut_at, markdown_lines,
+    model_picker_scroll, render_help_overlay, render_list, render_model_picker,
+    render_provider_picker, render_story, story_stack_text, streaming_entry_lines,
 };
 
 /// Which manual save manager the host should open.
@@ -62,11 +62,19 @@ pub struct TtsDisplay {
     pub voice: Option<String>,
 }
 
-/// Card import dialog state: path input → running → report.
+/// Card import dialog state: path input → browse → running → report.
 #[derive(Clone, Debug)]
 enum ImportDialog {
     /// Typing the card file path.
     Input { buffer: InputBuffer },
+    /// Browsing directories for a card file. `input` parks the path-entry
+    /// buffer so the Tab round-trip never loses typed text.
+    Browse {
+        dir: String,
+        entries: Vec<(String, bool)>,
+        selected: usize,
+        input: InputBuffer,
+    },
     /// The host is running the import (keys ignored).
     Running { path: String },
     /// Finished. `ready` carries the pack dir the player can switch to.
@@ -75,6 +83,20 @@ enum ImportDialog {
         lines: Vec<String>,
         ready: Option<String>,
     },
+}
+
+/// Join a browse directory and entry name into a path string.
+fn join_browse_path(dir: &str, name: &str) -> String {
+    format!("{}/{}", dir.trim_end_matches('/'), name)
+}
+
+/// Parent directory of a submitted card path, remembered so the next import
+/// dialog can prefill it. `None` for bare names with no parent.
+fn parent_dir_of(path: &str) -> Option<String> {
+    std::path::Path::new(path)
+        .parent()
+        .map(|parent| parent.display().to_string())
+        .filter(|dir| !dir.is_empty())
 }
 
 #[derive(Clone, Debug)]
@@ -213,8 +235,15 @@ pub struct App {
     import_dialog: Option<ImportDialog>,
     /// Set when the player submits a card path; the host runs the import.
     import_request: Option<String>,
+    /// Import file-browser navigation request. An empty string means "open
+    /// at the host-chosen start directory"; otherwise the directory to list.
+    browse_request: Option<String>,
     /// Set when the player confirms the report; the host swaps the pack in.
     pack_swap_request: Option<String>,
+    /// Pack delete confirmation modal: the selected index into `pack_dirs`.
+    pack_delete_confirm: Option<usize>,
+    /// Set when the player confirms deletion; the host validates and removes.
+    pack_delete_request: Option<String>,
     /// Alternate openings for the current pack: index 0 is the pack opening.
     /// Empty = no picker; 새 게임 starts immediately.
     pub(crate) greetings: Vec<String>,
@@ -249,6 +278,11 @@ pub struct App {
     /// Directory of the active pack; the host updates it after a swap and
     /// reads it back to scan the pack root for the picker.
     current_pack_dir: String,
+    /// `?` help overlay (`Some` story-screen context only).
+    help_visible: bool,
+    /// Directory of the most recent card import, used to prefill the next
+    /// import dialog so repeat imports don't retype the path.
+    import_last_dir: Option<String>,
     /// Pack picker modal (`Some` = visible): selected index into
     /// `pack_dirs`/`pack_labels`.
     pack_picker: Option<usize>,
@@ -301,6 +335,9 @@ impl App {
             mouse_command: None,
             import_dialog: None,
             import_request: None,
+            browse_request: None,
+            pack_delete_confirm: None,
+            pack_delete_request: None,
             pack_swap_request: None,
             greetings: Vec::new(),
             greeting_picker: None,
@@ -319,6 +356,8 @@ impl App {
             home_request: None,
             home_status: None,
             current_pack_dir: String::new(),
+            help_visible: false,
+            import_last_dir: None,
             pack_picker: None,
             pack_dirs: Vec::new(),
             pack_labels: Vec::new(),
@@ -376,6 +415,28 @@ impl App {
             .unwrap_or(0);
     }
 
+    /// Current role assignments for the model picker's badges. The live
+    /// provider projection wins (the host applies picks asynchronously);
+    /// pending in-App picks fill any gap so the badge updates the moment a
+    /// key is pressed.
+    fn model_role_hints(&self) -> ModelRoleHints {
+        let provider = self.settings.as_ref().map(|settings| &settings.provider);
+        ModelRoleHints {
+            base: provider
+                .map(|p| p.model.clone())
+                .or_else(|| self.selected_model.clone()),
+            director: provider
+                .and_then(|p| p.director_model.clone())
+                .or_else(|| self.selected_director_model.clone()),
+            choice: provider
+                .and_then(|p| p.choice_model.clone())
+                .or_else(|| self.selected_choice_model.clone()),
+            writer: provider
+                .and_then(|p| p.writer_model.clone())
+                .or_else(|| self.selected_writer_model.clone()),
+        }
+    }
+
     pub fn take_selected_model(&mut self) -> Option<String> {
         self.selected_model.take()
     }
@@ -407,11 +468,14 @@ impl App {
         self.mouse_command.take()
     }
 
-    /// Open the card import dialog from the home menu.
+    /// Open the card import dialog from the home menu. The typed path starts
+    /// from the last import's directory so repeat imports stay a small edit.
     pub fn open_import_dialog(&mut self) {
-        self.import_dialog = Some(ImportDialog::Input {
-            buffer: InputBuffer::new(500),
-        });
+        let mut buffer = InputBuffer::new(500);
+        if let Some(dir) = &self.import_last_dir {
+            buffer.insert_str(&format!("{dir}/"));
+        }
+        self.import_dialog = Some(ImportDialog::Input { buffer });
     }
 
     /// Consume a submitted card path; the host runs the import.
@@ -489,6 +553,39 @@ impl App {
                     self.pack_swap_request = Some(dir);
                 }
             }
+            KeyCode::Char('d' | 'ㅇ') => {
+                // Deletion is confirmed in its own modal; the active pack
+                // is never deletable.
+                let selected_index = *selected;
+                if let Some(dir) = self.pack_dirs.get(selected_index)
+                    && dir != &self.current_pack_dir
+                {
+                    self.pack_delete_confirm = Some(selected_index);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Keys while the pack delete confirmation owns the screen.
+    fn handle_pack_delete_confirm_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.should_quit = true;
+            return;
+        }
+        let Some(index) = self.pack_delete_confirm else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => self.pack_delete_confirm = None,
+            KeyCode::Enter => {
+                if let Some(dir) = self.pack_dirs.get(index) {
+                    let dir = dir.clone();
+                    self.pack_delete_confirm = None;
+                    self.pack_picker = None;
+                    self.pack_delete_request = Some(dir);
+                }
+            }
             _ => {}
         }
     }
@@ -534,6 +631,33 @@ impl App {
         });
     }
 
+    /// The host supplies a directory listing for the import file browser.
+    /// Stale listings (dialog closed meanwhile) are dropped. The parked
+    /// path-entry buffer survives the refresh.
+    pub fn open_file_browser(&mut self, dir: &str, entries: Vec<(String, bool)>) {
+        let Some(ImportDialog::Browse { input, .. }) = self.import_dialog.take() else {
+            return;
+        };
+        self.import_dialog = Some(ImportDialog::Browse {
+            dir: dir.to_string(),
+            entries,
+            selected: 0,
+            input,
+        });
+    }
+
+    /// Consume a pending file-browser listing request. An empty string asks
+    /// the host to pick the start directory (HOME or `.`).
+    pub fn take_browse_request(&mut self) -> Option<String> {
+        self.browse_request.take()
+    }
+
+    /// Consume a confirmed pack deletion. The host validates the guard and
+    /// removes the directory.
+    pub fn take_pack_delete_request(&mut self) -> Option<String> {
+        self.pack_delete_request.take()
+    }
+
     /// Keys while the import dialog owns the screen.
     fn handle_import_dialog_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
@@ -551,8 +675,22 @@ impl App {
                     if path.is_empty() {
                         return;
                     }
+                    let parent_dir = parent_dir_of(&path);
                     self.import_request = Some(path.clone());
                     *dialog = ImportDialog::Running { path };
+                    self.import_last_dir = parent_dir;
+                }
+                KeyCode::Tab => {
+                    // Park the typed text and switch to the file browser;
+                    // the host fills the listing ("" = start directory).
+                    let buffer = buffer.clone();
+                    self.browse_request = Some(String::new());
+                    *dialog = ImportDialog::Browse {
+                        dir: String::new(),
+                        entries: Vec::new(),
+                        selected: 0,
+                        input: buffer,
+                    };
                 }
                 KeyCode::Backspace => buffer.backspace(),
                 KeyCode::Delete => buffer.delete(),
@@ -562,6 +700,47 @@ impl App {
                 KeyCode::End => buffer.cursor_end(),
                 KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     buffer.insert_grapheme(&c.to_string());
+                }
+                _ => {}
+            },
+            ImportDialog::Browse {
+                dir,
+                entries,
+                selected,
+                input,
+            } => match key.code {
+                KeyCode::Esc | KeyCode::Tab => {
+                    // Back to path entry; the typed buffer is restored.
+                    let buffer = input.clone();
+                    *dialog = ImportDialog::Input { buffer };
+                }
+                KeyCode::Up | KeyCode::Char('k' | 'ㅏ') => {
+                    *selected = selected.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j' | 'ㅓ') => {
+                    *selected = (*selected + 1).min(entries.len().saturating_sub(1));
+                }
+                KeyCode::Enter => {
+                    let Some((name, is_dir)) = entries.get(*selected) else {
+                        return;
+                    };
+                    let path = join_browse_path(dir, name);
+                    if *is_dir {
+                        self.browse_request = Some(path);
+                    } else {
+                        let parent_dir = parent_dir_of(&path);
+                        self.import_request = Some(path.clone());
+                        *dialog = ImportDialog::Running { path };
+                        self.import_last_dir = parent_dir;
+                    }
+                }
+                KeyCode::Backspace | KeyCode::Left => {
+                    if let Some(parent) = std::path::Path::new(dir).parent()
+                        && parent.display().to_string() != *dir
+                        && !dir.is_empty()
+                    {
+                        self.browse_request = Some(parent.display().to_string());
+                    }
                 }
                 _ => {}
             },
@@ -872,6 +1051,10 @@ impl App {
             self.handle_greeting_picker_key(key);
             return None;
         }
+        if self.pack_delete_confirm.is_some() {
+            self.handle_pack_delete_confirm_key(key);
+            return None;
+        }
         if self.pack_picker.is_some() {
             self.handle_pack_picker_key(key);
             return None;
@@ -886,6 +1069,20 @@ impl App {
         }
         if self.save_load.is_some() {
             self.handle_save_load_key(key);
+            return None;
+        }
+        if self.help_visible {
+            // The help overlay is modal but not a trap: the same key closes
+            // it that opened it, Esc works, and quit always works.
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                self.should_quit = true;
+            } else {
+                match key.code {
+                    KeyCode::Char('?') | KeyCode::Esc => self.help_visible = false,
+                    KeyCode::Char('q' | 'ㅂ') => self.should_quit = true,
+                    _ => {}
+                }
+            }
             return None;
         }
         if self.view.error.is_some() {
@@ -955,18 +1152,18 @@ impl App {
                         .map(|(name, _)| name.clone());
                     self.list_mode = None;
                 }
+                // Role keys keep the picker open — the badge on the row is
+                // the feedback, and assigning all three roles should not
+                // take three round-trips through the Settings screen.
                 KeyCode::Char('d' | 'ㅇ') if self.list_mode == Some(ListMode::ModelPicker) => {
                     self.selected_director_model =
                         self.model_items.get(self.model_selected).cloned();
-                    self.list_mode = None;
                 }
                 KeyCode::Char('c' | 'ㅊ') if self.list_mode == Some(ListMode::ModelPicker) => {
                     self.selected_choice_model = self.model_items.get(self.model_selected).cloned();
-                    self.list_mode = None;
                 }
                 KeyCode::Char('w' | 'ㅈ') if self.list_mode == Some(ListMode::ModelPicker) => {
                     self.selected_writer_model = self.model_items.get(self.model_selected).cloned();
-                    self.list_mode = None;
                 }
                 _ => {}
             }
@@ -1032,6 +1229,11 @@ impl App {
         if matches!(key.code, KeyCode::Char('m' | 'ㅡ')) {
             self.list_mode = Some(ListMode::Memory);
             self.list_scroll = 0;
+            return None;
+        }
+        // Full keymap reference — the answer to "what keys even exist".
+        if matches!(key.code, KeyCode::Char('?')) {
+            self.help_visible = true;
             return None;
         }
         if !self.view.loading.is_some() && self.view.error.is_none() {
@@ -1140,6 +1342,16 @@ impl App {
                 let (before, after) = cursor_split.as_ref().expect("input split set above");
                 Some(crate::screens::import::ImportDialogView::Input { before, after })
             }
+            Some(ImportDialog::Browse {
+                dir,
+                entries,
+                selected,
+                ..
+            }) => Some(crate::screens::import::ImportDialogView::Browse {
+                dir,
+                entries,
+                selected: *selected,
+            }),
             Some(ImportDialog::Running { path }) => {
                 Some(crate::screens::import::ImportDialogView::Running { path })
             }
@@ -1166,6 +1378,14 @@ impl App {
         if let Some(selected) = self.pack_picker {
             crate::screens::pack::render_pack_picker(frame, area, &self.pack_labels, selected);
         }
+        if let Some(index) = self.pack_delete_confirm {
+            let title = self
+                .pack_labels
+                .get(index)
+                .map(String::as_str)
+                .unwrap_or("");
+            crate::screens::pack::render_pack_delete_confirm(frame, area, title);
+        }
     }
 
     fn render_base(&mut self, frame: &mut Frame, area: Rect) {
@@ -1184,12 +1404,35 @@ impl App {
         }
         if let Some(state) = &self.save_load {
             let (title, footer) = save_load_copy(state);
-            render_save_load(frame, area, title, &state.slots, state.selected, footer);
+            // Save mode names exactly what Enter will write; load mode has
+            // nothing to name yet.
+            let target = match state.mode {
+                SaveLoadMode::Save => Some(format!(
+                    "저장 대상: {} · 턴 {}",
+                    self.view.story_title, self.view.status.turn
+                )),
+                SaveLoadMode::Load => None,
+            };
+            render_save_load(
+                frame,
+                area,
+                title,
+                &state.slots,
+                state.selected,
+                footer,
+                target.as_deref(),
+            );
             return;
         }
         if let Some(mode) = self.list_mode {
             if mode == ListMode::ModelPicker {
-                render_model_picker(frame, area, &self.model_items, self.model_selected);
+                render_model_picker(
+                    frame,
+                    area,
+                    &self.model_items,
+                    self.model_selected,
+                    &self.model_role_hints(),
+                );
                 return;
             }
             if mode == ListMode::ProviderPicker {
@@ -1223,6 +1466,7 @@ impl App {
                     images_enabled: settings.images_enabled,
                     image_backend: settings.image_backend.clone(),
                     theme_name: "default",
+                    returns_home: self.settings_returns_home,
                 },
             );
             return;
@@ -1242,6 +1486,9 @@ impl App {
             self.scene_image.as_ref(),
         );
         self.narration_max_scroll.set(max_scroll);
+        if self.help_visible {
+            render_help_overlay(frame, area);
+        }
     }
 
     /// Open the slot chooser after the host has read the available saves.
@@ -1444,8 +1691,9 @@ impl App {
     fn choose_home(&mut self, selection: usize) {
         match selection {
             0 => {
-                // Alternate openings gate the start: pick one first.
-                if !self.greetings.is_empty() {
+                // Alternate openings gate the start — but with a single
+                // option there is nothing to choose; skip the modal.
+                if self.greetings.len() > 1 {
                     self.open_greeting_picker();
                     return;
                 }
@@ -1467,12 +1715,12 @@ impl App {
                 self.settings_returns_home = true;
             }
             3 => self.open_import_dialog(),
-            4 => self.should_quit = true,
-            5 => {
+            4 => {
                 // The picker overlays the home menu, which stays visible
                 // underneath.
                 self.home_request = Some(HomeRequest::PickPack);
             }
+            5 => self.should_quit = true,
             _ => {}
         }
     }
@@ -1573,15 +1821,15 @@ fn save_load_copy(state: &SaveLoadState) -> (&'static str, &'static str) {
     match (state.mode, state.overwrite_confirmation) {
         (SaveLoadMode::Save, true) => (
             "저장 / 덮어쓰기 확인",
-            "Enter 한 번 더: 덮어쓰기 · Esc 취소 · S 저장 · L 불러오기",
+            "Enter 한 번 더: 덮어쓰기 · Esc 취소",
         ),
         (SaveLoadMode::Save, false) => (
             "수동 저장",
-            "↑↓ 이동 · Enter 저장 · S 저장 · L 불러오기 · Esc 닫기",
+            "↑↓ 이동 · Enter 저장 · S/L 화면 전환 · Esc 닫기",
         ),
         (SaveLoadMode::Load, _) => (
             "저장 불러오기",
-            "↑↓ 이동 · Enter 불러오기 · S 저장 · L 불러오기 · Esc 닫기",
+            "↑↓ 이동 · Enter 불러오기 · S/L 화면 전환 · Esc 닫기",
         ),
     }
 }
@@ -2299,16 +2547,18 @@ mod tests {
         app.take_import_request(); // stay None
         let _ = app.take_import_request();
 
-        // Paste lands in the path buffer too.
+        // Paste lands in the path buffer too — the reopened dialog starts
+        // from the last import directory ("sto/"), so the paste completes
+        // the file name instead of retyping the folder.
         app.open_import_dialog();
-        app.handle_paste("/tmp/card.png");
+        app.handle_paste("card.png");
         assert_eq!(
             app.take_import_request(),
             None,
             "paste alone does not submit"
         );
         app.handle_key(key(KeyCode::Enter), None);
-        assert_eq!(app.take_import_request().as_deref(), Some("/tmp/card.png"));
+        assert_eq!(app.take_import_request().as_deref(), Some("sto/card.png"));
     }
 
     #[test]
@@ -2373,13 +2623,16 @@ mod tests {
         let mut app = App::new(sample_view(0));
         app.show_home();
         app.set_current_pack_dir("stories/rainy-reunion");
-        // Home row 5 ("팩 선택") requests the host to scan + open the picker.
-        app.choose_home(5);
+        // Home row 4 ("팩 선택") requests the host to scan + open the picker;
+        // row 5 is the exit, kept last.
+        app.choose_home(4);
         assert_eq!(
             app.take_home_request(),
             Some(HomeRequest::PickPack),
-            "row 5 asks the host for a pack scan"
+            "row 4 asks the host for a pack scan"
         );
+        app.choose_home(5);
+        assert!(app.should_quit, "row 5 is 종료");
         // Host path: scan results come back through open_pack_picker.
         app.open_pack_picker(
             vec![
@@ -2534,5 +2787,114 @@ mod tests {
             app.take_home_request(),
             Some(HomeRequest::StartNew)
         ));
+    }
+
+    #[test]
+    fn tab_opens_browser_and_esc_restores_typed_buffer() {
+        let mut app = App::new(sample_view(0));
+        app.open_import_dialog();
+        app.handle_paste("/tmp/my-card");
+        app.handle_key(key(KeyCode::Tab), None);
+
+        assert_eq!(app.take_browse_request().as_deref(), Some(""));
+        assert!(app.take_browse_request().is_none(), "consumed once");
+
+        // The host answers the listing; Esc goes back to path entry with
+        // the typed text intact.
+        app.open_file_browser(
+            "/tmp",
+            vec![("dir".to_string(), true), ("card.charx".to_string(), false)],
+        );
+        app.handle_key(key(KeyCode::Esc), None);
+        if let Some(ImportDialog::Input { buffer }) = &app.import_dialog {
+            assert_eq!(buffer.text(), "/tmp/my-card");
+        } else {
+            panic!("expected Input mode after Esc");
+        }
+    }
+
+    #[test]
+    fn browser_enter_on_dir_requests_listing_and_on_file_submits_import() {
+        let mut app = App::new(sample_view(0));
+        app.open_import_dialog();
+        app.handle_key(key(KeyCode::Tab), None);
+        app.open_file_browser(
+            "/tmp/cards",
+            vec![("sub".to_string(), true), ("a.charx".to_string(), false)],
+        );
+
+        app.handle_key(key(KeyCode::Enter), None);
+        assert_eq!(app.take_browse_request().as_deref(), Some("/tmp/cards/sub"));
+
+        // Descend and come back, then pick the card file.
+        app.open_file_browser(
+            "/tmp/cards",
+            vec![("sub".to_string(), true), ("a.charx".to_string(), false)],
+        );
+        app.handle_key(key(KeyCode::Down), None);
+        app.handle_key(key(KeyCode::Enter), None);
+        assert!(app.take_browse_request().is_none(), "no listing request");
+        assert_eq!(
+            app.take_import_request().as_deref(),
+            Some("/tmp/cards/a.charx")
+        );
+        assert!(matches!(
+            app.import_dialog,
+            Some(ImportDialog::Running { .. })
+        ));
+    }
+
+    #[test]
+    fn browser_backspace_requests_parent_directory() {
+        let mut app = App::new(sample_view(0));
+        app.open_import_dialog();
+        app.handle_key(key(KeyCode::Tab), None);
+        app.open_file_browser("/tmp/cards", Vec::new());
+
+        app.handle_key(key(KeyCode::Backspace), None);
+        assert_eq!(app.take_browse_request().as_deref(), Some("/tmp"));
+    }
+
+    #[test]
+    fn picker_delete_requests_confirm_only_for_non_active_packs() {
+        let mut app = App::new(sample_view(0));
+        app.set_current_pack_dir("stories/alpha");
+        app.open_pack_picker(
+            vec!["stories/alpha".to_string(), "stories/beta".to_string()],
+            vec!["알파 · ko-KR".to_string(), "베타 · ko-KR".to_string()],
+            "stories/alpha",
+        );
+        // Cursor starts on the active pack (alpha): d is a no-op.
+        app.handle_key(key(KeyCode::Char('d')), None);
+        assert!(app.pack_delete_confirm.is_none(), "active pack protected");
+
+        app.handle_key(key(KeyCode::Down), None);
+        app.handle_key(key(KeyCode::Char('d')), None);
+        assert_eq!(app.pack_delete_confirm, Some(1), "confirm opens for beta");
+    }
+
+    #[test]
+    fn delete_confirm_enter_requests_deletion_and_esc_cancels() {
+        let mut app = App::new(sample_view(0));
+        app.set_current_pack_dir("stories/alpha");
+        app.open_pack_picker(
+            vec!["stories/alpha".to_string(), "stories/beta".to_string()],
+            vec!["알파".to_string(), "베타".to_string()],
+            "stories/alpha",
+        );
+        app.handle_key(key(KeyCode::Down), None);
+        app.handle_key(key(KeyCode::Char('d')), None);
+
+        app.handle_key(key(KeyCode::Esc), None);
+        assert!(app.pack_delete_confirm.is_none(), "esc cancels");
+        assert!(app.take_pack_delete_request().is_none());
+
+        app.handle_key(key(KeyCode::Char('d')), None);
+        app.handle_key(key(KeyCode::Enter), None);
+        assert_eq!(
+            app.take_pack_delete_request().as_deref(),
+            Some("stories/beta")
+        );
+        assert!(app.pack_picker.is_none(), "picker closed while host works");
     }
 }

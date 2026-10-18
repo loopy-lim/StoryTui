@@ -33,6 +33,7 @@ fn render_to_string(slots: &[SlotMeta], selected: usize, w: u16, h: u16) -> Stri
                 slots,
                 selected,
                 "↑↓ 이동 · Enter 불러오기 · Del 삭제 · Esc 닫기",
+                None,
             );
         })
         .expect("draw");

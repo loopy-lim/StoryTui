@@ -3,14 +3,16 @@
 //! own opening.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+
+use super::popup::{POPUP_WIDTH_NARROW, centered_rect};
 
 /// Draw the modal listing `options` with `selected` highlighted.
 pub fn render_greeting_picker(frame: &mut Frame, area: Rect, options: &[String], selected: usize) {
-    let popup = centered_rect(area, 60, options.len() as u16 + 6);
+    let popup = centered_rect(area, POPUP_WIDTH_NARROW, options.len() as u16 + 6);
     frame.render_widget(Clear, popup);
 
     let active = selected.min(options.len().saturating_sub(1));
@@ -38,31 +40,12 @@ pub fn render_greeting_picker(frame: &mut Frame, area: Rect, options: &[String],
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::LightCyan))
         .title("오프닝 선택");
-    frame.render_widget(Paragraph::new(lines).block(block), popup);
-}
-
-/// A centered rect of at most `width`×`height`, clamped to `area`.
-fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
-    let width = width.min(area.width);
-    let height = height.min(area.height);
-    let horizontal = Layout::horizontal([
-        Constraint::Fill(1),
-        Constraint::Length(width),
-        Constraint::Fill(1),
-    ])
-    .split(area);
-    let vertical = Layout::vertical([
-        Constraint::Fill(1),
-        Constraint::Length(height),
-        Constraint::Fill(1),
-    ])
-    .split(area);
-    Rect {
-        x: horizontal[1].x,
-        y: vertical[1].y,
-        width: horizontal[1].width,
-        height: vertical[1].height,
-    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
 }
 
 #[cfg(test)]

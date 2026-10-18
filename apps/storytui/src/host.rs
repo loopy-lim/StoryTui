@@ -797,6 +797,46 @@ async fn handle_ui_requests(
             resume_engine,
         );
     }
+    if let Some(request) = app.take_browse_request() {
+        // ADR-003: the host owns all file I/O. Like the pack scan, a local
+        // read_dir is fast enough to run inline in the event loop. An empty
+        // request asks for the start directory (HOME, falling back to `.`).
+        let target = if request.is_empty() {
+            std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .filter(|path| path.is_dir())
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+        } else {
+            std::path::PathBuf::from(request)
+        };
+        let entries: Vec<(String, bool)> = packs::list_dir_for_browse(&target)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entry| (entry.name, entry.is_dir))
+            .collect();
+        app.open_file_browser(&target.display().to_string(), entries);
+    }
+    if let Some(dir) = app.take_pack_delete_request() {
+        // Guarded in packs::delete_pack; the picker reopens with the
+        // remaining packs either way.
+        let current = app.current_pack_dir().to_string();
+        let current_path = std::path::Path::new(&current);
+        let scan_root = current_path
+            .parent()
+            .map(|parent| parent.to_path_buf())
+            .unwrap_or_else(|| current_path.to_path_buf());
+        let outcome = packs::delete_pack(std::path::Path::new(&dir), &scan_root, current_path);
+        if let Err(error) = &outcome {
+            app.set_home_status(Some((error.clone(), true)));
+        }
+        let entries = packs::scan_packs(current_path);
+        let dirs: Vec<String> = entries.iter().map(|e| e.dir.clone()).collect();
+        let labels: Vec<String> = entries
+            .iter()
+            .map(|e| format!("{} · {}", e.title, e.language))
+            .collect();
+        app.open_pack_picker(dirs, labels, &current);
+    }
     if let Some(request) = app.take_save_load_request() {
         saves::handle_request(
             request,

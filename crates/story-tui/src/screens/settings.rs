@@ -18,8 +18,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use story_model::{ProviderConfigSafe, ProviderHealth};
 
-use crate::screens::keymap::keymap_lines;
+use crate::screens::keymap::keymap_lines_two_columns;
 use crate::screens::model_display_label;
+use crate::screens::popup::render_min_size_warning;
 
 /// Minimum supported terminal size for the Settings screen.
 pub const MIN_WIDTH: u16 = 80;
@@ -76,12 +77,16 @@ pub struct SettingsView<'a> {
     pub image_backend: Option<String>,
     /// Theme name placeholder (no theme switcher yet).
     pub theme_name: &'a str,
+    /// True when Settings was opened from the start menu, so `Esc` goes back
+    /// to the menu; false means it was opened mid-game and `Esc` returns to
+    /// the story.
+    pub returns_home: bool,
 }
 
 /// Render the Settings screen.
 pub fn render_settings(frame: &mut Frame, area: Rect, view: &SettingsView<'_>) {
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
-        render_min_size_warning(frame, area);
+        render_min_size_warning(frame, area, MIN_WIDTH, MIN_HEIGHT);
         return;
     }
 
@@ -100,12 +105,12 @@ pub fn render_settings(frame: &mut Frame, area: Rect, view: &SettingsView<'_>) {
     render_provider_block(frame, chunks[1], view);
     render_health_and_sampling(frame, chunks[2], view);
     render_keymap_block(frame, chunks[3]);
-    render_footer(frame, chunks[4]);
+    render_footer(frame, chunks[4], view.returns_home);
 }
 
 fn render_title(frame: &mut Frame, area: Rect) {
     let line = Line::from(vec![Span::styled(
-        "설정 · Settings",
+        "설정",
         Style::default()
             .add_modifier(Modifier::BOLD)
             .fg(Color::Cyan),
@@ -124,7 +129,7 @@ fn render_provider_block(frame: &mut Frame, area: Rect, view: &SettingsView<'_>)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Span::styled(
-            "공급자 · Provider",
+            "공급자",
             Style::default().add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
@@ -192,7 +197,7 @@ fn render_health_and_sampling(frame: &mut Frame, area: Rect, view: &SettingsView
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Span::styled(
-            "상태 · Status",
+            "상태",
             Style::default().add_modifier(Modifier::BOLD),
         ));
     let h_inner = h_block.inner(chunks[0]);
@@ -253,7 +258,7 @@ fn render_health_and_sampling(frame: &mut Frame, area: Rect, view: &SettingsView
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Span::styled(
-            "샘플링 · Sampling",
+            "샘플링",
             Style::default().add_modifier(Modifier::BOLD),
         ));
     let s_inner = s_block.inner(chunks[1]);
@@ -294,34 +299,31 @@ fn render_keymap_block(frame: &mut Frame, area: Rect) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Span::styled(
-            "단축키 · Keymap",
+            "단축키",
             Style::default().add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    // Cap the visible rows at the available height so a too-short keymap block
-    // never overflows.
-    let lines = keymap_lines();
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    // Two balanced columns keep the full table visible on mid-size
+    // terminals; the block's height cap already guards tiny ones.
+    let (left, right) = keymap_lines_two_columns();
+    let columns =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(inner);
+    frame.render_widget(Paragraph::new(left).wrap(Wrap { trim: false }), columns[0]);
+    frame.render_widget(Paragraph::new(right).wrap(Wrap { trim: false }), columns[1]);
 }
 
-fn render_footer(frame: &mut Frame, area: Rect) {
+fn render_footer(frame: &mut Frame, area: Rect, returns_home: bool) {
+    let esc_hint = if returns_home {
+        "Esc 시작 메뉴"
+    } else {
+        "Esc 게임으로"
+    };
     let para = Paragraph::new(Line::from(Span::styled(
-        "P 모델 · E 프로바이더 · Esc 시작 메뉴 · q 종료",
+        format!("P 모델 · E 프로바이더 · {esc_hint} · q 종료"),
         Style::default().fg(Color::DarkGray),
     )))
     .alignment(Alignment::Center);
-    frame.render_widget(para, area);
-}
-
-fn render_min_size_warning(frame: &mut Frame, area: Rect) {
-    let msg = format!(
-        "터미널이 너무 작습니다 (최소 {MIN_WIDTH}x{MIN_HEIGHT}, 현재 {}x{})",
-        area.width, area.height
-    );
-    let para = Paragraph::new(Line::from(msg))
-        .alignment(Alignment::Center)
-        .style(Style::default().fg(Color::Yellow));
     frame.render_widget(para, area);
 }
 
@@ -369,6 +371,7 @@ mod tests {
             images_enabled: true,
             image_backend: Some("kitty".to_string()),
             theme_name: "default",
+            returns_home: false,
         };
         // Touch every field to ensure renaming/removal is intentional.
         let _ = (
@@ -382,6 +385,7 @@ mod tests {
             v.tts_backend,
             v.tts_voice,
             v.theme_name,
+            v.returns_home,
         );
     }
 }

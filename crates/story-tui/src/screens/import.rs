@@ -2,15 +2,23 @@
 //! over whatever screen is underneath (normally the home menu).
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+
+use super::popup::{POPUP_WIDTH_WIDE, centered_rect};
 
 /// Per-frame dialog state as plain display data.
 pub enum ImportDialogView<'a> {
     /// Path input; the cursor cell renders reversed.
     Input { before: &'a str, after: &'a str },
+    /// Browsing directories; `entries` pairs a name with `is_dir`.
+    Browse {
+        dir: &'a str,
+        entries: &'a [(String, bool)],
+        selected: usize,
+    },
     /// The host is running the import.
     Running { path: &'a str },
     /// Finished; `ready` marks a loadable pack.
@@ -21,17 +29,15 @@ pub enum ImportDialogView<'a> {
     },
 }
 
-/// Draw the modal centered over `area`.
+/// Draw the modal centered over `area`, sized to its content so a one-line
+/// report never floats in an empty box.
 pub fn render_import_dialog(frame: &mut Frame, area: Rect, view: ImportDialogView<'_>) {
-    let popup = centered_rect(area, 72, 18);
-    frame.render_widget(Clear, popup);
-
     let (title, mut body, footer) = match view {
         ImportDialogView::Input { before, after } => (
             "카드 가져오기",
             vec![
-                Line::from("캐릭터 카드(PNG/JSON) 파일 경로를 입력하세요."),
-                Line::from("옵션은 CLI를 사용하세요: storytui import --help"),
+                Line::from("카드 파일을 경로로 입력하거나, Tab으로 파일 브라우저를 여세요."),
+                Line::from("지원 형식: PNG/JSON/CHARX · 옵션은 CLI: storytui import --help"),
                 Line::from(""),
                 Line::from(vec![
                     Span::raw("> "),
@@ -45,8 +51,65 @@ pub fn render_import_dialog(frame: &mut Frame, area: Rect, view: ImportDialogVie
                     Span::raw(after),
                 ]),
             ],
-            "Enter 임포트 · Esc 취소",
+            "Enter 임포트 · Tab 파일 브라우저 · Esc 취소",
         ),
+        ImportDialogView::Browse {
+            dir,
+            entries,
+            selected,
+        } => {
+            // Sliding window: the modal fits ~12 rows of entries; keep the
+            // selection inside it so long listings never lose the cursor.
+            const VISIBLE_ROWS: usize = 12;
+            let active = selected.min(entries.len().saturating_sub(1));
+            let window_start = active.saturating_sub(VISIBLE_ROWS.saturating_sub(1));
+            let window_end = (window_start + VISIBLE_ROWS).min(entries.len());
+            let mut body = vec![
+                Line::from(Span::styled(dir, Style::default().fg(Color::DarkGray))),
+                Line::from(""),
+            ];
+            if entries.is_empty() {
+                body.push(Line::from(Span::styled(
+                    "표시할 항목이 없습니다 (읽기 실패했을 수 있습니다).",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            } else {
+                for (index, (name, is_dir)) in entries[window_start..window_end].iter().enumerate()
+                {
+                    let index = index + window_start;
+                    let label = if *is_dir {
+                        format!("{name}/")
+                    } else {
+                        name.clone()
+                    };
+                    if index == active {
+                        body.push(Line::from(Span::styled(
+                            format!("▶ {label}"),
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD)
+                                .add_modifier(Modifier::REVERSED),
+                        )));
+                    } else {
+                        body.push(Line::from(Span::styled(
+                            format!("  {label}"),
+                            Style::default().fg(Color::Gray),
+                        )));
+                    }
+                }
+                if entries.len() > VISIBLE_ROWS {
+                    body.push(Line::from(Span::styled(
+                        format!("전체 {}개 항목", entries.len()),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+            }
+            (
+                "카드 가져오기 — 파일 브라우저",
+                body,
+                "Enter 폴더 열기/카드 선택 · Backspace 상위 · Tab 경로 입력 · Esc 취소",
+            )
+        }
         ImportDialogView::Running { path } => (
             "카드 가져오기",
             vec![
@@ -88,6 +151,9 @@ pub fn render_import_dialog(frame: &mut Frame, area: Rect, view: ImportDialogVie
         Style::default().fg(Color::DarkGray),
     )));
 
+    let height = (body.len() as u16 + 2).clamp(7, area.height.max(7));
+    let popup = centered_rect(area, POPUP_WIDTH_WIDE, height);
+    frame.render_widget(Clear, popup);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::LightCyan))
@@ -98,30 +164,6 @@ pub fn render_import_dialog(frame: &mut Frame, area: Rect, view: ImportDialogVie
             .wrap(ratatui::widgets::Wrap { trim: false }),
         popup,
     );
-}
-
-/// A centered rect of at most `width`×`height`, clamped to `area`.
-fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
-    let width = width.min(area.width);
-    let height = height.min(area.height);
-    let horizontal = Layout::horizontal([
-        Constraint::Fill(1),
-        Constraint::Length(width),
-        Constraint::Fill(1),
-    ])
-    .split(area);
-    let vertical = Layout::vertical([
-        Constraint::Fill(1),
-        Constraint::Length(height),
-        Constraint::Fill(1),
-    ])
-    .split(area);
-    Rect {
-        x: horizontal[1].x,
-        y: vertical[1].y,
-        width: horizontal[1].width,
-        height: vertical[1].height,
-    }
 }
 
 #[cfg(test)]
@@ -165,6 +207,31 @@ mod tests {
         assert!(out.contains("카드 가져오기"));
         assert!(out.contains("> stories/"));
         assert!(out.contains("Enter 임포트"));
+    }
+
+    #[test]
+    fn browse_view_lists_entries_with_hints() {
+        let entries = vec![("sub".to_string(), true), ("card.charx".to_string(), false)];
+        let out = draw(ImportDialogView::Browse {
+            dir: "/tmp/cards",
+            entries: &entries,
+            selected: 0,
+        });
+        assert!(out.contains("파일 브라우저"), "{out}");
+        assert!(out.contains("/tmp/cards"), "{out}");
+        assert!(out.contains("sub/"), "{out}");
+        assert!(out.contains("card.charx"), "{out}");
+        assert!(out.contains("Tab 경로 입력"), "{out}");
+    }
+
+    #[test]
+    fn browse_view_explains_empty_listings() {
+        let out = draw(ImportDialogView::Browse {
+            dir: "/empty",
+            entries: &[],
+            selected: 0,
+        });
+        assert!(out.contains("표시할 항목이 없습니다"), "{out}");
     }
 
     #[test]

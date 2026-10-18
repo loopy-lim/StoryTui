@@ -1,5 +1,6 @@
 ---
 source: crates/story-tui/tests/snapshots.rs
+assertion_line: 152
 expression: "render_to_string_with_scroll(view, 80, 24, 12)"
 ---
 비가 그친 뒤 · chapter-1 · 카페 나무 · 저녁
@@ -25,4 +26,4 @@ expression: "render_to_string_with_scroll(view, 80, 24, 12)"
 └──────────────────────────────────────────────────────────────────────────────┘
 ────────────────────────────────────────────────────────────────────────────────
 애정:3  신뢰:1  긴장:8  턴: 1
-[R] 선택지 다시 만들기  [Home] 홈  [O] 설정  [S] 저장  [L] 불러오기
+[I] 직접 입력  [S] 저장  [L] 불러오기  [Home] 홈  [O] 설정  [?] 도움말

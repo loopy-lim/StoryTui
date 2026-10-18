@@ -96,6 +96,7 @@ fn snapshot_settings_loopback_ready() {
         images_enabled: true,
         image_backend: Some("kitty".to_string()),
         theme_name: "default",
+        returns_home: false,
     };
     let out = render_to_string(view, 80, 24);
     insta::assert_snapshot!("settings_loopback_ready", out);
@@ -116,6 +117,7 @@ fn snapshot_settings_non_loopback_warning() {
         images_enabled: false,
         image_backend: None,
         theme_name: "default",
+        returns_home: false,
     };
     let out = render_to_string(view, 80, 24);
     insta::assert_snapshot!("settings_non_loopback_warning", out);
@@ -141,6 +143,7 @@ fn settings_below_min_size_renders_warning() {
         images_enabled: true,
         image_backend: Some("kitty".to_string()),
         theme_name: "default",
+        returns_home: false,
     };
     let out = render_to_string(view, MIN_WIDTH - 1, MIN_HEIGHT - 1);
     assert!(
@@ -182,6 +185,7 @@ fn settings_masked_secret_never_renders() {
         images_enabled: true,
         image_backend: Some("kitty".to_string()),
         theme_name: "default",
+        returns_home: false,
     };
     let out = render_to_string(view, 80, 24);
     assert!(

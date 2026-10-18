@@ -16,6 +16,8 @@ pub fn render_home(
     can_continue: bool,
     status: Option<(&str, bool)>,
 ) {
+    // Destructive exit sits last so scanning top-to-bottom ends with the
+    // content rows, not the exit.
     let rows = [
         ("새 게임", "새로운 이야기로 시작합니다.", true),
         ("이어하기", "자동 저장된 이야기를 이어갑니다.", can_continue),
@@ -25,8 +27,8 @@ pub fn render_home(
             "캐릭터 카드를 이 팩 목록에 임포트합니다.",
             true,
         ),
-        ("종료", "StoryTUI를 종료합니다.", true),
         ("팩 선택", "이 목록의 다른 스토리 팩을 불러옵니다.", true),
+        ("종료", "StoryTUI를 종료합니다.", true),
     ];
     let content = Layout::vertical([
         Constraint::Fill(1),

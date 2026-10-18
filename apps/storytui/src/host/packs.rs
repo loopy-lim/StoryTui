@@ -105,6 +105,80 @@ fn pack_entry(current_pack_dir: &Path) -> PackEntry {
     }
 }
 
+/// One row of the import file browser: a directory, or a card file whose
+/// extension the importer accepts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowseEntry {
+    pub name: String,
+    pub is_dir: bool,
+}
+
+/// Extensions the card importer accepts (case-insensitive on the file name).
+const CARD_EXTENSIONS: &[&str] = &["png", "json", "charx"];
+
+/// List `dir` for the import file browser: directories first (sorted), then
+/// card files. Hidden (dot-prefixed) entries and files the importer cannot
+/// parse are skipped. Symlinks do not count as directories — the browser
+/// never descends through one.
+pub fn list_dir_for_browse(dir: &Path) -> Result<Vec<BrowseEntry>, String> {
+    let mut dirs: Vec<String> = Vec::new();
+    let mut cards: Vec<String> = Vec::new();
+    let entries =
+        std::fs::read_dir(dir).map_err(|error| format!("하위를 읽지 못했습니다: {error}"))?;
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        if file_type.is_dir() {
+            dirs.push(name);
+        } else if file_type.is_file() {
+            let extension = name
+                .rsplit('.')
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if CARD_EXTENSIONS.contains(&extension.as_str()) {
+                cards.push(name);
+            }
+        }
+    }
+    dirs.sort();
+    cards.sort();
+    Ok(dirs
+        .into_iter()
+        .map(|name| BrowseEntry { name, is_dir: true })
+        .chain(cards.into_iter().map(|name| BrowseEntry {
+            name,
+            is_dir: false,
+        }))
+        .collect())
+}
+
+/// Delete a pack directory. Guarded: the target must be a direct child of
+/// the scan root, hold a `story.toml`, and not be the active pack — any
+/// guard violation returns the Korean error text without touching the file
+/// system. Saves are not touched (they live in the save store).
+pub fn delete_pack(target: &Path, scan_root: &Path, active_pack_dir: &Path) -> Result<(), String> {
+    if target == active_pack_dir {
+        return Err("현재 플레이 중인 팩은 삭제할 수 없습니다.".to_string());
+    }
+    let Some(target_parent) = target.parent() else {
+        return Err("팩 경로가 올바르지 않습니다.".to_string());
+    };
+    if target_parent != scan_root {
+        return Err("팩 목록의 디렉터리만 삭제할 수 있습니다.".to_string());
+    }
+    if !target.join("story.toml").is_file() {
+        return Err("story.toml이 없는 디렉터리는 팩으로 삭제할 수 없습니다.".to_string());
+    }
+    std::fs::remove_dir_all(target)
+        .map_err(|error| format!("팩 디렉터리를 삭제하지 못했습니다: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -181,5 +255,72 @@ mod tests {
         assert_eq!(entries[0].title, "외톨이 팩");
         assert_eq!(entries[0].dir, dir.display().to_string());
         fs::remove_dir_all(dir).expect("clean test directory");
+    }
+
+    #[test]
+    fn browse_lists_dirs_first_and_filters_files() {
+        let root = test_dir("browse");
+        fs::create_dir_all(root.join("zeta-dir")).expect("dir");
+        fs::create_dir_all(root.join(".hidden-dir")).expect("hidden dir");
+        fs::write(root.join("card.CHARX"), b"x").expect("charx");
+        fs::write(root.join("notes.txt"), b"x").expect("txt");
+        fs::write(root.join(".dot.png"), b"x").expect("hidden card");
+        // A symlink must not count as a browsable directory.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("zeta-dir"), root.join("link-dir")).expect("symlink");
+
+        let entries = super::list_dir_for_browse(&root).expect("list");
+
+        #[cfg(unix)]
+        {
+            assert!(
+                !entries.iter().any(|e| e.name == "link-dir"),
+                "symlinks are not browsable dirs: {entries:?}"
+            );
+        }
+        assert_eq!(
+            entries,
+            vec![
+                super::BrowseEntry {
+                    name: "zeta-dir".to_string(),
+                    is_dir: true,
+                },
+                super::BrowseEntry {
+                    name: "card.CHARX".to_string(),
+                    is_dir: false,
+                },
+            ]
+        );
+        fs::remove_dir_all(root).expect("clean test directory");
+    }
+
+    #[test]
+    fn browse_unreadable_dir_reports_instead_of_panicking() {
+        let missing = test_dir("browse-missing").join("nope");
+        let error = super::list_dir_for_browse(&missing).unwrap_err();
+        assert!(error.contains("읽지 못했습니다"), "{error}");
+    }
+
+    #[test]
+    fn delete_pack_guards_active_root_and_manifest() {
+        let root = test_dir("delete");
+        write_pack(&root, "alpha", "A", "ko-KR");
+        write_pack(&root, "beta", "B", "ko-KR");
+        let plain = root.join("plain");
+        fs::create_dir_all(&plain).expect("plain dir");
+
+        let error =
+            super::delete_pack(&root.join("alpha"), &root, &root.join("alpha")).unwrap_err();
+        assert!(error.contains("현재 플레이 중"), "{error}");
+        let error =
+            super::delete_pack(&root, &root.join("alpha"), &root.join("alpha")).unwrap_err();
+        assert!(error.contains("팩 목록의"), "{error}");
+        let error = super::delete_pack(&plain, &root, &root.join("alpha")).unwrap_err();
+        assert!(error.contains("story.toml"), "{error}");
+
+        super::delete_pack(&root.join("beta"), &root, &root.join("alpha")).expect("delete");
+        assert!(!root.join("beta").exists(), "pack removed");
+        assert!(root.join("alpha").exists(), "active pack untouched");
+        fs::remove_dir_all(root).expect("clean test directory");
     }
 }

@@ -153,6 +153,12 @@ impl InputBuffer {
         self.graphemes.len()
     }
 
+    /// The configured grapheme ceiling — the `max` half of the on-screen
+    /// `char_count/max_chars` counter.
+    pub fn max_chars(&self) -> usize {
+        self.max_chars
+    }
+
     /// Sum of `unicode-width` per grapheme — the layout cell width the text
     /// occupies in a monospace terminal. Wide CJK syllables and emoji
     /// contribute 2; combining marks and zero-width joiners contribute 0.

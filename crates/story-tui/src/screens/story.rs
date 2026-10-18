@@ -10,7 +10,7 @@
 
 use crate::input::InputBuffer;
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
@@ -22,13 +22,13 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::SceneImage;
 
+use super::keymap::keymap_lines_two_columns;
 use super::model_display_label;
+use super::popup::{POPUP_WIDTH_WIDE, centered_rect, render_min_size_warning};
 
 /// Minimum supported terminal size for the Story screen.
 pub const MIN_WIDTH: u16 = 60;
 pub const MIN_HEIGHT: u16 = 16;
-
-const CHOICE_REFRESH_SHORTCUT: &str = "[R] 선택지 다시 만들기  ";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ListMode {
@@ -79,7 +79,49 @@ pub fn render_list(frame: &mut Frame, area: Rect, mode: ListMode, items: &[Strin
     frame.render_widget(paragraph, area);
 }
 
-pub fn render_model_picker(frame: &mut Frame, area: Rect, items: &[String], selected: usize) {
+/// Which model currently holds each generation role, for picker badges.
+///
+/// The strings are raw model ids kept ONLY for equality comparison — the
+/// picker still prints the opaque [`model_display_label`], never the id.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModelRoleHints {
+    pub base: Option<String>,
+    pub director: Option<String>,
+    pub choice: Option<String>,
+    pub writer: Option<String>,
+}
+
+impl ModelRoleHints {
+    /// The ` · 기본 · 본문` badge suffix for `model`, or an empty string.
+    fn badges_for(&self, model: &str) -> String {
+        let mut roles = Vec::new();
+        if self.base.as_deref() == Some(model) {
+            roles.push("기본");
+        }
+        if self.director.as_deref() == Some(model) {
+            roles.push("기획");
+        }
+        if self.choice.as_deref() == Some(model) {
+            roles.push("선택지");
+        }
+        if self.writer.as_deref() == Some(model) {
+            roles.push("본문");
+        }
+        if roles.is_empty() {
+            String::new()
+        } else {
+            format!("  · {}", roles.join("·"))
+        }
+    }
+}
+
+pub fn render_model_picker(
+    frame: &mut Frame,
+    area: Rect,
+    items: &[String],
+    selected: usize,
+    roles: &ModelRoleHints,
+) {
     let rows: Vec<Line> = if items.is_empty() {
         vec![Line::from("모델 목록을 불러오지 못했습니다.")]
     } else {
@@ -90,9 +132,10 @@ pub fn render_model_picker(frame: &mut Frame, area: Rect, items: &[String], sele
                 let active = index == selected.min(items.len().saturating_sub(1));
                 Line::styled(
                     format!(
-                        "{} {}",
+                        "{} {}{}",
                         if active { "▶" } else { " " },
-                        model_display_label(item)
+                        model_display_label(item),
+                        roles.badges_for(item)
                     ),
                     if active {
                         Style::default()
@@ -112,7 +155,7 @@ pub fn render_model_picker(frame: &mut Frame, area: Rect, items: &[String], sele
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::LightCyan))
-                .title("모델 선택 · ↑↓ 이동 · Enter 기본 · D 기획 · C 선택지 · W 본문 · R 새로고침 · Esc 닫기"),
+                .title("모델 선택 · ↑↓ 이동 · Enter 기본 · D 기획 · C 선택지 · W 본문 (연속 지정) · R 새로고침 · Esc 닫기"),
         )
         .wrap(Wrap { trim: false });
     frame.render_widget(Clear, area);
@@ -187,7 +230,7 @@ pub fn render_story(
     scene_image: Option<&SceneImage>,
 ) -> u16 {
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
-        render_min_size_warning(frame, area);
+        render_min_size_warning(frame, area, MIN_WIDTH, MIN_HEIGHT);
         return 0;
     }
 
@@ -242,14 +285,19 @@ pub fn render_story(
     };
     // Scene image column: when the pack ships an image for the current
     // location/character and the terminal is wide enough, the narration text
-    // shrinks to keep a readable minimum column.
+    // shrinks to keep a readable minimum column. One blank gutter column
+    // keeps wrapped prose from touching the image pixels.
     let (narration_region, image_region): (Rect, Option<Rect>) = if let Some(image) = scene_image
-        && image.fits_beside_narration(chunks[0].width)
+        && image.fits_beside_narration(chunks[0].width.saturating_sub(1))
         && chunks[0].height >= 4
     {
-        let split = Layout::horizontal([Constraint::Fill(1), Constraint::Length(image.cols)])
-            .split(chunks[0]);
-        (split[0], Some(split[1]))
+        let split = Layout::horizontal([
+            Constraint::Fill(1),
+            Constraint::Length(1),
+            Constraint::Length(image.cols),
+        ])
+        .split(chunks[0]);
+        (split[0], Some(split[2]))
     } else {
         (chunks[0], None)
     };
@@ -258,8 +306,14 @@ pub fn render_story(
     {
         frame.render_widget(Image::new(&image.protocol), region);
     }
-    let needs_scrollbar = wrapped_line_count(&narration_text, narration_region.width)
-        > narration_region.height as usize;
+    // Decide the scrollbar against the width the text occupies *with* the
+    // scrollbar present, so the one-column reservation cannot flip the
+    // decision it feeds. When it fits at the narrower width it also fits at
+    // the wider one, so the choice stays stable frame to frame.
+    let needs_scrollbar = wrapped_line_count(
+        &narration_text,
+        narration_region.width.saturating_sub(1).max(1),
+    ) > narration_region.height as usize;
     let narration_chunks = if needs_scrollbar {
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(1)]).split(narration_region)
     } else {
@@ -304,9 +358,9 @@ pub fn render_story(
     );
     if input_mode {
         render_input_panel(frame, chunks[2], input);
-        render_status_panel(frame, chunks[3], view);
+        render_status_panel(frame, chunks[3], view, true);
     } else {
-        render_status_panel(frame, chunks[2], view);
+        render_status_panel(frame, chunks[2], view, false);
     }
 
     // Overlays on top.
@@ -367,9 +421,10 @@ pub fn choice_index_at(
     None
 }
 
-/// Whether a click lands on the visible `[Home] 홈` shortcut in the status
-/// panel. Keeping the hit test beside the renderer prevents the label from
-/// becoming a keyboard-only affordance.
+/// Whether a click lands on the visible `[Home] 홈` segment of the shortcut
+/// footer. Keeping the hit test beside the renderer — both resolve the same
+/// [`active_footer_segments`] layout — prevents the label from becoming a
+/// keyboard-only affordance.
 pub fn home_shortcut_at(
     area: Rect,
     view: &AppViewModel,
@@ -404,21 +459,99 @@ pub fn home_shortcut_at(
         ])
         .split(body)[2]
     };
-    let shortcut = "[Home] 홈";
-    let start = area
-        .x
-        .saturating_add(CHOICE_REFRESH_SHORTCUT.width() as u16);
-    row == status_area.y.saturating_add(2)
-        && column >= start
-        && column < start.saturating_add(shortcut.width() as u16)
+    if row != status_area.y.saturating_add(2) {
+        return false;
+    }
+    let mut cursor = area.x;
+    for (key, label) in active_footer_segments(view, input_mode, area.width) {
+        let seg_width = (key.width() + label.width()) as u16;
+        if key == "[Home]" && column >= cursor && column < cursor.saturating_add(seg_width) {
+            return true;
+        }
+        cursor = cursor.saturating_add(seg_width + FOOTER_SEPARATOR.width() as u16);
+    }
+    false
 }
 
+/// Count the visual lines `text` occupies when word-wrapped at `width`
+/// columns.
+///
+/// ratatui's `WordWrapper` moves a word that does not fit onto the next
+/// visual line, hard-breaking only when a single word is wider than the
+/// area. A per-line `width().div_ceil()` undercounts wrapped prose — which
+/// used to leave both the scrollbar geometry and the auto-scroll bottom short
+/// of the real content end. The greedy simulation below matches the wrapper
+/// for space-separated Korean prose; only a trailing-whitespace edge can
+/// differ by one line, which the scroll clamp absorbs.
 fn wrapped_line_count(text: &Text<'_>, width: u16) -> usize {
     let width = width.max(1) as usize;
     text.lines
         .iter()
-        .map(|line| line.width().max(1).div_ceil(width))
+        .map(|line| {
+            // Lines that already fit need no simulation — skip the allocation.
+            if line.width() <= width {
+                1
+            } else {
+                greedy_wrap_count(&line.to_string(), width)
+            }
+        })
         .sum()
+}
+
+/// Visual line count for one logical line under greedy word wrap at `width`.
+fn greedy_wrap_count(line: &str, width: usize) -> usize {
+    if line.width() <= width {
+        return 1;
+    }
+    let mut lines = 0usize;
+    let mut current = 0usize; // display width of the visual line being filled
+    let mut current_counted = false; // whether `current`'s line is in `lines`
+    for word in line.split(' ') {
+        let word_width = word.width();
+        if word_width == 0 {
+            continue;
+        }
+        if word_width > width {
+            // One run wider than the area: hard-break char by char — 2-wide
+            // Hangul rarely divides the width evenly — exactly as the
+            // wrapper does.
+            if current > 0 && !current_counted {
+                lines += 1;
+            }
+            let mut fill = 0usize;
+            let mut word_lines = 1usize;
+            for ch in word.chars() {
+                let char_width = ch.to_string().width();
+                if fill + char_width > width {
+                    word_lines += 1;
+                    fill = 0;
+                }
+                fill += char_width;
+            }
+            lines += word_lines;
+            current = fill;
+            current_counted = true;
+            continue;
+        }
+        let joined = if current == 0 {
+            word_width
+        } else {
+            current + 1 + word_width
+        };
+        if joined <= width {
+            current = joined;
+            continue;
+        }
+        if current > 0 && !current_counted {
+            lines += 1;
+        }
+        current = word_width;
+        current_counted = false;
+    }
+    if current > 0 && !current_counted {
+        lines += 1;
+    }
+    lines.max(1)
 }
 
 /// Render a wall-clock duration (seconds) as a compact Korean label:
@@ -796,11 +929,89 @@ fn render_choice_panel(
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
+/// Separator between footer segments.
+const FOOTER_SEPARATOR: &str = "  ";
+
+/// One shortcut footer segment: the bracketed key and its Korean label
+/// (leading space included).
+type FooterSegment = (&'static str, &'static str);
+
+/// The shortcut footer segments that render at `width`.
+///
+/// The footer advertises the keys the story screen actually binds — not just
+/// the five it used to show. Segments are dropped by tier as the terminal
+/// narrows so the line never overflows: tier 2 (`[R]`/`[H]`/`[M]` detail)
+/// first, then `[O]`; the core (`[I]`/`[S]`/`[L]`/`[Home]`/`[?]`) survives
+/// at the minimum width. While typing, the footer swaps to the input
+/// panel's keys.
+fn active_footer_segments(view: &AppViewModel, input_mode: bool, width: u16) -> Vec<FooterSegment> {
+    if input_mode {
+        return vec![("[Enter]", " 전송"), ("[Esc]", " 취소")];
+    }
+    let has_choices = !view.choices.is_empty();
+    // (visible, key, label, tier) — tier 2 shows only at the widest step.
+    let candidates: [(bool, &'static str, &'static str, u8); 9] = [
+        (has_choices, "[R]", " 선택지 다시 만들기", 2),
+        (has_choices, "[I]", " 직접 입력", 0),
+        (true, "[H]", " 기록", 2),
+        (true, "[M]", " 기억", 2),
+        (true, "[S]", " 저장", 0),
+        (true, "[L]", " 불러오기", 0),
+        (view.status.turn > 0, "[Home]", " 홈", 0),
+        (true, "[O]", " 설정", 1),
+        (true, "[?]", " 도움말", 0),
+    ];
+    for tier in [2u8, 1, 0] {
+        let active: Vec<FooterSegment> = candidates
+            .iter()
+            .filter(|(visible, _, _, segment_tier)| *visible && *segment_tier <= tier)
+            .map(|&(_, key, label, _)| (key, label))
+            .collect();
+        let total: usize = active
+            .iter()
+            .map(|(key, label)| key.width() + label.width())
+            .sum::<usize>()
+            + FOOTER_SEPARATOR.width() * active.len().saturating_sub(1);
+        if total <= width as usize {
+            return active;
+        }
+    }
+    // Even the core set does not fit: help is the one affordance that
+    // survives at any width.
+    vec![("[?]", " 도움말")]
+}
+
+/// Build the footer line as styled spans: the bracketed key in cyan, the
+/// label in dim gray.
+fn footer_spans(view: &AppViewModel, input_mode: bool, width: u16) -> Vec<Span<'static>> {
+    let key_style = Style::default().fg(Color::LightCyan);
+    let label_style = Style::default().fg(Color::DarkGray);
+    let mut spans = Vec::new();
+    for (index, (key, label)) in active_footer_segments(view, input_mode, width)
+        .into_iter()
+        .enumerate()
+    {
+        if index > 0 {
+            spans.push(Span::styled(FOOTER_SEPARATOR, label_style));
+        }
+        spans.push(Span::styled(key.to_string(), key_style));
+        spans.push(Span::styled(label.to_string(), label_style));
+    }
+    spans
+}
+
 fn render_input_panel(frame: &mut Frame, area: Rect, input: &InputBuffer) {
+    // The grapheme counter stays visible so long pastes never surprise the
+    // player with silent truncation.
+    let title = format!(
+        "직접 입력 ({}/{}) · Enter 전송 · Esc 취소",
+        input.char_count(),
+        input.max_chars()
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::LightCyan))
-        .title("직접 입력 · Enter 전송 · Esc 취소");
+        .title(title);
     let (before, after) = input.split_at_cursor();
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -814,11 +1025,14 @@ fn render_input_panel(frame: &mut Frame, area: Rect, input: &InputBuffer) {
     );
 }
 
-fn render_status_panel(frame: &mut Frame, area: Rect, view: &AppViewModel) {
+fn render_status_panel(frame: &mut Frame, area: Rect, view: &AppViewModel, input_mode: bool) {
     let block = Block::default()
         .borders(Borders::TOP)
         .border_style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(Paragraph::new(status_lines(view)).block(block), area);
+    frame.render_widget(
+        Paragraph::new(status_lines(view, area.width, input_mode)).block(block),
+        area,
+    );
 }
 
 fn choice_lines(
@@ -915,26 +1129,31 @@ fn append_wrapped_word(
     }
 }
 
-fn status_lines(view: &AppViewModel) -> Vec<Line<'static>> {
+fn status_lines(view: &AppViewModel, width: u16, input_mode: bool) -> Vec<Line<'static>> {
     let values = Line::from(status_values_prefix(view));
+    if input_mode {
+        return vec![values, Line::from(footer_spans(view, true, width))];
+    }
     if view.status.turn == 0 && view.choices.is_empty() && view.loading.is_none() {
+        // First screen: the one action that starts the story, plus where to
+        // find the rest of the keys.
         vec![
             values,
-            Line::from(Span::styled(
-                "[N] 게임 시작",
-                Style::default()
-                    .fg(Color::LightCyan)
-                    .add_modifier(Modifier::BOLD),
-            )),
+            Line::from(vec![
+                Span::styled(
+                    "[N]",
+                    Style::default()
+                        .fg(Color::LightCyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" 게임 시작", Style::default().fg(Color::DarkGray)),
+                Span::styled(FOOTER_SEPARATOR, Style::default().fg(Color::DarkGray)),
+                Span::styled("[?]", Style::default().fg(Color::LightCyan)),
+                Span::styled(" 도움말", Style::default().fg(Color::DarkGray)),
+            ]),
         ]
     } else if view.loading.is_none() && view.error.is_none() {
-        vec![
-            values,
-            Line::from(Span::styled(
-                format!("{CHOICE_REFRESH_SHORTCUT}[Home] 홈  [O] 설정  [S] 저장  [L] 불러오기"),
-                Style::default().fg(Color::DarkGray),
-            )),
-        ]
+        vec![values, Line::from(footer_spans(view, false, width))]
     } else {
         vec![values]
     }
@@ -987,33 +1206,22 @@ fn render_error_overlay(frame: &mut Frame, area: Rect, err: &story_model::Domain
     frame.render_widget(para, centered);
 }
 
-fn render_min_size_warning(frame: &mut Frame, area: Rect) {
-    let msg = format!(
-        "터미널이 너무 작습니다 (최소 {MIN_WIDTH}x{MIN_HEIGHT}, 현재 {}x{})",
-        area.width, area.height
-    );
-    let para = Paragraph::new(Line::from(msg))
-        .alignment(Alignment::Center)
-        .style(Style::default().fg(Color::Yellow));
-    frame.render_widget(para, area);
-}
-
-/// Center a `w`×`h` rect inside `area`.
-fn centered_rect(area: Rect, w: u16, h: u16) -> Rect {
-    let pop = Layout::vertical([
-        Constraint::Length((area.height.saturating_sub(h)) / 2),
-        Constraint::Length(h),
-        Constraint::Min(0),
-    ])
-    .split(area);
-    let mid = pop[1];
-    let horiz = Layout::horizontal([
-        Constraint::Length((area.width.saturating_sub(w)) / 2),
-        Constraint::Length(w),
-        Constraint::Min(0),
-    ])
-    .split(mid);
-    horiz[1]
+/// The `?` help overlay: the full keymap, two columns, centered over the
+/// story screen. The same table the Settings screen renders.
+pub fn render_help_overlay(frame: &mut Frame, area: Rect) {
+    let (left, right) = keymap_lines_two_columns();
+    let popup = centered_rect(area, POPUP_WIDTH_WIDE, 20);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::LightCyan))
+        .title("키 안내 · ? 또는 Esc로 닫기");
+    let body = block.inner(popup);
+    let columns =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(body);
+    frame.render_widget(block, popup);
+    frame.render_widget(Paragraph::new(left).wrap(Wrap { trim: false }), columns[0]);
+    frame.render_widget(Paragraph::new(right).wrap(Wrap { trim: false }), columns[1]);
 }
 
 fn time_slot_label(t: TimeSlot) -> &'static str {
@@ -1055,6 +1263,7 @@ mod tests {
     use image::DynamicImage;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
     use ratatui::text::Text;
     use ratatui_image::picker::Picker;
     use story_model::{AppViewModel, ChoiceView, RiskLevel, StatusLine, TimeSlot};
@@ -1199,6 +1408,216 @@ mod tests {
         // MIN_WIDTH is 60: the image would not fit beside a readable column.
         let out = draw_with(Some(&scene), 60, 30);
         assert!(out.contains("비가 그쳤다"), "text-only fallback: {out}");
+    }
+
+    #[test]
+    fn scrollbar_track_is_contiguous_for_the_whole_transcript() {
+        // Regression: an undercounting wrap estimate used to make the track
+        // geometry disagree with the text, and the scrollbar column showed
+        // gaps mid-transcript. The track must render on every narration row
+        // while the scrollbar is visible.
+        let view = sample_view();
+        let mut long = String::new();
+        for index in 0..40 {
+            long.push_str(&format!(
+                "{index}번째 줄입니다. 비가 그친 카페의 창밖을 봅니다.\n\n"
+            ));
+        }
+        let narration = Text::from(markdown_lines(&long));
+        let mut terminal = Terminal::new(TestBackend::new(100, 34)).expect("terminal");
+        let mut max_scroll = 0u16;
+        terminal
+            .draw(|frame| {
+                max_scroll = render_story(
+                    frame,
+                    frame.area(),
+                    &view,
+                    0,
+                    5,
+                    false,
+                    &InputBuffer::new(200),
+                    narration.clone(),
+                    None,
+                    None,
+                    None,
+                );
+            })
+            .expect("draw");
+        assert!(max_scroll > 0, "long transcript must be scrollable");
+        let buffer = terminal.backend().buffer();
+        // No image: the scrollbar owns the last column of the narration area,
+        // which spans from below the title rule to above the choices panel.
+        let column = buffer.area.width - 1;
+        let missing: Vec<u16> = (3..22)
+            .filter(|y| {
+                let symbol = buffer[(column, *y)].symbol();
+                symbol != "│" && symbol != "┃"
+            })
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "track missing at rows {missing:?} in column {column}"
+        );
+
+        // Beside an image the same contiguity must hold: the order left to
+        // right is text | track | gutter | image, and no row may lose the
+        // track cell to the image or the gutter.
+        let picker = Picker::halfblocks();
+        let scene =
+            SceneImage::encode(&picker, DynamicImage::new_rgb8(64, 64)).expect("halfblocks encode");
+        let mut terminal = Terminal::new(TestBackend::new(100, 34)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_story(
+                    frame,
+                    frame.area(),
+                    &view,
+                    0,
+                    5,
+                    false,
+                    &InputBuffer::new(200),
+                    narration.clone(),
+                    None,
+                    None,
+                    Some(&scene),
+                );
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let image_left = buffer.area.width.saturating_sub(scene.cols);
+        let track_column = image_left.saturating_sub(2);
+        let missing: Vec<u16> = (3..22)
+            .filter(|y| {
+                let symbol = buffer[(track_column, *y)].symbol();
+                symbol != "│" && symbol != "┃"
+            })
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "track missing beside image at rows {missing:?} in column {track_column} (image_left={image_left})"
+        );
+    }
+
+    #[test]
+    fn greedy_wrap_matches_the_word_wrapper() {
+        use super::greedy_wrap_count;
+        // Fits: one visual line.
+        assert_eq!(greedy_wrap_count("비가 그쳤다", 30), 1);
+        // Words moved whole to the next line.
+        assert_eq!(greedy_wrap_count("안녕 하세요 반갑습니다", 12), 2);
+        // "안녕" / "하세요" / hard-broken "반갑습니"+"다".
+        assert_eq!(greedy_wrap_count("안녕 하세요 반갑습니다", 7), 4);
+        // A run wider than the area hard-breaks on 2-wide boundaries.
+        assert_eq!(greedy_wrap_count("가나다라마바사", 4), 4);
+        // Width 3 fits one 2-wide syllable per line: seven of them.
+        assert_eq!(greedy_wrap_count("가나다라마바사", 3), 7);
+        // Mixed: a normal word then an over-long run.
+        assert_eq!(greedy_wrap_count("안녕 가나다라마바사", 4), 5);
+    }
+
+    #[test]
+    fn wrap_count_feeds_a_reachable_scroll_bottom() {
+        // Regression: div_ceil per logical line undercounted wrapped prose,
+        // so max_scroll landed above the real last line. The word-aware count
+        // must report every visual line the paragraph will render.
+        use super::{markdown_lines, wrapped_line_count};
+        let text = Text::from(markdown_lines(
+            "짙은 남색 코트는 옆 의자에 반듯하게 접혀 있고 오른손의 은색 시계가 빛난다",
+        ));
+        let count = wrapped_line_count(&text, 30);
+        // The single 43-wide logical line cannot fit in fewer than 2 lines.
+        assert!(count >= 2, "wrapped prose undercounted: {count}");
+    }
+
+    #[test]
+    fn footer_advertises_every_bound_key_when_wide() {
+        use super::active_footer_segments;
+        let view = sample_view();
+        let segments = active_footer_segments(&view, false, 200);
+        let keys: Vec<_> = segments.iter().map(|(key, _)| *key).collect();
+        for expected in [
+            "[R]", "[I]", "[H]", "[M]", "[S]", "[L]", "[Home]", "[O]", "[?]",
+        ] {
+            assert!(
+                keys.contains(&expected),
+                "wide footer is missing {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn footer_narrows_without_losing_the_core() {
+        use super::active_footer_segments;
+        let view = sample_view();
+        // At the minimum supported width the whole core still fits.
+        let min_width = active_footer_segments(&view, false, 60);
+        let keys: Vec<_> = min_width.iter().map(|(key, _)| *key).collect();
+        assert!(keys.contains(&"[?]"), "help survives the minimum width");
+        assert!(!keys.contains(&"[R]"), "tier-2 detail drops first");
+        assert!(keys.contains(&"[Home]"), "home survives the minimum width");
+        // Below that, only the help affordance remains.
+        let tiny = active_footer_segments(&view, false, 30);
+        assert_eq!(tiny, vec![("[?]", " 도움말")]);
+    }
+
+    #[test]
+    fn input_mode_footer_swaps_to_editor_keys() {
+        use super::active_footer_segments;
+        let view = sample_view();
+        let segments = active_footer_segments(&view, true, 80);
+        assert_eq!(segments, vec![("[Enter]", " 전송"), ("[Esc]", " 취소")]);
+    }
+
+    #[test]
+    fn input_panel_shows_the_grapheme_counter() {
+        let mut input = InputBuffer::new(200);
+        input.insert_str("안녕");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                use super::render_input_panel;
+                render_input_panel(frame, Rect::new(0, 0, 80, 3), &input);
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+        }
+        // The counter itself is ASCII, so double-width spacers cannot split it.
+        assert!(out.contains("(2/200)"), "{out}");
+    }
+
+    #[test]
+    fn help_overlay_lists_the_full_keymap() {
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
+        terminal
+            .draw(|frame| super::render_help_overlay(frame, frame.area()))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buffer.area.height {
+            // Skip the spacer cell after double-width symbols so Hangul stays
+            // contiguous.
+            let mut previous_was_wide = false;
+            for x in 0..buffer.area.width {
+                let symbol = buffer[(x, y)].symbol();
+                if previous_was_wide && symbol == " " {
+                    previous_was_wide = false;
+                    continue;
+                }
+                previous_was_wide = symbol.width() == 2;
+                out.push_str(symbol);
+            }
+            out.push('\n');
+        }
+        assert!(out.contains("키 안내"), "{out}");
+        // Rows that used to be undocumented.
+        assert!(out.contains("직접 입력"), "{out}");
+        assert!(out.contains("이전 생성 기록"), "{out}");
+        assert!(out.contains("도움말 오버레이"), "{out}");
     }
 
     #[test]
