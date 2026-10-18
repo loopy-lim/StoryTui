@@ -7,3 +7,10 @@
 
 # macOS
 .DS_Store
+
+# stories/ 아래는 배포 팩 3개만 커밋한다(README 게이트 G5). 그 외 개인 임포트
+# 팩은 전부 로컬로 유지 — 새 팩이 생겨도 별도 추가 없이 자동 무시된다.
+/stories/*
+!/stories/mira-ko/
+!/stories/rainy-reunion/
+!/stories/starlight-station/
