@@ -2541,7 +2541,9 @@ mod tests {
     };
     use story_model::chrono::Utc;
     use story_model::uuid::Uuid;
-    use story_model::{ConditionExpr, EndingDef, HistoryEntry, StatePatch, StoryRules, TurnSummary};
+    use story_model::{
+        ConditionExpr, EndingDef, HistoryEntry, StatePatch, StoryRules, TurnSummary,
+    };
 
     #[test]
     fn turn_schema_closes_reference_maps_when_the_pack_defines_nothing() {
@@ -2557,15 +2559,16 @@ mod tests {
         assert_eq!(patch["number_delta"]["maxProperties"], 0);
         assert_eq!(patch["inventory_delta"]["maxProperties"], 0);
         assert_eq!(patch["add_events"]["maxItems"], 0);
-        assert_eq!(patch["affection_delta"]["maxProperties"], 0, "no characters");
+        assert_eq!(
+            patch["affection_delta"]["maxProperties"], 0,
+            "no characters"
+        );
     }
 
     #[test]
     fn turn_schema_keeps_reference_maps_open_when_registries_have_entries() {
         let mut rules = StoryRules::minimal();
-        rules
-            .allowed_flags
-            .insert("met_namu".to_string());
+        rules.allowed_flags.insert("met_namu".to_string());
         rules.strings.insert(
             "address_form".to_string(),
             story_model::StringVarDef {

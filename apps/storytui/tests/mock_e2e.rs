@@ -11,15 +11,17 @@
 //! - the committed stable state is never corrupted.
 //!
 //! Plus two control cases: cancel mid-generation restores the checkpoint, and
-//! a malformed (rule-violating) draft surfaces a recoverable error with the
-//! stable state intact.
+//! a malformed (rule-violating) draft has its unknown keys dropped+audited by
+//! the stage-2 policy while the turn itself commits.
 
 use std::path::PathBuf;
 
 use story_core::engine::{EngineState, reduce};
 use story_core::engine_cmd::{EngineCommand, EngineEffect};
 use story_model::StoryPack;
-use story_model::{CharacterId, Choice, GeneratedTurnDraft, RiskLevel, StatePatch, TurnSummary};
+use story_model::{
+    ChangeDecision, CharacterId, Choice, GeneratedTurnDraft, RiskLevel, StatePatch, TurnSummary,
+};
 use story_persistence::PackLoader;
 use story_provider::{LlmProvider, MockProvider, MockResponse};
 use tokio_util::sync::CancellationToken;
@@ -340,11 +342,11 @@ async fn cancel_mid_generation_restores_checkpoint() {
 }
 
 // ---------------------------------------------------------------------------
-// malformed draft → ShowRecoverableError, stable state intact
+// malformed draft → unknown keys are dropped+audited, the turn commits
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn malformed_draft_surfaces_error_and_keeps_state_intact() {
+async fn malformed_draft_drops_unknown_keys_and_commits_the_turn() {
     let pack = load_pack();
     let provider = build_provider_with_drafts(vec![
         legal_draft("오프닝.", 1),
@@ -360,8 +362,6 @@ async fn malformed_draft_surfaces_error_and_keeps_state_intact() {
     let t = drive_generation(&state, &req, &provider, &pack).await;
     state = t.state;
     assert_eq!(state.game.turn, 1);
-
-    let checkpoint_snapshot = story_model::serde_json::to_vec(&state.game).unwrap();
 
     // SubmitChoice → pending.
     let submit = reduce(
@@ -394,32 +394,33 @@ async fn malformed_draft_surfaces_error_and_keeps_state_intact() {
     )
     .expect("failed accept returns a Transition (with error effect)");
 
-    // Stable state byte-identical to the checkpoint.
-    let restored = story_model::serde_json::to_vec(&t.state.game).unwrap();
-    assert_eq!(
-        restored, checkpoint_snapshot,
-        "malformed draft must not corrupt the committed stable state"
+    // Stage 2 drops the unknown flag (audited) instead of rejecting the whole
+    // generation — one stray key must not discard a full turn.
+    assert_eq!(t.state.game.turn, 2);
+    assert_eq!(t.state.game.history.len(), 2);
+    assert!(t.state.pending.is_none(), "pending cleared on accept");
+
+    // The dropped key never reaches the live flag set.
+    assert!(
+        !t.state.game.flags.contains_key("__nonexistent_flag__"),
+        "unknown flag must not leak into the state"
     );
-    assert!(t.state.pending.is_none(), "pending cleared on failure");
 
-    // A ShowRecoverableError effect was emitted alongside a fresh view.
-    let has_error = t
-        .effects
-        .iter()
-        .any(|e| matches!(e, EngineEffect::ShowRecoverableError(_)));
-    assert!(has_error, "expected ShowRecoverableError effect");
-    let err_view = t
-        .effects
-        .iter()
-        .find_map(|e| match e {
-            EngineEffect::ShowRecoverableError(v) => Some(v),
-            _ => None,
-        })
-        .unwrap();
-    assert_eq!(err_view.code, "patch_unknown_flag");
-    assert!(err_view.recoverable);
+    // The drop is audited as a Rejected change-log entry…
+    assert!(
+        t.state.audit_tail.iter().any(|entry| {
+            entry.decision == ChangeDecision::Rejected
+                && entry.field_path == "state_patch.set_flags.__nonexistent_flag__"
+        }),
+        "the dropped key is audited: {:?}",
+        t.state.audit_tail
+    );
 
-    // History length and turn unchanged: no partial commit.
-    assert_eq!(t.state.game.turn, 1);
-    assert_eq!(t.state.game.history.len(), 1);
+    // …and is not a player-facing failure.
+    assert!(
+        !t.effects
+            .iter()
+            .any(|e| matches!(e, EngineEffect::ShowRecoverableError(_))),
+        "a dropped key must not surface an error"
+    );
 }
