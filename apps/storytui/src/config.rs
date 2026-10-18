@@ -215,6 +215,10 @@ fn preferred_default_config_path() -> PathBuf {
 
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
+    /// The active profile. `model` may be empty — that means "not picked
+    /// yet": the host preflight discovers a local server and auto-selects a
+    /// chat model (see `host::settings::discover_session_provider`) instead
+    /// of failing the whole launch.
     pub provider: ProviderConfig,
     /// Every configured provider profile (base first), resolved and ready to
     /// be swapped in at runtime by the TUI provider picker.
@@ -484,11 +488,6 @@ pub fn load(cli: &CliOptions) -> Result<RuntimeConfig, String> {
         .pack
         .clone()
         .unwrap_or_else(|| PathBuf::from("stories/rainy-reunion"));
-    if file.provider.model.trim().is_empty() {
-        return Err(
-            "provider.model이 비어 있습니다. --model 또는 TOML에서 모델을 지정하세요.".to_string(),
-        );
-    }
     if !Path::new(&pack_dir).is_dir() {
         return Err(format!(
             "Story Pack 디렉터리가 없습니다: {}",
@@ -590,6 +589,39 @@ mod tests {
             MaxTokensField::MaxCompletionTokens
         );
         assert_eq!(runtime.provider.model, "임의-호환-모델");
+        fs::remove_dir_all(dir).expect("clean test directory");
+    }
+
+    #[test]
+    fn load_succeeds_with_empty_model_and_defers_to_host_preflight() {
+        let dir = test_dir("empty-model");
+        let pack_dir = dir.join("pack");
+        let config_path = dir.join("storytui.toml");
+        fs::create_dir_all(&pack_dir).expect("pack directory");
+        fs::write(
+            &config_path,
+            format!(
+                concat!(
+                    "save_dir = \"{}\"\n",
+                    "[provider]\n",
+                    "base_url = \"http://127.0.0.1:8000\"\n",
+                    // No `model` line: the checked-in template looks like
+                    // this on a fresh clone.
+                ),
+                dir.join("saves").display()
+            ),
+        )
+        .expect("config");
+
+        let runtime = load(&CliOptions {
+            provider_config: Some(config_path),
+            pack: Some(pack_dir),
+            ..CliOptions::default()
+        })
+        .expect("an empty model must not abort the launch");
+
+        assert_eq!(runtime.provider.model, "");
+        assert_eq!(runtime.fallback_model, "");
         fs::remove_dir_all(dir).expect("clean test directory");
     }
 

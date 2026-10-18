@@ -4,6 +4,7 @@ pub mod greeting;
 pub mod home;
 pub mod import;
 pub mod keymap;
+pub mod pack;
 pub mod save_load;
 pub mod settings;
 pub mod story;

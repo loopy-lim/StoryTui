@@ -59,11 +59,11 @@ pub const KEYMAP: &[KeymapRow] = &[
     },
     KeymapRow {
         key: "Home",
-        action_ko: "시작 메뉴로 이동",
+        action_ko: "시작 메뉴 (팩 선택·카드 가져오기 포함)",
     },
     KeymapRow {
         key: "Esc",
-        action_ko: "오류 닫기",
+        action_ko: "오류·모달 닫기",
     },
     KeymapRow {
         key: "q / Ctrl+C",

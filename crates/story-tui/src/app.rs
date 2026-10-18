@@ -49,6 +49,9 @@ pub enum HomeRequest {
     StartNew,
     Continue,
     ReturnToGame,
+    /// Home menu "팩 선택": the host scans the pack root and opens the
+    /// picker (via `open_pack_picker`).
+    PickPack,
 }
 
 /// The TTS slice of the Settings projection (plain display data).
@@ -240,6 +243,17 @@ pub struct App {
     can_continue: bool,
     home_continue_returns_to_game: bool,
     home_request: Option<HomeRequest>,
+    /// One-line start-menu status (guidance or notice) below the rows:
+    /// `(line, attention)` — attention renders yellow, the rest gray.
+    home_status: Option<(String, bool)>,
+    /// Directory of the active pack; the host updates it after a swap and
+    /// reads it back to scan the pack root for the picker.
+    current_pack_dir: String,
+    /// Pack picker modal (`Some` = visible): selected index into
+    /// `pack_dirs`/`pack_labels`.
+    pack_picker: Option<usize>,
+    pack_dirs: Vec<String>,
+    pack_labels: Vec<String>,
     settings: Option<SettingsState>,
     settings_visible: bool,
     settings_opened: bool,
@@ -303,6 +317,11 @@ impl App {
             can_continue: false,
             home_continue_returns_to_game: false,
             home_request: None,
+            home_status: None,
+            current_pack_dir: String::new(),
+            pack_picker: None,
+            pack_dirs: Vec::new(),
+            pack_labels: Vec::new(),
             settings: None,
             settings_visible: false,
             settings_opened: false,
@@ -414,6 +433,64 @@ impl App {
     /// Consume the picked greeting index (`None` = default opening).
     pub fn take_greeting_selection(&mut self) -> Option<usize> {
         self.greeting_selection.take()
+    }
+
+    /// Set (or clear) the one-line status under the home menu rows.
+    pub fn set_home_status(&mut self, status: Option<(String, bool)>) {
+        self.home_status = status;
+    }
+
+    /// The directory of the active pack (host bookkeeping for pack scans).
+    pub fn current_pack_dir(&self) -> &str {
+        &self.current_pack_dir
+    }
+
+    /// Record the active pack directory. Call at startup and after a swap.
+    pub fn set_current_pack_dir(&mut self, dir: &str) {
+        self.current_pack_dir = dir.to_string();
+    }
+
+    /// Open the pack picker. The host supplies scan results; an empty list
+    /// still opens (the modal explains there is nothing to load). Labels
+    /// matching `current_dir` get a " (현재)" suffix.
+    pub fn open_pack_picker(&mut self, dirs: Vec<String>, labels: Vec<String>, current_dir: &str) {
+        let mut labels = labels;
+        for (index, (label, dir)) in labels.iter_mut().zip(dirs.iter()).enumerate() {
+            if dir == current_dir {
+                *label = format!("{label} (현재)");
+                self.pack_picker = Some(index);
+            }
+        }
+        self.pack_dirs = dirs;
+        self.pack_labels = labels;
+        if self.pack_picker.is_none() {
+            self.pack_picker = Some(0);
+        }
+    }
+
+    /// Keys while the pack picker owns the screen.
+    fn handle_pack_picker_key(&mut self, key: KeyEvent) {
+        let Some(selected) = self.pack_picker.as_mut() else {
+            return;
+        };
+        let last = self.pack_dirs.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Esc => self.pack_picker = None,
+            KeyCode::Up | KeyCode::Char('k' | 'ㅏ') => {
+                *selected = selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j' | 'ㅓ') => {
+                *selected = (*selected + 1).min(last);
+            }
+            KeyCode::Enter => {
+                if let Some(dir) = self.pack_dirs.get(*selected) {
+                    let dir = dir.clone();
+                    self.pack_picker = None;
+                    self.pack_swap_request = Some(dir);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Open the greeting picker (host already knows the pack has greetings).
@@ -795,6 +872,10 @@ impl App {
             self.handle_greeting_picker_key(key);
             return None;
         }
+        if self.pack_picker.is_some() {
+            self.handle_pack_picker_key(key);
+            return None;
+        }
         if self.import_dialog.is_some() {
             self.handle_import_dialog_key(key);
             return None;
@@ -1082,12 +1163,23 @@ impl App {
                 selected,
             );
         }
+        if let Some(selected) = self.pack_picker {
+            crate::screens::pack::render_pack_picker(frame, area, &self.pack_labels, selected);
+        }
     }
 
     fn render_base(&mut self, frame: &mut Frame, area: Rect) {
         self.last_render_area.set(area);
         if self.home_visible {
-            render_home(frame, area, self.home_selected, self.can_continue);
+            render_home(
+                frame,
+                area,
+                self.home_selected,
+                self.can_continue,
+                self.home_status
+                    .as_ref()
+                    .map(|(line, attention)| (line.as_str(), *attention)),
+            );
             return;
         }
         if let Some(state) = &self.save_load {
@@ -1174,9 +1266,13 @@ impl App {
 
     /// Handle mouse-wheel scrolling without changing the selected choice.
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
-        // The import dialog and greeting picker are keyboard-only modals:
-        // clicks must not reach the home menu or story screen underneath.
-        if self.import_dialog.is_some() || self.greeting_picker.is_some() {
+        // The import dialog and greeting/pack pickers are keyboard-only
+        // modals: clicks must not reach the home menu or story screen
+        // underneath.
+        if self.import_dialog.is_some()
+            || self.greeting_picker.is_some()
+            || self.pack_picker.is_some()
+        {
             return;
         }
         if self.save_load.is_some() {
@@ -1332,7 +1428,7 @@ impl App {
                 }
             }
             KeyCode::Down | KeyCode::Char('j' | 'ㅓ') => {
-                self.home_selected = (self.home_selected + 1).min(4);
+                self.home_selected = (self.home_selected + 1).min(5);
                 if !self.can_continue && self.home_selected == 1 {
                     self.home_selected = 2;
                 }
@@ -1372,6 +1468,11 @@ impl App {
             }
             3 => self.open_import_dialog(),
             4 => self.should_quit = true,
+            5 => {
+                // The picker overlays the home menu, which stays visible
+                // underneath.
+                self.home_request = Some(HomeRequest::PickPack);
+            }
             _ => {}
         }
     }
@@ -2265,6 +2366,78 @@ mod tests {
         });
         app.handle_key(key(KeyCode::Esc), None);
         assert!(app.import_dialog.is_some(), "running state ignores Esc");
+    }
+
+    #[test]
+    fn pack_picker_row_opens_picker_and_enter_emits_swap_request() {
+        let mut app = App::new(sample_view(0));
+        app.show_home();
+        app.set_current_pack_dir("stories/rainy-reunion");
+        // Home row 5 ("팩 선택") requests the host to scan + open the picker.
+        app.choose_home(5);
+        assert_eq!(
+            app.take_home_request(),
+            Some(HomeRequest::PickPack),
+            "row 5 asks the host for a pack scan"
+        );
+        // Host path: scan results come back through open_pack_picker.
+        app.open_pack_picker(
+            vec![
+                "stories/rainy-reunion".to_string(),
+                "stories/mira-ko".to_string(),
+            ],
+            vec![
+                "비가 그친 뒤 · ko-KR".to_string(),
+                "Mira · ko-KR".to_string(),
+            ],
+            "stories/rainy-reunion",
+        );
+        assert!(app.pack_picker.is_some(), "picker is open");
+        assert!(app.home_visible, "home stays visible underneath");
+        app.handle_key(key(KeyCode::Down), None); // → index 1 (mira-ko)
+        app.handle_key(key(KeyCode::Enter), None);
+        assert!(app.pack_picker.is_none(), "picker closes on Enter");
+        assert_eq!(
+            app.take_pack_swap_request().as_deref(),
+            Some("stories/mira-ko")
+        );
+    }
+
+    #[test]
+    fn pack_picker_esc_cancels_without_swap() {
+        let mut app = App::new(sample_view(0));
+        app.show_home();
+        app.open_pack_picker(
+            vec!["stories/rainy-reunion".to_string()],
+            vec!["비가 그친 뒤 · ko-KR".to_string()],
+            "stories/rainy-reunion",
+        );
+        app.handle_key(key(KeyCode::Esc), None);
+        assert!(app.pack_picker.is_none());
+        assert!(app.take_pack_swap_request().is_none(), "no pack, no swap");
+    }
+
+    #[test]
+    fn pack_picker_marks_the_current_pack_and_tolerates_an_empty_scan() {
+        let mut app = App::new(sample_view(0));
+        app.open_pack_picker(
+            vec!["stories/x".to_string()],
+            vec!["어떤 팩 · ko-KR".to_string()],
+            "stories/x",
+        );
+        assert_eq!(app.pack_picker, Some(0), "current pack is highlighted");
+
+        let mut empty = App::new(sample_view(0));
+        empty.open_pack_picker(vec![], vec![], "stories/none");
+        assert!(
+            empty.pack_picker.is_some(),
+            "empty scan still opens the picker"
+        );
+        empty.handle_key(key(KeyCode::Enter), None);
+        assert!(
+            empty.take_pack_swap_request().is_none(),
+            "an empty list must not emit a swap"
+        );
     }
 
     #[test]

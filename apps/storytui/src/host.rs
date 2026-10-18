@@ -25,6 +25,7 @@ use storytui::config::{RuntimeConfig, UserSettings, load_user_settings, save_use
 
 mod diagnostics;
 mod images;
+mod packs;
 pub(crate) mod saves;
 mod settings;
 
@@ -100,12 +101,33 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
         .map_err(|e| format!("Story Pack을 불러오지 못했습니다: {e}"))?;
     apply_player_profile(&mut pack, &config.player);
     let mut provider_config = config.provider.clone();
+    let mut repaired_main_model = false;
+    let mut repaired_stage_models = false;
+    // First-run auto-setup: with no model selected yet (a fresh clone — the
+    // checked-in template intentionally carries no model id), find a local
+    // OpenAI-compatible server and adopt it for this session. The model is
+    // persisted below through the repaired-model path; the URL never is.
+    let mut discovery: Option<settings::DiscoveryOutcome> = None;
+    if provider_config.model.trim().is_empty() {
+        match settings::discover_session_provider(&provider_config).await {
+            settings::DiscoveryOutcome::Connected { base_url, model } => {
+                tracing::info!(
+                    base_url = %base_url,
+                    model = %model,
+                    "no model configured; adopting a detected local server"
+                );
+                provider_config.base_url = base_url;
+                provider_config.model = model;
+                config.provider = provider_config.clone();
+                repaired_main_model = true;
+            }
+            other => discovery = Some(other),
+        }
+    }
     let mut provider = Arc::new(
         OpenAiCompatibleProvider::new(provider_config.clone())
             .map_err(|e| format!("provider를 만들지 못했습니다: {e}"))?,
     );
-    let mut repaired_main_model = false;
-    let mut repaired_stage_models = false;
     match provider.list_models().await {
         Ok(advertised) if !advertised.is_empty() => {
             if let Some(model) = settings::reconcile_active_model(
@@ -190,6 +212,7 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
     app.set_lists(&engine.game.history, &engine.game.memories);
     app.set_can_continue(resume_engine.is_some());
     app.set_greetings(greeting_labels(&pack));
+    app.set_current_pack_dir(&config.pack_dir.to_string_lossy());
     {
         // The roster is exactly the load()-assembled set: base profile first,
         // then every `[[providers]]` entry — never prepended again, or the
@@ -225,6 +248,19 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
             image_backend,
         );
     }
+    // Start-menu status line: guide an unconfigured first run, and note a
+    // down server for a returning user — without blocking the menu.
+    app.set_home_status(if provider_config.model.trim().is_empty() {
+        Some(settings::unconfigured_home_status(
+            discovery
+                .as_ref()
+                .unwrap_or(&settings::DiscoveryOutcome::NoServer),
+        ))
+    } else if health == ProviderHealth::Unavailable {
+        Some(settings::server_down_home_status())
+    } else {
+        None
+    });
     app.show_home();
     if repaired_main_model {
         user_settings.model = Some(provider_config.model.clone());
@@ -461,6 +497,7 @@ fn swap_pack(
     app.follow_story_end();
     app.set_can_continue(false);
     app.set_greetings(greeting_labels(pack));
+    app.set_current_pack_dir(pack_dir);
     refresh_scene_images(app, pack, engine, scene_images);
     tracing::info!(pack = %pack_dir, "switched to the imported pack");
 }
@@ -544,7 +581,25 @@ async fn handle_ui_requests(
             )
             .await?;
         }
-        settings::refresh_model_list(app, provider, provider_config, false).await;
+        // Keep the "turn the server on, then open settings" promise: while
+        // no model is selected, opening settings retries auto-setup first.
+        let reprobe = settings::reprobe_if_unconfigured(
+            app,
+            provider_config,
+            provider,
+            user_settings,
+            config,
+            tts,
+        )
+        .await;
+        match &reprobe {
+            // An adopted server already refreshed the model list above.
+            Some(settings::DiscoveryOutcome::Connected { .. }) => {}
+            Some(other) => {
+                app.set_home_status(Some(settings::unconfigured_home_status(other)));
+            }
+            None => settings::refresh_model_list(app, provider, provider_config, false).await,
+        }
     }
     if app.take_model_reload_requested() {
         settings::refresh_model_list(app, provider, provider_config, true).await;
@@ -658,6 +713,16 @@ async fn handle_ui_requests(
                     app.set_can_continue(false);
                     refresh_scene_images(app, pack, engine, scene_images);
                 }
+            }
+            HomeRequest::PickPack => {
+                let current = app.current_pack_dir().to_string();
+                let entries = packs::scan_packs(std::path::Path::new(&current));
+                let dirs: Vec<String> = entries.iter().map(|e| e.dir.clone()).collect();
+                let labels: Vec<String> = entries
+                    .iter()
+                    .map(|e| format!("{} · {}", e.title, e.language))
+                    .collect();
+                app.open_pack_picker(dirs, labels, &current);
             }
             HomeRequest::ReturnToGame => app.close_home(),
         }
@@ -820,6 +885,21 @@ async fn dispatch(
                 refresh_scene_images(app, pack, engine, scene_images);
             }
             EngineEffect::ShowRecoverableError(error) => app.view.error = Some(error),
+            // No model selected yet (first run before auto-setup succeeded):
+            // block the HTTP round-trip with a friendly message instead of a
+            // confusing provider failure.
+            EngineEffect::RequestGeneration { .. }
+            | EngineEffect::RequestDirector { .. }
+            | EngineEffect::RequestWriter { .. }
+                if provider.model_name().trim().is_empty() =>
+            {
+                app.view.error = Some(DomainErrorView {
+                    code: "model_not_selected".to_string(),
+                    title_ko: "모델이 아직 선택되지 않았어요".to_string(),
+                    message_ko: "설정 메뉴에서 모델을 고른 뒤 시작해 주세요.".to_string(),
+                    recoverable: true,
+                });
+            }
             EngineEffect::RequestGeneration {
                 generation_id,
                 mut request,

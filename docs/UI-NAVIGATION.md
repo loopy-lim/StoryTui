@@ -17,6 +17,7 @@ stateDiagram-v2
     ProviderPicker: 프로바이더 선택기 (o → e)
     SaveLoad: 저장/불러오기 (s / l)
     ImportDialog: 카드 가져오기 (홈 메뉴)
+    PackPicker: 팩 선택 (홈 메뉴)
     Error: 오류 오버레이
 
     [*] --> Home
@@ -27,6 +28,9 @@ stateDiagram-v2
     Home --> ImportDialog: 메뉴 "카드 가져오기" Enter
     ImportDialog --> ImportDialog: 경로 입력 · Enter 임포트 (호스트가 백그라운드 실행)
     ImportDialog --> Home: Esc 취소 · 리포트에서 Enter 시 임포트된 팩으로 전환
+    Home --> PackPicker: 메뉴 "팩 선택" Enter (호스트가 현재 팩 옆 stories/* 스캔)
+    PackPicker: 팩 목록 (↑↓ · Enter · Esc)
+    PackPicker --> Home: Enter "이 팩 불러오기" (엔진 리셋·자동저장 이어하기 초기화) · Esc 취소
     Home --> Home: ↑↓ 이동 · 메뉴 클릭
     Story --> Story: 선택지 확정(1-9/Enter/클릭) → 생성 → 다음 턴
     Story --> Input: i/ㅑ
@@ -105,6 +109,18 @@ stateDiagram-v2
   `storytui import --help` (`--normalize` 정규화 패스 포함)
 - 상세 정책: `crates/story-import` 모듈 문서와 임포트 리포트(`import-report.md`)
 
+### 팩 선택 (시작 메뉴)
+
+- 시작 메뉴 마지막 행 `팩 선택` → 호스트가 현재 팩의 형제 디렉터리에서
+  `story.toml`을 가진 팩을 스캔해 모달로 나열한다 (`제목 · 언어` 라벨, 현재 팩은
+  " (현재)" 표시)
+- 깨진 manifest를 가진 디렉터는 경고 로그 후 건너뛴다 — 하나의 불량 팩이 메뉴를
+  막지 않는다
+- `Enter` → 기존 임포트 전환 경로 재사용: PackLoader 검증 → 엔진 리셋 → 자동저장
+  이어하기 초기화 → 새 팩의 인사말 재스캔. 로드 실패 시 오류 오버레이로 격리되고
+  기존 팩이 유지된다
+- `Esc` → 취소 (팩 변경 없음)
+
 ### 이미지 표시 규칙
 
 - 경로: `pack/images/locations/<장소id>.png` → 없으면 `pack/images/characters/<캐릭터id>.png`
@@ -122,5 +138,5 @@ stateDiagram-v2
 | TTS 낭독 | `v` | ✓ |
 | 장면 이미지 | 설정 `i` | ✓ |
 | 저장/불러오기 | `s` / `l` | ✓ |
-| 스토리 팩 자체 | 불가 (재시작 필요) | — |
+| 스토리 팩 전환 | 시작 메뉴 "팩 선택" | ✓ (엔진 리셋) |
 | 엔드포인트 자유 입력 | 불가 (TOML 프로필 정의 → TUI는 전환) | — |

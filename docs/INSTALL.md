@@ -41,23 +41,36 @@ The workspace builds six crates:
 
 ## Run
 
-The checked-in profile contains no machine-specific model ID. Copy it to the
-ignored `config/storytui.local.toml`, add the local model selections there,
-and run normally; StoryTUI automatically prefers that file. At startup it
-checks `/v1/models` with a short probe timeout. If a saved model is no longer
-advertised, it falls back to the private local profile model (or the first
-advertised model) and repairs `saves/user-settings.toml` before generation.
+The checked-in profile intentionally contains no machine-specific model ID —
+you do not need to edit any config to start. The app opens the start menu
+directly and wires the model itself:
+
+- **First run**: with no model selected, the app probes the configured
+  endpoint and then the common local OpenAI-compatible endpoints
+  (`127.0.0.1:8080`, `:1234`, `:11434`), filters out non-chat models
+  (embedding/rerank/audio), and auto-selects one. The model ID is persisted
+  to `saves/user-settings.toml` (the URL never is), so later runs start with
+  your selection immediately.
+- **No server running**: the start menu still opens, with a one-line Korean
+  status notice. Turn your model server on, then open 설정 (Settings) — the
+  app retries auto-setup there.
+- **Model changes**: press `o`, then `p`, to open the server-advertised model
+  picker; `Enter` selects the main model, while `d` and `w` select the
+  optional Director and Writer models. `c` selects the lightweight model used
+  only for a rejected/manual choice rewrite. If a saved model is no longer
+  advertised at startup, it falls back to the private local profile model (or
+  the first advertised model) and repairs `saves/user-settings.toml`.
 
 ```sh
 cargo run -p storytui
 ```
 
-The TUI starts in the Story screen. Use `1..9` or `Enter` to choose, `j/k` or
-arrow keys to move, `c` to cancel a generation, `Esc` to dismiss an error, and
-`q`/`Ctrl+C` to quit. Press `o`, then `p`, to open the server-advertised model
-picker; `Enter` selects the main model, while `d` and `w` select the optional
-Director and Writer models. `c` selects the lightweight model used only for a
-rejected/manual choice rewrite.
+The app starts at the 시작 메뉴 (start menu): 새 게임 / 이어하기 / 설정 /
+카드 가져오기 / 종료 / **팩 선택**. Use `↑↓` + `Enter` to navigate — pack
+switching lives in 팩 선택, which lists the story packs found next to the
+current one. In the story screen, `1..9` or `Enter` choose, `j/k` or arrow
+keys move, `c` cancels a generation, `Esc` dismisses an error, and
+`q`/`Ctrl+C` quits.
 
 To run the live model contract gates (they remain ignored in normal CI):
 
