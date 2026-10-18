@@ -1,0 +1,27 @@
+schema_version = "1.0.0"
+
+[limits]
+affection_min = -30
+affection_max = 30
+trust_min = -30
+trust_max = 30
+tension_min = 0
+tension_max = 30
+normal_delta_min = -3
+normal_delta_max = 3
+
+[[locations]]
+id = "default-location"
+name = "이야기의 무대"
+
+[[numbers]]
+id = "mira.affection"
+default = 0
+min = -30
+max = 30
+
+[[numbers]]
+id = "mira.trust"
+default = 0
+min = -30
+max = 30

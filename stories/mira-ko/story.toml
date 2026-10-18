@@ -1,0 +1,18 @@
+schema_version = "1.0.0"
+story_id = "mira"
+story_version = "0.1.0"
+min_engine_version = "0.1.0"
+title = "Mira"
+language = "ko-KR"
+genres = ["imported-card"]
+rating = "teen"
+default_choice_count = 3
+
+[initial_state]
+chapter = "chapter-1"
+scene = "opening"
+location = "default-location"
+time_slot = "evening"
+
+[content]
+violence = "mild"

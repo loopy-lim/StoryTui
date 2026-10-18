@@ -1,0 +1,122 @@
+name = "하버라인 박물관"
+scan_depth = 3
+token_budget = 1600
+recursive_scanning = true
+
+[[entries]]
+id = "book-0"
+keys = [
+    "crate eleven",
+    "wedding dress",
+    "11번 상자",
+    "웨딩드레스",
+    "결혼 드레스",
+]
+secondary_keys = []
+logic = "and_any"
+content = "11번 상자에는 두 번 물에 젠 듀발 웨딩드레스가 들어 있다. 미라의 할머니는 그 드레스의 마지막 주인의 재단사였다."
+constant = false
+enabled = true
+insertion_order = 10
+position = "before_char"
+case_sensitive = false
+probability = 100
+prevent_recursion = false
+exclude_recursion = false
+sticky = 0
+cooldown = 0
+delay = 0
+vectorized = false
+
+[[entries]]
+id = "book-1"
+keys = [
+    "pocket watch",
+    "회중시계",
+    "시계",
+]
+secondary_keys = []
+logic = "and_any"
+content = "미라의 놋쇠 회중시계는 아버지가 돌아가신 그날 밤 새벽 3시 12분에 멈췄다. 그녀는 그래도 매일 밤 태엽을 감는다."
+constant = false
+enabled = true
+insertion_order = 20
+position = "after_char"
+case_sensitive = false
+probability = 100
+prevent_recursion = false
+exclude_recursion = false
+sticky = 0
+cooldown = 0
+delay = 0
+vectorized = false
+
+[[entries]]
+id = "book-2"
+keys = [
+    "insurance",
+    "보험",
+]
+secondary_keys = []
+logic = "and_any"
+content = "보험 감정인은 새벽에 도착한다. 그 전에 기록되지 않은 것은 전멸로 처리된다."
+constant = true
+enabled = true
+insertion_order = 30
+position = "before_char"
+case_sensitive = false
+probability = 100
+prevent_recursion = false
+exclude_recursion = false
+sticky = 0
+cooldown = 0
+delay = 0
+vectorized = false
+
+[[entries]]
+id = "book-3"
+keys = [
+    "flood",
+    "홍수",
+    "침수",
+]
+secondary_keys = [
+    "basement",
+    "지하",
+]
+logic = "and_any"
+content = "2009년 홍수는 지하 금고까지 닿았다. 2019년 홍수는 하역장에서 멈췄다."
+constant = false
+enabled = true
+insertion_order = 40
+position = "before_char"
+case_sensitive = false
+probability = 80
+prevent_recursion = false
+exclude_recursion = true
+sticky = 2
+cooldown = 0
+delay = 0
+vectorized = false
+
+[[entries]]
+id = "book-4"
+keys = [
+    "loading dock",
+    "하역장",
+]
+secondary_keys = []
+logic = "and_any"
+content = "하역장에는 빗내음과 경유 냄새가 밴다. 셔터는 중간에서 자주 걸린다."
+constant = false
+enabled = true
+insertion_order = 50
+position = "before_char"
+case_sensitive = false
+probability = 100
+prevent_recursion = false
+exclude_recursion = false
+sticky = 0
+cooldown = 0
+delay = 0
+vectorized = true
