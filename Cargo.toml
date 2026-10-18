@@ -29,6 +29,10 @@ tracing = "0.1.44"
 # Character-card PNG tEXt decoding/encoding for the importer's fixtures.
 png = "0.17"
 base64 = "0.22"
+# RisuAI .charx card container (zip) reading for the importer. Minimal feature
+# set — DEFLATE only: the charx spec forbids encryption, so the aes-crypto/
+# bzip2/zstd/lzma stack would be dead weight.
+zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 tracing-subscriber = "0.3.23"
 async-trait = "0.1.91"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream"] }

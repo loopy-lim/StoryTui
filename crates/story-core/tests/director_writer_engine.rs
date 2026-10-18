@@ -175,9 +175,7 @@ fn valid_plan() -> DirectorPlan {
 /// `unknown_patch_reference_is_dropped_and_writer_still_called`.)
 fn bad_plan_out_of_range_delta() -> DirectorPlan {
     let mut patch = StatePatch::default();
-    patch
-        .affection_delta
-        .insert(cid(), 5);
+    patch.affection_delta.insert(cid(), 5);
     let mut plan = valid_plan();
     plan.proposed_patch = patch;
     plan

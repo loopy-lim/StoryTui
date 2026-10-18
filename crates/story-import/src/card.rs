@@ -1,5 +1,7 @@
 //! Character card parsing: SillyTavern/RisuAI V1/V2/V3 cards from `.png`
-//! (embedded tEXt JSON) or `.json` files.
+//! (embedded tEXt JSON), `.json`, or RisuAI `.charx` zip containers.
+//! Character.AI community-dump field aliases (`greeting`, `definition`,
+//! `{"character": ...}` wrapper, ...) collapse onto the standard vocabulary.
 //!
 //! Policy: the parsed JSON is kept verbatim (`sources/card.json` receives the
 //! original content), so lenient parsing here never destroys card data —
@@ -13,6 +15,7 @@ use serde::Deserialize;
 use crate::worldinfo::{self, NormalizedBook};
 
 /// A decoded card ready for scaffolding.
+#[derive(Debug)]
 pub struct ParsedCard {
     /// Normalized card content (macro substitution happens later, in
     /// [`crate::scaffold`], against the configured player address).
@@ -30,6 +33,7 @@ pub struct ParsedCard {
 }
 
 /// Normalized card content across V1/V2/V3.
+#[derive(Debug)]
 pub struct CanonicalCard {
     pub name: String,
     pub description: String,
@@ -45,6 +49,7 @@ pub struct CanonicalCard {
 }
 
 /// A decoded avatar ready to be written under `images/characters/`.
+#[derive(Debug)]
 pub struct AvatarImage {
     pub bytes: Vec<u8>,
     pub extension: &'static str,
@@ -66,8 +71,9 @@ pub fn load_card(path: &std::path::Path) -> Result<ParsedCard, String> {
                 String::from_utf8(bytes).map_err(|_| "카드 JSON이 UTF-8이 아닙니다".to_string())?;
             parse_card_json(&text)
         }
+        "charx" => crate::charx::parse_charx(&bytes),
         other => Err(format!(
-            "지원하지 않는 카드 확장자: .{other} — .png 또는 .json 카드를 사용하세요"
+            "지원하지 않는 카드 확장자: .{other} — .png, .json 또는 .charx 카드를 사용하세요"
         )),
     }
 }
@@ -102,7 +108,16 @@ pub fn parse_card_json(text: &str) -> Result<ParsedCard, String> {
                 .to_string(),
         );
     }
-    let data = card_data_view(&raw);
+    let mut working = raw.clone();
+    let mut notes = Vec::new();
+    apply_character_wrapper(&mut working, &mut notes);
+    // Alias fills target the card-data vocabulary (the `data` object for
+    // V2/V3, the root for V1/dumps) so stray root keys on spec cards never
+    // produce false report notes.
+    if let Some(view) = card_data_view_mut(&mut working) {
+        apply_character_alias_fills(view, &mut notes);
+    }
+    let data = card_data_view(&working);
     let mut card: CardData = serde_json::from_value(data.clone())
         .map_err(|e| format!("카드 필드를 해석하지 못했습니다: {e}"))?;
     if card.name.trim().is_empty() {
@@ -111,7 +126,6 @@ pub fn parse_card_json(text: &str) -> Result<ParsedCard, String> {
         );
     }
 
-    let mut notes = Vec::new();
     let book = card
         .character_book
         .take()
@@ -142,7 +156,7 @@ pub fn parse_card_json(text: &str) -> Result<ParsedCard, String> {
 
 /// Permissive card data: every field defaults so partially-broken cards still
 /// import, while the raw JSON keeps everything.
-#[derive(Default, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct CardData {
     pub name: String,
@@ -161,7 +175,7 @@ pub struct CardData {
 }
 
 /// V2/V3 embedded `character_book` DTO (spec shape + tolerated extras).
-#[derive(Default, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct CardBook {
     pub name: String,
@@ -173,7 +187,7 @@ pub struct CardBook {
 
 /// One embedded-book entry. `position`/`logic`/`probability` may live at the
 /// top level (V2 strings) or inside `extensions` (SillyTavern numeric export).
-#[derive(Default, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct CardBookEntry {
     pub keys: Vec<String>,
@@ -191,13 +205,28 @@ pub struct CardBookEntry {
 }
 
 /// V3 asset entry (`avatar` / `icon` / `other` / `cc3-*`).
-#[derive(Default, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct CardAsset {
     pub kind: String,
     pub uri: String,
     /// V3 spells the field `type`; `kind` kept for leniency.
     pub r#type: Option<String>,
+    /// V3 asset display name; `main` marks the primary avatar.
+    pub name: String,
+}
+
+impl CardAsset {
+    /// Spec `type` (or lenient `kind`) spelling of the asset type.
+    pub(crate) fn asset_kind(&self) -> &str {
+        self.r#type.as_deref().unwrap_or(self.kind.as_str())
+    }
+
+    /// `true` for avatar/icon assets — the only assets the pack can carry.
+    pub(crate) fn is_avatar(&self) -> bool {
+        let kind = self.asset_kind();
+        kind.contains("avatar") || kind == "icon"
+    }
 }
 
 /// `data` object for V2/V3 cards, top level for V1 (or spec-less V2 exports).
@@ -205,6 +234,86 @@ fn card_data_view(root: &serde_json::Value) -> &serde_json::Value {
     root.get("data")
         .filter(|data| data.is_object())
         .unwrap_or(root)
+}
+
+/// Mutable [`card_data_view`] for the alias pass.
+fn card_data_view_mut(
+    root: &mut serde_json::Value,
+) -> Option<&mut serde_json::Map<String, serde_json::Value>> {
+    if root.get("data").is_some_and(|data| data.is_object()) {
+        root.get_mut("data").and_then(|data| data.as_object_mut())
+    } else {
+        root.as_object_mut()
+    }
+}
+
+/// Map Character.AI community-dump field aliases onto the standard card
+/// vocabulary, on a working copy (the raw JSON keeps the original dump).
+/// Character.AI has no official export; the shapes below are what its
+/// download extensions emit (e.g. CAI Tools' raw `character` payload and
+/// pygmalion-style hybrid dumps).
+///
+/// Filling rules: only when the standard field is absent, null, or empty —
+/// a spec card that already carries `first_mes` is never overwritten — and
+/// every application is recorded as a report note.
+/// Unwrap the `{"character": {...}}` API-response wrapper: only when the
+/// root carries no card vocabulary of its own, so a real card with an
+/// unrelated `character` key is never disturbed.
+fn apply_character_wrapper(root: &mut serde_json::Value, notes: &mut Vec<(String, String)>) {
+    if let Some(character) = root.get("character").cloned() {
+        let is_dump = root.get("data").is_none()
+            && root.get("name").is_none()
+            && root.get("spec").is_none()
+            && character
+                .get("name")
+                .is_some_and(serde_json::Value::is_string);
+        if is_dump {
+            *root = character;
+            notes.push((
+                "character".to_string(),
+                "(c.ai 덤프) character 래퍼를 벗겼습니다".to_string(),
+            ));
+        }
+    }
+}
+
+/// Fill empty standard fields from c.ai dump aliases. Every application is
+/// recorded as a report note; spec-card vocabulary is never overwritten.
+fn apply_character_alias_fills(
+    view: &mut serde_json::Map<String, serde_json::Value>,
+    notes: &mut Vec<(String, String)>,
+) {
+    const ALIASES: &[(&str, &str)] = &[
+        ("greeting", "first_mes"),
+        ("char_greeting", "first_mes"),
+        ("definition", "mes_example"),
+        ("example_dialogue", "mes_example"),
+        ("char_persona", "description"),
+        ("world_scenario", "scenario"),
+        ("title", "personality"),
+    ];
+    for (alias, target) in ALIASES {
+        let Some(alias_text) = view
+            .get(*alias)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        else {
+            continue;
+        };
+        let target_empty = match view.get(*target) {
+            None | Some(serde_json::Value::Null) => true,
+            Some(serde_json::Value::String(text)) => text.trim().is_empty(),
+            Some(_) => false,
+        };
+        if target_empty {
+            view.insert((*target).to_string(), alias_text.to_string().into());
+            notes.push((
+                format!("card.{alias}"),
+                format!("(c.ai 덤프) {alias} → {target} 매핑"),
+            ));
+        }
+    }
 }
 
 /// Extract the base64 card JSON from `chara`/`ccv3` tEXt chunks. `ccv3` wins
@@ -375,6 +484,71 @@ mod tests {
             .err()
             .expect("world info must be rejected");
         assert!(error.contains("--lorebook"), "{error}");
+    }
+
+    #[test]
+    fn cai_raw_dump_aliases_fill_empty_fields() {
+        let dump = r#"{"name":"세라","description":"AI 동료","greeting":"오셨군요.","definition":"<START>\n{{user}}: 안녕\n{{char}}: 반가워","title":"호기심 많은 AI"}"#;
+        let parsed = parse_card_json(dump).expect("c.ai dump");
+        assert_eq!(parsed.canonical.first_mes, "오셨군요.");
+        assert!(parsed.canonical.mes_example.contains("반가워"));
+        assert_eq!(parsed.canonical.personality, "호기심 많은 AI");
+        assert!(
+            parsed
+                .notes
+                .iter()
+                .any(|(_, reason)| reason.contains("greeting → first_mes")),
+            "alias note missing: {:?}",
+            parsed.notes
+        );
+        // The raw JSON keeps the original dump, aliases applied only on the
+        // working copy.
+        assert!(parsed.raw.get("greeting").is_some());
+        assert!(parsed.raw.get("first_mes").is_none());
+    }
+
+    #[test]
+    fn character_wrapper_is_unwrapped() {
+        let dump = r#"{"character":{"name":"보","greeting":"반갑다","definition":""}}"#;
+        let parsed = parse_card_json(dump).expect("wrapped dump");
+        assert_eq!(parsed.canonical.name, "보");
+        assert_eq!(parsed.canonical.first_mes, "반갑다");
+        assert!(
+            parsed
+                .notes
+                .iter()
+                .any(|(_, reason)| reason.contains("래퍼")),
+            "unwrap note missing: {:?}",
+            parsed.notes
+        );
+    }
+
+    #[test]
+    fn aliases_never_override_standard_fields() {
+        let dump = r#"{"name":"나","first_mes":"표준 인사","greeting":"구형 인사","personality":"표준 성격","title":"별명"}"#;
+        let parsed = parse_card_json(dump).expect("hybrid dump");
+        assert_eq!(parsed.canonical.first_mes, "표준 인사");
+        assert_eq!(parsed.canonical.personality, "표준 성격");
+    }
+
+    #[test]
+    fn root_level_stray_keys_do_not_trigger_aliases_on_spec_cards() {
+        let card = r#"{"spec":"chara_card_v3","data":{"name":"아","description":"설명","personality":"brave"},"title":"메타 태그"}"#;
+        let parsed = parse_card_json(card).expect("v3 card");
+        assert_eq!(parsed.canonical.personality, "brave");
+        assert!(
+            parsed
+                .notes
+                .iter()
+                .all(|(_, reason)| !reason.contains("c.ai")),
+            "false alias notes: {:?}",
+            parsed.notes
+        );
+        // The raw JSON keeps the stray key untouched.
+        assert_eq!(
+            parsed.raw.get("title").and_then(serde_json::Value::as_str),
+            Some("메타 태그")
+        );
     }
 
     #[test]

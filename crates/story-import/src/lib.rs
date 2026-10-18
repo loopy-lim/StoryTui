@@ -1,5 +1,6 @@
-//! Character-card importer: compile SillyTavern/RisuAI cards (V1/V2/V3 PNG or
-//! JSON) plus optional World Info into a native StoryTui pack.
+//! Character-card importer: compile SillyTavern/RisuAI cards (V1/V2/V3 PNG
+//! or JSON, RisuAI `.charx` zip containers) plus Character.AI community-dump
+//! JSON and optional World Info into a native StoryTui pack.
 //!
 //! Policy contract (see `docs/plans/` for the full discussion):
 //! - **The parser is total** — the untouched card JSON always ships in
@@ -12,6 +13,7 @@
 //!   loader cannot drift apart.
 
 pub mod card;
+pub mod charx;
 pub mod chat;
 pub mod macros;
 pub mod normalize;

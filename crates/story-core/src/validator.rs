@@ -130,7 +130,12 @@ fn drop_unknown_references(
         "affection_delta",
     );
     drop_unknown_character_keys(&mut sanitized.trust_delta, state, &mut audit, "trust_delta");
-    drop_unknown_character_keys(&mut sanitized.tension_delta, state, &mut audit, "tension_delta");
+    drop_unknown_character_keys(
+        &mut sanitized.tension_delta,
+        state,
+        &mut audit,
+        "tension_delta",
+    );
     drop_unknown_character_keys(
         &mut sanitized.relationship_transitions,
         state,
@@ -169,7 +174,11 @@ fn drop_unknown_references(
     let unknown_events: Vec<String> = sanitized
         .add_events
         .iter()
-        .filter(|ev| !rules.events.contains_key(&story_model::EventId((*ev).clone())))
+        .filter(|ev| {
+            !rules
+                .events
+                .contains_key(&story_model::EventId((*ev).clone()))
+        })
         .cloned()
         .collect();
     for ev in unknown_events {
@@ -255,7 +264,8 @@ fn drop_unknown_character_keys<V: serde::Serialize>(
         .cloned()
         .collect();
     for ch in unknown {
-        let proposed = story_model::serde_json::to_value(map.get(&ch)).unwrap_or(story_model::serde_json::Value::Null);
+        let proposed = story_model::serde_json::to_value(map.get(&ch))
+            .unwrap_or(story_model::serde_json::Value::Null);
         audit.record(
             format!("state_patch.{field}.{ch}"),
             proposed,
@@ -275,7 +285,8 @@ fn drop_unknown_registry_keys<V: serde::Serialize>(
 ) {
     let unknown: Vec<String> = map.keys().filter(|key| !known(key)).cloned().collect();
     for key in unknown {
-        let proposed = story_model::serde_json::to_value(map.get(&key)).unwrap_or(story_model::serde_json::Value::Null);
+        let proposed = story_model::serde_json::to_value(map.get(&key))
+            .unwrap_or(story_model::serde_json::Value::Null);
         audit.record(
             format!("state_patch.{field}.{key}"),
             proposed,

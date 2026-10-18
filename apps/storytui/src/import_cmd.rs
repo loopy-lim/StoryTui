@@ -9,7 +9,7 @@ use story_provider::OpenAiCompatibleProvider;
 
 /// Help text for the import subcommand.
 pub fn usage() -> String {
-    "사용법: storytui import <카드.png|.json> [옵션]
+    "사용법: storytui import <카드.png|.json|.charx> [옵션]
 
   -o, --out PATH        출력 팩 디렉터리 (기본: stories/<카드명-slug>)
   --player-name NAME    {{user}} 매크로 치환에 쓸 호칭 (기본: 플레이어)

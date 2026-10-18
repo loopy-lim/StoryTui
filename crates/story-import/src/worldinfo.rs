@@ -13,6 +13,7 @@ use story_model::{LorebookEntry, LorebookLogic, LorebookPosition};
 use crate::card::{CardBook, CardBookEntry};
 
 /// A normalized lorebook: engine-ready entries plus book-level metadata.
+#[derive(Debug)]
 pub struct NormalizedBook {
     pub name: String,
     pub scan_depth: Option<u32>,

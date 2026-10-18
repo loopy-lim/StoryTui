@@ -208,13 +208,18 @@ fn unknown_string_var_is_dropped_with_audit() {
     patch
         .set_strings
         .insert("address_form".to_string(), "formal".to_string());
-    let outcome = run(&st, &rules, &patch).expect("unknown reference drops the entry, not the patch");
+    let outcome =
+        run(&st, &rules, &patch).expect("unknown reference drops the entry, not the patch");
     assert!(
         !outcome.sanitized.set_strings.contains_key("nonexistent"),
         "dropped key absent from sanitized patch"
     );
     assert_eq!(
-        outcome.sanitized.set_strings.get("address_form").map(String::as_str),
+        outcome
+            .sanitized
+            .set_strings
+            .get("address_form")
+            .map(String::as_str),
         Some("formal"),
         "known key survives alongside the drop"
     );
@@ -248,7 +253,10 @@ fn unknown_character_is_dropped() {
     let outcome = run(&st, &rules, &patch).expect("unknown character drops its entry");
     assert!(outcome.sanitized.affection_delta.is_empty());
     assert_eq!(
-        outcome.sanitized.trust_delta.get(&CharacterId("c-namu".to_string())),
+        outcome
+            .sanitized
+            .trust_delta
+            .get(&CharacterId("c-namu".to_string())),
         Some(&1),
         "known character's delta survives"
     );
@@ -263,7 +271,9 @@ fn empty_string_key_is_dropped() {
     let st = fresh_state();
     let rules = fresh_rules();
     let mut patch = StatePatch::default();
-    patch.set_strings.insert(String::new(), "formal".to_string());
+    patch
+        .set_strings
+        .insert(String::new(), "formal".to_string());
     let outcome = run(&st, &rules, &patch).expect("empty key drops, turn survives");
     assert!(outcome.sanitized.set_strings.is_empty());
     assert_eq!(outcome.warnings[0].code, PATCH_UNKNOWN_STRING);
@@ -349,7 +359,10 @@ fn unknown_refs_across_maps_all_drop_and_known_parts_still_range_check() {
     patch.add_events.insert("e-nope".to_string());
     let outcome = run(&st, &rules, &patch).expect("turn survives a stray key in every map");
     assert_eq!(
-        outcome.sanitized.affection_delta.get(&CharacterId("c-namu".to_string())),
+        outcome
+            .sanitized
+            .affection_delta
+            .get(&CharacterId("c-namu".to_string())),
         Some(&1)
     );
     assert!(outcome.sanitized.set_strings.is_empty());
