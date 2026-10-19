@@ -30,6 +30,7 @@ pub const MIN_HEIGHT: u16 = 12;
 /// - `footer`: small hint line (e.g. `"↑↓ 이동 · Enter 저장 · Esc 닫기"`).
 /// - `target`: one metadata line under the title — what the action applies
 ///   to (save mode names the story and turn; load mode passes `None`).
+///
 /// Resolve a click row inside the Save/Load modal to a slot index.
 pub fn save_load_selection_at(area: Rect, row: u16, slot_count: usize) -> Option<usize> {
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT || slot_count == 0 {

@@ -43,12 +43,6 @@ pub const BORDER_TYPE: BorderType = BorderType::Rounded;
 pub struct Styles;
 
 impl Styles {
-    /// Transparent default.
-    #[inline]
-    pub fn default() -> Style {
-        Style::default()
-    }
-
     /// Screen title style.
     #[inline]
     pub fn title() -> Style {
