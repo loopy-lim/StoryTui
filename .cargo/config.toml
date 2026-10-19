@@ -1,0 +1,16 @@
+[target.aarch64-apple-darwin]
+linker = "scripts/rust-lld-wrapper.sh"
+rustflags = [
+    "-C", "split-debuginfo=unpacked",
+]
+
+[target.x86_64-apple-darwin]
+linker = "scripts/rust-lld-wrapper.sh"
+rustflags = [
+    "-C", "split-debuginfo=unpacked",
+]
+
+[build]
+jobs = 10
+rustc-wrapper = "scripts/rustc-wrapper.sh"
+

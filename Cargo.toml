@@ -66,3 +66,19 @@ story-tui = { path = "crates/story-tui" }
 
 [profile.release]
 lto = "thin"
+
+[profile.dev]
+debug = 1
+
+[profile.test]
+debug = 1
+
+# Optimize 3rd-party dependencies in dev/test for dramatically faster execution
+# while keeping workspace crates at opt-level = 0 for instant recompilation.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.test.package."*"]
+opt-level = 2
+
+
