@@ -80,6 +80,39 @@
 **PASS** — AC-1..5 전부 독립 재실행 증거로 충족(story-tui 127개·storytui 55개 전부 ok, clippy 0,
 stale 증거 없음). 남음: ① 대화형 실단말 체감 확인은 사용자 실행(계획에 명시된 한계), ② F-3(가드
 거절 오류가 10+ 팩에서 피커에 가려질 수 있음)은 후속 과제로 분리.
+
+## 후속 작업 (2026-10-18, 사용자 "지금 바로 뒤이어서 개발" 승인)
+
+두 건을 소규모로 구현 — AC-FU1: Tab 브라우저가 마지막 임포트 **폴더 자체**(`import_last_dir` —
+파일 부모가 아닌 디렉터리)에서 시작해 이어서 탐색(없으면 기존 HOME 센티널; 통합 리뷰의 의도 질문으로
+"부모"에서 "폴더 자체"로 정정). AC-FU2: 팩 삭제 거절 오류를 피커 모달 안에 인라인 표시(`pack_notice`
+필드, `open_pack_picker`가 재오픈 때마다 초기화, 실패 시 호스트가 재오픈 후 설정 — G3 F-3 해소).
+
+| 검증 | 결과 |
+|---|---|
+| story-tui lib | 114개 전부 통과(신규 3: Tab 시작점 2분기, notice 설정·초기화, 피커 notice 렌더) |
+| storytui | 6 스위트 전부 ok |
+| clippy(--all-targets) + fmt | 경고 0, 정렬 |
+
+## 후속 작업 2: charx 배경 이미지 → 장면 이미지 (2026-10-19)
+
+요청: "이미지 넣는 것이나 그 장소들 제대로 안한거 아니야? Risu 구조를 확인해 봐라."
+
+**조사 결론**(`host/images.rs` + 실관찰 "서울에서 부산까지!" charx):
+- StoryTui 장면 이미지 컨벤션은 이미 존재: `images/locations/<location-id>.{png,jpg,jpeg,webp}`
+  우선, 폴백 `images/characters/<character-id>.*`(webp 목록 포함) — 팩이 배경을 갖고 있으면
+  런타임에 표시된다. 지금 임포터는 아바타만 가져오고 배경을 미지원 처리했다 → **갭**.
+- 실파일 자산 8개: 프로필 webp 5(캐릭터별), 배경 bg_ruins.webp 1, 폰트 woff2 1, 아바타 png 1.
+  Risu 관례상 배경은 type "x-risu-asset" + 이름 `bg_*`; V3 스펙 배경은 type "background".
+- 캐릭터 프로필 5장은 현재 단일 캐릭터 팩 구조(주요 인물 초상화만 렌더)로 표시 경로가 없다 →
+  다중 캐릭터 임포트(로어북→캐릭터 추출 휴리스틱+정규화 연계)는 **별도 후속 과제**로 분리.
+- 장소(rules.toml locations)는 카드·charx에 구조화 데이터가 없어 자동 생성 불가 — Director 생성
+  패스 과제로 분리. 폰트는 터미널 앱에 슬롯 없음(미지원 표기 유지).
+
+**범위(이번)**: AC-IMG1 charx `embeded://` 배경(V3 `type:"background"` 또는 Risu `name:"bg*"`)
+→ `images/locations/default-location.<ext>` 기록 + 리포트 매핑 표기. JSON 카드의 data-URI
+background도 동일 경로. AC-IMG2 배경 채택 후 나머지 자산 집계 정확히 갱신. 웹 디코딩 검증 포함.
+**범위 밖(후속 제안)**: 다중 캐릭터 임포트(+프로필 이미지), Director 기반 장소 생성.
 | V-4 | 실관찰: 렌더 테스트로 화면 확인(대화형 실사용은 사용자 실행) | repo root | 모달이 그려지고 힌트가 보임 | 브라우저 뷰(항목/`sub/`/힌트), 빈 목록 안내, 삭제 확인 모달(제목·경고·Enter 삭제) 렌더 테스트로 확인 | PASS |
 
 ## 평가와 인계

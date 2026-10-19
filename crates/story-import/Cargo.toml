@@ -16,6 +16,7 @@ toml.workspace = true
 zip.workspace = true
 
 [dev-dependencies]
+image.workspace = true
 story-core.workspace = true
 png.workspace = true
 tempfile.workspace = true

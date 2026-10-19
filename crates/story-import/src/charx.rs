@@ -29,6 +29,18 @@ pub fn parse_charx(bytes: &[u8]) -> Result<ParsedCard, String> {
     let card_text = read_card_json(&mut archive)?;
     let mut parsed = parse_card_json(&card_text)?;
     resolve_embeded_avatar(&mut parsed, &mut archive);
+    resolve_embeded_background(&mut parsed, &mut archive);
+    // Count the assets the pack could not carry, now that avatar and
+    // background have been consumed.
+    let consumed = usize::from(parsed.canonical.avatar.is_some())
+        + usize::from(parsed.canonical.background.is_some());
+    let others = parsed.card_data.assets.len().saturating_sub(consumed);
+    if others > 0 {
+        parsed.notes.push((
+            "assets".to_string(),
+            format!("아바타·배경 외 CHARX 자산 {others}개는 미지원 (원본 card.json에 보존)"),
+        ));
+    }
     note_container_files(&mut parsed, &mut archive);
     Ok(parsed)
 }
@@ -130,14 +142,56 @@ fn resolve_embeded_avatar<R: Read + Seek>(
         "assets.avatar".to_string(),
         "CHARX embeded:// 자산에서 아바타를 복원했습니다".to_string(),
     ));
+}
 
-    let others = parsed.card_data.assets.len() - 1;
-    if others > 0 {
-        parsed.notes.push((
-            "assets".to_string(),
-            format!("아바타 외 CHARX 자산 {others}개는 미지원 (원본 card.json에 보존)"),
-        ));
+/// Resolve the background scene image from `embeded://` asset URIs: the V3
+/// `background` type or Risu's `bg*`-named image assets. The scaffold writes
+/// it to `images/locations/` (the host's scene-image convention).
+fn resolve_embeded_background<R: Read + Seek>(
+    parsed: &mut ParsedCard,
+    archive: &mut zip::ZipArchive<R>,
+) {
+    if parsed.canonical.background.is_some() {
+        return;
     }
+    let candidates: Vec<&CardAsset> = parsed
+        .card_data
+        .assets
+        .iter()
+        .filter(|asset| {
+            asset.uri.starts_with("embeded://")
+                && (asset.asset_kind().contains("background")
+                    || asset.name.to_ascii_lowercase().starts_with("bg"))
+                && is_image_path(asset.uri.strip_prefix("embeded://").unwrap_or(&asset.uri))
+        })
+        .collect();
+    let Some(asset) = candidates.first().copied() else {
+        return;
+    };
+    let Some(path) = asset.uri.strip_prefix("embeded://").map(str::to_string) else {
+        return;
+    };
+
+    // The "external URI" note parse_card_json left behind no longer applies.
+    parsed
+        .notes
+        .retain(|(subject, _)| subject != "assets.background");
+
+    let Some((bytes, entry_path)) = read_entry(archive, &path) else {
+        parsed.notes.push((
+            "assets.background".to_string(),
+            format!("embeded:// 경로를 CHARX에서 찾지 못했습니다 ({path}) — 배경 생략"),
+        ));
+        return;
+    };
+    parsed.canonical.background = Some(AvatarImage {
+        bytes,
+        extension: image_extension(&entry_path),
+    });
+    parsed.notes.push((
+        "assets.background".to_string(),
+        "CHARX embeded:// 자산에서 배경 이미지를 복원했습니다".to_string(),
+    ));
 }
 
 /// Report container files the pack cannot carry (Risu modules, RisuAI
@@ -207,6 +261,19 @@ fn read_entry<R: Read + Seek>(
     None
 }
 
+/// Recognizable image path by extension — a Risu `bg*` filter must not
+/// swallow non-images (e.g. a font named `bg_font.woff2`).
+fn is_image_path(path: &str) -> bool {
+    matches!(
+        Path::new(path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("png" | "jpg" | "jpeg" | "webp" | "avif" | "gif")
+    )
+}
+
 /// Pack-storable image extension from a stored path; unknown extensions fall
 /// back to `png` (the scaffold writes `images/characters/<id>.<ext>`).
 fn image_extension(path: &str) -> &'static str {
@@ -248,7 +315,8 @@ mod tests {
             "first_mes": "어서 오세요.",
             "assets": [
                 {"type": "icon", "uri": "embeded://assets/icon/images/avatar.png", "name": "avatar", "ext": "png"},
-                {"type": "background", "uri": "embeded://assets/background/images/bg.png", "name": "bg", "ext": "png"}
+                {"type": "background", "uri": "embeded://assets/background/images/bg.png", "name": "bg", "ext": "png"},
+                {"type": "x-risu-asset", "uri": "embeded://assets/other/fonts/font_hand.woff2", "name": "font_hand", "ext": "woff2"}
             ]
         }
     }"#;
@@ -259,6 +327,7 @@ mod tests {
             ("card.json", CARD_JSON.as_bytes()),
             ("assets/icon/images/avatar.png", b"fakepng"),
             ("assets/background/images/bg.png", b"fakebg"),
+            ("assets/other/fonts/font_hand.woff2", b"fakefont"),
         ]);
         let parsed = parse_charx(&bytes).expect("charx");
         assert_eq!(parsed.canonical.name, "세라핀");
@@ -266,6 +335,9 @@ mod tests {
         let avatar = parsed.canonical.avatar.expect("avatar");
         assert_eq!(avatar.bytes, b"fakepng");
         assert_eq!(avatar.extension, "png");
+        let background = parsed.canonical.background.expect("background");
+        assert_eq!(background.bytes, b"fakebg");
+        assert_eq!(background.extension, "png");
         assert!(
             parsed
                 .notes
@@ -278,10 +350,41 @@ mod tests {
             parsed
                 .notes
                 .iter()
-                .any(|(subject, reason)| subject == "assets" && reason.contains("미지원")),
+                .any(|(subject, reason)| subject == "assets.background" && reason.contains("복원")),
+            "background note missing: {:?}",
+            parsed.notes
+        );
+        // Only the font remains unsupported: avatar + background consumed.
+        assert!(
+            parsed
+                .notes
+                .iter()
+                .any(|(subject, reason)| subject == "assets"
+                    && reason.contains("1개는 미지원")
+                    && reason.contains("아바타·배경 외")),
             "other-assets note missing: {:?}",
             parsed.notes
         );
+    }
+
+    #[test]
+    fn risu_bg_named_asset_resolves_as_background() {
+        // Risu containers mark backgrounds as type "x-risu-asset" with a
+        // `bg*` name; the font must NOT be mistaken for one.
+        let card = r#"{"spec":"chara_card_v3","data":{"name":"아","assets":[
+            {"type":"x-risu-asset","uri":"embeded://assets/other/image/bg_ruins.webp","name":"bg_ruins","ext":"webp"},
+            {"type":"x-risu-asset","uri":"embeded://assets/other/fonts/bg_font.woff2","name":"bg_font","ext":"woff2"}
+        ]}}"#;
+        let bytes = build_zip(&[
+            ("card.json", card.as_bytes()),
+            ("assets/other/image/bg_ruins.webp", b"fakewebp"),
+            ("assets/other/fonts/bg_font.woff2", b"fakefont"),
+        ]);
+        let parsed = parse_charx(&bytes).expect("charx");
+        let background = parsed.canonical.background.expect("background");
+        assert_eq!(background.bytes, b"fakewebp");
+        assert_eq!(background.extension, "webp");
+        assert!(parsed.canonical.avatar.is_none());
     }
 
     #[test]

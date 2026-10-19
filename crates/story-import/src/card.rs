@@ -46,6 +46,10 @@ pub struct CanonicalCard {
     pub book: Option<NormalizedBook>,
     /// Embedded avatar image (the PNG itself, or a V3 data-URI asset).
     pub avatar: Option<AvatarImage>,
+    /// Embedded background scene image (V3 `background` asset or a Risu
+    /// `bg*` asset). The scaffold writes it to `images/locations/` so the
+    /// host's scene-image convention picks it up.
+    pub background: Option<AvatarImage>,
 }
 
 /// A decoded avatar ready to be written under `images/characters/`.
@@ -132,6 +136,8 @@ pub fn parse_card_json(text: &str) -> Result<ParsedCard, String> {
         .map(|book| worldinfo::normalize_embedded_book(book, &mut notes));
     let (avatar, avatar_notes) = extract_asset_avatar(&card.assets);
     notes.extend(avatar_notes);
+    let (background, background_notes) = extract_asset_background(&card.assets);
+    notes.extend(background_notes);
 
     let canonical = CanonicalCard {
         name: card.name.clone(),
@@ -143,6 +149,7 @@ pub fn parse_card_json(text: &str) -> Result<ParsedCard, String> {
         mes_example: card.mes_example.clone(),
         book,
         avatar,
+        background,
     };
 
     Ok(ParsedCard {
@@ -424,6 +431,45 @@ fn extract_asset_avatar(assets: &[CardAsset]) -> (Option<AvatarImage>, Vec<(Stri
     (None, notes)
 }
 
+/// Pick an embedded background from V3 typed `background` assets (data URI
+/// only). CHARX containers resolve `embeded://` backgrounds themselves (see
+/// [`crate::charx`]), so those URIs stay silent here. Returns the image
+/// plus report notes; reuses [`AvatarImage`] (bytes + extension).
+fn extract_asset_background(assets: &[CardAsset]) -> (Option<AvatarImage>, Vec<(String, String)>) {
+    let mut notes = Vec::new();
+    for asset in assets {
+        if !asset.asset_kind().contains("background") {
+            continue;
+        }
+        if let Some(rest) = asset.uri.strip_prefix("data:") {
+            let (mime, payload) = rest.split_once(',').unwrap_or(("", rest));
+            let extension = if mime.contains("jpeg") || mime.contains("jpg") {
+                "jpg"
+            } else if mime.contains("webp") {
+                "webp"
+            } else {
+                "png"
+            };
+            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(payload.trim()) {
+                return (Some(AvatarImage { bytes, extension }), notes);
+            }
+            notes.push((
+                "assets.background".to_string(),
+                "data URI 디코딩 실패 — 배경 생략".to_string(),
+            ));
+            return (None, notes);
+        }
+        if !asset.uri.starts_with("embeded://") {
+            notes.push((
+                "assets.background".to_string(),
+                "외부 URI 배경은 내려받지 않습니다 (data URI·CHARX embeded만 지원)".to_string(),
+            ));
+        }
+        return (None, notes);
+    }
+    (None, notes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,6 +575,25 @@ mod tests {
         let parsed = parse_card_json(dump).expect("hybrid dump");
         assert_eq!(parsed.canonical.first_mes, "표준 인사");
         assert_eq!(parsed.canonical.personality, "표준 성격");
+    }
+
+    #[test]
+    fn v3_typed_background_data_uri_extracts() {
+        let payload = base64::engine::general_purpose::STANDARD.encode(b"fakebg");
+        let card = serde_json::json!({
+            "spec": "chara_card_v3",
+            "data": {
+                "name": "아",
+                "assets": [{
+                    "type": "background",
+                    "uri": format!("data:image/webp;base64,{payload}"),
+                }],
+            },
+        });
+        let parsed = parse_card_json(&card.to_string()).expect("v3 card");
+        let background = parsed.canonical.background.expect("background");
+        assert_eq!(background.bytes, b"fakebg");
+        assert_eq!(background.extension, "webp");
     }
 
     #[test]

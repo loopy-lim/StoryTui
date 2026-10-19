@@ -3223,6 +3223,7 @@ name = "story-import"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "image",
  "png 0.17.16",
  "serde",
  "serde_json",

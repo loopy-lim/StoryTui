@@ -179,6 +179,18 @@ pub fn emit_pack(
         std::fs::write(&path, &avatar.bytes)
             .map_err(|e| format!("아바타를 쓰지 못했습니다 ({}): {e}", path.display()))?;
     }
+    if let Some(background) = &card.background {
+        // The host's scene-image convention: images/locations/<location-id>
+        // wins over the character portrait. Imported packs start at
+        // `default-location` (story.toml initial_state).
+        let path = out_dir
+            .join("images/locations")
+            .join(format!("default-location.{}", background.extension));
+        std::fs::create_dir_all(out_dir.join("images/locations"))
+            .map_err(|e| format!("디렉터를 만들지 못했습니다 ({}): {e}", path.display()))?;
+        std::fs::write(&path, &background.bytes)
+            .map_err(|e| format!("배경 이미지를 쓰지 못했습니다 ({}): {e}", path.display()))?;
+    }
 
     // --- preserve the raw card ------------------------------------------------
     let raw_json = serde_json::to_string_pretty(&parsed.raw)
@@ -220,6 +232,11 @@ pub fn emit_pack(
         report
             .mapped
             .push(format!("아바타 → images/characters/{character_id}.*"));
+    }
+    if card.background.is_some() {
+        report
+            .mapped
+            .push("배경 자산 → images/locations/default-location.*".to_string());
     }
     if !lorebook.entries.is_empty() {
         report.mapped.push(format!(
