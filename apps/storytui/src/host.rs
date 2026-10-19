@@ -205,11 +205,15 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
     if let Some(restored) = resume_engine.as_mut() {
         restored.use_director_writer = config.use_director_writer;
     }
-    let mut scene_image_cache = images::SceneImageCache::default();
+    let mut scene_images = images::LocationImageStore::default();
     let mut app = App::new(build_view(&engine, &pack, None, None));
     app.set_image_picker(image_picker);
-    refresh_scene_images(&mut app, &pack, &engine, &mut scene_image_cache);
-    app.set_lists(&engine.game.history, &engine.game.memories);
+    refresh_location_images(&mut app, &pack, &engine, &mut scene_images);
+    app.set_lists(
+        &engine.game.history,
+        &engine.game.memories,
+        &pack.metadata.initial_state.location,
+    );
     app.set_can_continue(resume_engine.is_some());
     app.set_greetings(greeting_labels(&pack));
     app.set_current_pack_dir(&config.pack_dir.to_string_lossy());
@@ -291,12 +295,12 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
                         let pending = app.view.loading.as_ref().map(|v| v.generation_id);
                         if let Some(command) = app.handle_key(key, pending) {
-                            dispatch(command, &mut engine, &mut app, &pack, &provider, &config, &save_store, &tts, &mut scene_image_cache, &tx, &mut cancellation).await?;
+                            dispatch(command, &mut engine, &mut app, &pack, &provider, &config, &save_store, &tts, &mut scene_images, &tx, &mut cancellation).await?;
                         }
                         handle_ui_requests(
                             &mut app, &mut engine, &mut pack, &mut provider_config,
                             &mut provider, &mut user_settings, &mut config,
-                            &save_store, &tts, &mut scene_image_cache, &tx, &mut cancellation, &mut resume_engine,
+                            &save_store, &tts, &mut scene_images, &tx, &mut cancellation, &mut resume_engine,
                         ).await?;
                         needs_redraw = true;
                     }
@@ -312,7 +316,7 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                                 &config,
                                 &save_store,
                                 &tts,
-                                &mut scene_image_cache,
+                                &mut scene_images,
                                 &tx,
                                 &mut cancellation,
                             )
@@ -321,7 +325,7 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                         handle_ui_requests(
                             &mut app, &mut engine, &mut pack, &mut provider_config,
                             &mut provider, &mut user_settings, &mut config,
-                            &save_store, &tts, &mut scene_image_cache, &tx, &mut cancellation, &mut resume_engine,
+                            &save_store, &tts, &mut scene_images, &tx, &mut cancellation, &mut resume_engine,
                         ).await?;
                         // Movement carries no render state (hover is not
                         // rendered): a full frame per move event starved the
@@ -369,7 +373,7 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                                 }
                             }
                         };
-                        dispatch(command, &mut engine, &mut app, &pack, &provider, &config, &save_store, &tts, &mut scene_image_cache, &tx, &mut cancellation).await?;
+                        dispatch(command, &mut engine, &mut app, &pack, &provider, &config, &save_store, &tts, &mut scene_images, &tx, &mut cancellation).await?;
                         needs_redraw = true;
                     }
                     HostMessage::Director { generation_id, result } => {
@@ -392,7 +396,7 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                                 }
                             }
                         };
-                        dispatch(command, &mut engine, &mut app, &pack, &provider, &config, &save_store, &tts, &mut scene_image_cache, &tx, &mut cancellation).await?;
+                        dispatch(command, &mut engine, &mut app, &pack, &provider, &config, &save_store, &tts, &mut scene_images, &tx, &mut cancellation).await?;
                         needs_redraw = true;
                     }
                     HostMessage::Writer { generation_id, model, result } => {
@@ -407,7 +411,7 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                                 EngineCommand::ProviderFailed { generation_id, error: provider_error_view(error) }
                             }
                         };
-                        dispatch(command, &mut engine, &mut app, &pack, &provider, &config, &save_store, &tts, &mut scene_image_cache, &tx, &mut cancellation).await?;
+                        dispatch(command, &mut engine, &mut app, &pack, &provider, &config, &save_store, &tts, &mut scene_images, &tx, &mut cancellation).await?;
                         needs_redraw = true;
                     }
                     HostMessage::ImportFinished { path, result } => {
@@ -465,7 +469,7 @@ fn swap_pack(
     pack_dir: &str,
     pack: &mut StoryPack,
     engine: &mut EngineState,
-    scene_images: &mut images::SceneImageCache,
+    scene_images: &mut images::LocationImageStore,
     config: &RuntimeConfig,
     cancellation: &mut Option<(story_model::uuid::Uuid, CancellationToken)>,
     resume_engine: &mut Option<EngineState>,
@@ -491,14 +495,20 @@ fn swap_pack(
     *engine = EngineState::initial(pack);
     engine.use_director_writer = config.use_director_writer;
     *resume_engine = None;
-    *scene_images = images::SceneImageCache::default();
+    // Paired clear: the app's encoded images and this store must reset
+    // together or the previous pack's images survive the switch.
+    reset_scene_images(app, scene_images);
     app.set_view(build_view(engine, pack, None, None));
-    app.set_lists(&engine.game.history, &engine.game.memories);
+    app.set_lists(
+        &engine.game.history,
+        &engine.game.memories,
+        &pack.metadata.initial_state.location,
+    );
     app.follow_story_end();
     app.set_can_continue(false);
     app.set_greetings(greeting_labels(pack));
     app.set_current_pack_dir(pack_dir);
-    refresh_scene_images(app, pack, engine, scene_images);
+    refresh_location_images(app, pack, engine, scene_images);
     tracing::info!(pack = %pack_dir, "switched to the imported pack");
 }
 
@@ -532,19 +542,44 @@ fn read_greeting(pack: &StoryPack, index: usize) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
-/// Refresh the scene image cache and push its update into the view: set a new
-/// image, clear it, or leave the current pane untouched.
-fn refresh_scene_images(
+/// Refresh the per-location image store and push newly resolved images into
+/// the view. Runs on every publish; a location decodes at most once per pack
+/// session, so the common case is a no-op scan of visited locations.
+fn refresh_location_images(
     app: &mut App,
     pack: &StoryPack,
     engine: &EngineState,
-    cache: &mut images::SceneImageCache,
+    store: &mut images::LocationImageStore,
 ) {
-    match cache.refresh(pack, engine) {
-        images::SceneImageUpdate::Set(image) => app.set_scene_image(Some(image)),
-        images::SceneImageUpdate::Clear => app.set_scene_image(None),
-        images::SceneImageUpdate::Unchanged => {}
+    let primary = engine.game.characters.keys().next().map(|id| id.0.clone());
+    let initial = &pack.metadata.initial_state.location;
+    // Distinct locations in play, order-preserving; the opening location is
+    // always in play (the empty-stack opening shows its image).
+    let mut seen = std::collections::HashSet::new();
+    let mut locations = vec![initial.0.clone()];
+    seen.insert(initial.0.clone());
+    for location in story_tui::location_timeline(&engine.game.history, initial)
+        .into_iter()
+        .flatten()
+    {
+        if seen.insert(location.clone()) {
+            locations.push(location);
+        }
     }
+    for (location, resolved) in store.load_missing(pack, &locations, primary.as_deref()) {
+        app.set_location_image(&location, resolved);
+    }
+}
+
+/// Clear the per-location images on BOTH sides in lockstep.
+///
+/// Invariant: the host's decode store and the app's encoded image map must be
+/// reset together. Clearing only one side lets the previous pack's images
+/// survive a pack switch — the stale-portrait bug fixed 2026-10-19 (a fresh
+/// cache that answered `Unchanged` instead of `Clear` for an imageless pack).
+fn reset_scene_images(app: &mut App, store: &mut images::LocationImageStore) {
+    store.clear();
+    app.reset_location_images();
 }
 
 #[allow(clippy::too_many_arguments)] // consumes all host-owned UI requests in one place
@@ -558,7 +593,7 @@ async fn handle_ui_requests(
     config: &mut RuntimeConfig,
     save_store: &SaveStore,
     tts: &TtsService,
-    scene_images: &mut images::SceneImageCache,
+    scene_images: &mut images::LocationImageStore,
     tx: &UnboundedSender<HostMessage>,
     cancellation: &mut Option<(story_model::uuid::Uuid, CancellationToken)>,
     resume_engine: &mut Option<EngineState>,
@@ -684,10 +719,14 @@ async fn handle_ui_requests(
                 new_engine.use_director_writer = config.use_director_writer;
                 *engine = new_engine;
                 app.set_view(build_view(engine, pack, None, None));
-                app.set_lists(&engine.game.history, &engine.game.memories);
+                app.set_lists(
+                    &engine.game.history,
+                    &engine.game.memories,
+                    &pack.metadata.initial_state.location,
+                );
                 app.follow_story_end();
                 app.close_home();
-                refresh_scene_images(app, pack, engine, scene_images);
+                refresh_location_images(app, pack, engine, scene_images);
                 dispatch(
                     EngineCommand::StartNewGame,
                     engine,
@@ -708,10 +747,14 @@ async fn handle_ui_requests(
                     restored.use_director_writer = config.use_director_writer;
                     *engine = restored;
                     app.set_view(build_view(engine, pack, None, None));
-                    app.set_lists(&engine.game.history, &engine.game.memories);
+                    app.set_lists(
+                        &engine.game.history,
+                        &engine.game.memories,
+                        &pack.metadata.initial_state.location,
+                    );
                     app.follow_story_end();
                     app.set_can_continue(false);
-                    refresh_scene_images(app, pack, engine, scene_images);
+                    refresh_location_images(app, pack, engine, scene_images);
                 }
             }
             HomeRequest::PickPack => {
@@ -852,7 +895,7 @@ async fn handle_ui_requests(
             config.use_director_writer,
             cancellation,
         );
-        refresh_scene_images(app, pack, engine, scene_images);
+        refresh_location_images(app, pack, engine, scene_images);
     }
     Ok(())
 }
@@ -894,7 +937,7 @@ async fn dispatch(
     config: &RuntimeConfig,
     save_store: &SaveStore,
     tts: &TtsService,
-    scene_images: &mut images::SceneImageCache,
+    scene_images: &mut images::LocationImageStore,
     tx: &UnboundedSender<HostMessage>,
     cancellation: &mut Option<(story_model::uuid::Uuid, CancellationToken)>,
 ) -> Result<(), String> {
@@ -914,7 +957,11 @@ async fn dispatch(
         e.to_string()
     })?;
     *engine = transition.state;
-    app.set_lists(&engine.game.history, &engine.game.memories);
+    app.set_lists(
+        &engine.game.history,
+        &engine.game.memories,
+        &pack.metadata.initial_state.location,
+    );
 
     for effect in transition.effects {
         match effect {
@@ -927,7 +974,7 @@ async fn dispatch(
                 if turn_completed && !narration.trim().is_empty() {
                     tts.speak(narration).await;
                 }
-                refresh_scene_images(app, pack, engine, scene_images);
+                refresh_location_images(app, pack, engine, scene_images);
             }
             EngineEffect::ShowRecoverableError(error) => app.view.error = Some(error),
             // No model selected yet (first run before auto-setup succeeded):

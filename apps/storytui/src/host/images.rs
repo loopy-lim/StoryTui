@@ -4,38 +4,42 @@
 //! wins, then `images/characters/<character-id>.png` for the primary
 //! character. Extensions are probed in [`IMAGE_EXTENSIONS`] order. The pack
 //! loader stays text-only (`ADR-003`); the host owns all file access.
+//!
+//! The transcript shows one image per scene boundary, so resolution is
+//! per-location and cached in a [`LocationImageStore`] — a location decodes
+//! at most once per pack session.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use story_core::engine::EngineState;
+use image::DynamicImage;
 use story_model::StoryPack;
 
 pub const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp"];
 
-/// Candidate image paths for the current scene, most specific first:
-/// location art, then the primary character's portrait.
-pub fn scene_image_candidates(pack: &StoryPack, engine: &EngineState) -> Vec<PathBuf> {
+/// Candidate image paths for `location`, most specific first: location art,
+/// then the primary character's portrait.
+pub fn location_image_candidates(
+    pack: &StoryPack,
+    location: &str,
+    primary_character: Option<&str>,
+) -> Vec<PathBuf> {
     let images = pack.pack_root.join("images");
     let mut candidates: Vec<PathBuf> = Vec::with_capacity(IMAGE_EXTENSIONS.len() * 2);
-    if is_safe_stem(engine.game.location.0.as_str()) {
+    if is_safe_stem(location) {
         for ext in IMAGE_EXTENSIONS {
-            candidates.push(
-                images
-                    .join("locations")
-                    .join(format!("{}.{}", engine.game.location.0, ext)),
-            );
+            candidates.push(images.join("locations").join(format!("{location}.{ext}")));
         }
     }
-    // The view's primary character is the first key of the state map; a
-    // portrait is the fallback when the location has no art.
-    if let Some(character_id) = engine.game.characters.keys().next()
-        && is_safe_stem(character_id.0.as_str())
+    // A portrait is the fallback when the location has no art.
+    if let Some(character_id) = primary_character
+        && is_safe_stem(character_id)
     {
         for ext in IMAGE_EXTENSIONS {
             candidates.push(
                 images
                     .join("characters")
-                    .join(format!("{}.{}", character_id.0, ext)),
+                    .join(format!("{character_id}.{ext}")),
             );
         }
     }
@@ -45,18 +49,19 @@ pub fn scene_image_candidates(pack: &StoryPack, engine: &EngineState) -> Vec<Pat
 /// First candidate that actually DECODES. A corrupt location image must not
 /// permanently shadow a valid character portrait, so decode failures fall
 /// through to the next candidate instead of ending the search.
-pub fn load_scene_image(
+pub fn load_location_image(
     pack: &StoryPack,
-    engine: &EngineState,
-) -> Option<(PathBuf, image::DynamicImage)> {
-    scene_image_candidates(pack, engine)
+    location: &str,
+    primary_character: Option<&str>,
+) -> Option<(PathBuf, DynamicImage)> {
+    location_image_candidates(pack, location, primary_character)
         .into_iter()
         .filter(|path| path.is_file())
         .find_map(|path| decode_scene_image(&path).map(|decoded| (path, decoded)))
 }
 
-/// Decode the scene image at `path`. Failures are logged and become "no
-/// image" — a broken asset must never block play.
+/// Decode the image at `path`. Failures are logged and become "no image" — a
+/// broken asset must never block play.
 pub fn decode_scene_image(path: &Path) -> Option<image::DynamicImage> {
     match image::ImageReader::open(path) {
         Ok(reader) => match reader.decode() {
@@ -79,50 +84,52 @@ fn is_safe_stem(stem: &str) -> bool {
     !stem.is_empty() && stem != "." && stem != ".." && !stem.contains(['/', '\\', '\0'])
 }
 
-/// What the host should do with the scene-image pane after a refresh.
-#[derive(Debug, PartialEq)]
-pub enum SceneImageUpdate {
-    /// The scene's image did not change — keep the current pane.
-    Unchanged,
-    /// A new image exists for the (new) scene.
-    Set(image::DynamicImage),
-    /// The new scene has no image (or the previous one vanished).
-    Clear,
-}
-
-/// Remembers which path the current scene image came from so an unchanged
-/// scene never re-decodes across turns.
+/// Per-location decode cache. The value is the winning candidate's path
+/// (`None` = resolved but no usable art — an authoritative absence).
+///
+/// Invariant: this store and the App's per-location image map are cleared
+/// together on a pack switch (`host::reset_scene_images`). A fresh store is
+/// authoritative — after a clear, every location resolves again and reports
+/// its outcome, so a stale image from the previous pack can never survive.
 #[derive(Default)]
-pub struct SceneImageCache {
-    last_path: Option<PathBuf>,
+pub struct LocationImageStore {
+    resolved: HashMap<String, Option<PathBuf>>,
 }
 
-impl SceneImageCache {
-    /// Resolve + (on change) decode the scene image for `engine`. The cache
-    /// key is the winning candidate's path, so a scene whose image is decoded
-    /// once is not re-read every turn.
-    pub fn refresh(&mut self, pack: &StoryPack, engine: &EngineState) -> SceneImageUpdate {
-        // Fast path: `last_path` only ever stores a decode-success path, so
-        // its continued existence means the same usable image is still there.
-        // This keeps every-turn PublishView refreshes decode-free.
-        if self.last_path.as_ref().is_some_and(|path| path.is_file()) {
-            return SceneImageUpdate::Unchanged;
+impl LocationImageStore {
+    /// Resolve + decode every location in `locations` not already cached
+    /// under a still-existing path. Returns ONLY locations whose outcome
+    /// changed (freshly resolved, or re-resolved differently after their
+    /// file vanished) so the host pushes them into the app exactly once.
+    pub fn load_missing(
+        &mut self,
+        pack: &StoryPack,
+        locations: &[String],
+        primary_character: Option<&str>,
+    ) -> Vec<(String, Option<(PathBuf, DynamicImage)>)> {
+        let mut updates = Vec::new();
+        for location in locations {
+            // A known winner skips re-decoding while its file exists; this
+            // keeps every-publish refreshes decode-free.
+            if let Some(Some(path)) = self.resolved.get(location)
+                && path.is_file()
+            {
+                continue;
+            }
+            let usable = load_location_image(pack, location, primary_character);
+            let path = usable.as_ref().map(|(path, _)| path.clone());
+            if self.resolved.get(location) != Some(&path) {
+                updates.push((location.clone(), usable));
+            }
+            self.resolved.insert(location.clone(), path);
         }
-        let usable = load_scene_image(pack, engine);
-        let path = usable.as_ref().map(|(path, _)| path.clone());
-        // `Unchanged` keeps whatever image the app currently shows, so it is
-        // only sound when we know that image's path. A fresh cache (pack
-        // switch) holding `last_path: None` must resolve authoritatively —
-        // reporting Unchanged here would let the previous pack's portrait
-        // survive a switch to a pack without images.
-        if path == self.last_path && self.last_path.is_some() {
-            return SceneImageUpdate::Unchanged;
-        }
-        self.last_path = path;
-        match usable {
-            Some((_, image)) => SceneImageUpdate::Set(image),
-            None => SceneImageUpdate::Clear,
-        }
+        updates
+    }
+
+    /// Drop every resolution. The caller MUST also clear the App's image map
+    /// in the same step (see the invariant on [`LocationImageStore`]).
+    pub fn clear(&mut self) {
+        self.resolved.clear();
     }
 }
 
@@ -185,15 +192,15 @@ mod tests {
                 likes: vec![],
                 dislikes: vec![],
                 secrets: vec![],
+                known_facts: vec![],
+                unknown_facts: vec![],
+                current_goal: String::new(),
+                long_term_desire: String::new(),
                 initial_player_relationship: RelationshipStage::Acquaintance,
                 speech_style: String::new(),
                 honorific_rule: String::new(),
                 frequent_phrases: vec![],
                 avoid_phrases: vec![],
-                known_facts: vec![],
-                unknown_facts: vec![],
-                current_goal: String::new(),
-                long_term_desire: String::new(),
             },
         );
         StoryPack {
@@ -226,16 +233,15 @@ mod tests {
     fn location_image_wins_then_character_falls_back() {
         let dir = tempfile::tempdir().expect("tempdir");
         let pack = pack_at(dir.path());
-        let engine = EngineState::initial(&pack);
 
         // No images at all.
-        assert!(load_scene_image(&pack, &engine).is_none());
+        assert!(load_location_image(&pack, "cafe", Some("yuna")).is_none());
 
         // Character portrait appears as the fallback.
         let portrait = dir.path().join("images/characters/yuna.png");
         write_png(&portrait);
         assert_eq!(
-            load_scene_image(&pack, &engine).map(|(path, _)| path),
+            load_location_image(&pack, "cafe", Some("yuna")).map(|(path, _)| path),
             Some(portrait.clone())
         );
 
@@ -243,7 +249,7 @@ mod tests {
         let scene = dir.path().join("images/locations/cafe.png");
         write_png(&scene);
         assert_eq!(
-            load_scene_image(&pack, &engine).map(|(path, _)| path),
+            load_location_image(&pack, "cafe", Some("yuna")).map(|(path, _)| path),
             Some(scene)
         );
     }
@@ -252,13 +258,12 @@ mod tests {
     fn extension_order_is_png_first() {
         let dir = tempfile::tempdir().expect("tempdir");
         let pack = pack_at(dir.path());
-        let engine = EngineState::initial(&pack);
         let jpg = dir.path().join("images/locations/cafe.jpg");
         write_png(&jpg);
         let png = dir.path().join("images/locations/cafe.png");
         write_png(&png);
         assert_eq!(
-            load_scene_image(&pack, &engine).map(|(path, _)| path),
+            load_location_image(&pack, "cafe", None).map(|(path, _)| path),
             Some(png),
             "png must win over jpg when both exist"
         );
@@ -268,16 +273,13 @@ mod tests {
     fn unsafe_location_id_is_skipped_not_crashed() {
         let dir = tempfile::tempdir().expect("tempdir");
         let pack = pack_at(dir.path());
-        let mut engine = EngineState::initial(&pack);
-        engine.game.location = LocationId("../evil".to_string());
-        assert!(load_scene_image(&pack, &engine).is_none());
+        assert!(load_location_image(&pack, "../evil", None).is_none());
     }
 
     #[test]
     fn broken_location_image_falls_through_to_character_portrait() {
         let dir = tempfile::tempdir().expect("tempdir");
         let pack = pack_at(dir.path());
-        let engine = EngineState::initial(&pack);
         // A corrupt location asset must not permanently shadow a valid
         // portrait: decode failure falls through to the next candidate.
         let broken = dir.path().join("images/locations/cafe.png");
@@ -287,75 +289,59 @@ mod tests {
         write_png(&portrait);
 
         assert_eq!(
-            load_scene_image(&pack, &engine).map(|(path, _)| path),
+            load_location_image(&pack, "cafe", Some("yuna")).map(|(path, _)| path),
             Some(portrait)
         );
     }
 
     #[test]
-    fn fresh_cache_without_image_reports_clear_not_unchanged() {
-        // A pack switch resets the cache. `Unchanged` would keep whatever the
-        // app currently shows — the previous pack's portrait — so a fresh
-        // cache over a pack without images must resolve to Clear.
+    fn resolved_locations_are_not_redecoded_until_the_file_vanishes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let pack = pack_at(dir.path());
-        let engine = EngineState::initial(&pack);
-
-        let mut cache = SceneImageCache::default();
-        assert_eq!(
-            cache.refresh(&pack, &engine),
-            SceneImageUpdate::Clear,
-            "fresh cache must be authoritative even when no image exists"
-        );
-        // Steady state: repeated turns over the same imageless pack keep
-        // reporting Clear (an idempotent no-op downstream), never Unchanged
-        // — `last_path` stays None, so the cache never claims to know what
-        // the app is showing.
-        assert_eq!(
-            cache.refresh(&pack, &engine),
-            SceneImageUpdate::Clear,
-            "None must not masquerade as a known-unchanged image"
-        );
-    }
-
-    #[test]
-    fn unchanged_scene_does_not_redecode() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let pack = pack_at(dir.path());
-        let engine = EngineState::initial(&pack);
         let scene = dir.path().join("images/locations/cafe.png");
         write_png(&scene);
 
-        let mut cache = SceneImageCache::default();
-        assert!(matches!(
-            cache.refresh(&pack, &engine),
-            SceneImageUpdate::Set(_)
-        ));
+        let mut store = LocationImageStore::default();
+        let updates = store.load_missing(&pack, &["cafe".to_string()], None);
+        assert_eq!(updates.len(), 1, "fresh store resolves and reports");
+        assert!(updates[0].1.is_some());
 
-        // Corrupt the bytes behind the SAME path. The cache trusts the
-        // existing winner while the path exists: re-decoding here would fall
-        // through and report Clear instead.
+        // Corrupt the bytes behind the SAME path: the cache trusts the
+        // existing winner while the path exists, so nothing is re-reported.
         std::fs::write(&scene, b"corrupted bytes").expect("corrupt");
-        assert_eq!(
-            cache.refresh(&pack, &engine),
-            SceneImageUpdate::Unchanged,
-            "an existing winner must never be re-decoded on every turn"
+        assert!(
+            store
+                .load_missing(&pack, &["cafe".to_string()], None)
+                .is_empty()
         );
 
-        // Once the path disappears, the cache re-scans and clears.
+        // Once the path disappears, the store re-scans and reports the
+        // changed outcome (now absent).
         std::fs::remove_file(&scene).expect("remove");
-        assert_eq!(cache.refresh(&pack, &engine), SceneImageUpdate::Clear);
+        let updates = store.load_missing(&pack, &["cafe".to_string()], None);
+        assert_eq!(updates.len(), 1);
+        assert!(updates[0].1.is_none());
     }
 
     #[test]
-    fn decode_failure_with_no_fallback_clears() {
+    fn cleared_store_re_resolves_and_reports_absence() {
+        // A pack switch resets the store. The fresh store must be
+        // authoritative: a pack without images reports its absence (so the
+        // paired app-side clear is followed by a real resolution), never
+        // silence that would keep the previous pack's image alive.
         let dir = tempfile::tempdir().expect("tempdir");
         let pack = pack_at(dir.path());
-        let engine = EngineState::initial(&pack);
-        let broken = dir.path().join("images/locations/cafe.png");
-        std::fs::create_dir_all(broken.parent().expect("parent")).expect("mkdir");
-        std::fs::write(&broken, b"not a png").expect("write junk");
-        assert!(load_scene_image(&pack, &engine).is_none());
+
+        let mut store = LocationImageStore::default();
+        assert!(
+            store.load_missing(&pack, &["cafe".to_string()], None)[0]
+                .1
+                .is_none()
+        );
+        store.clear();
+        let updates = store.load_missing(&pack, &["cafe".to_string()], None);
+        assert_eq!(updates.len(), 1, "fresh store must re-resolve");
+        assert!(updates[0].1.is_none());
     }
 
     #[test]

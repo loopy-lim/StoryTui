@@ -114,7 +114,11 @@ pub fn handle_request(
                     restored.use_director_writer = use_director_writer;
                     *engine = restored;
                     app.close_save_load();
-                    app.set_lists(&engine.game.history, &engine.game.memories);
+                    app.set_lists(
+                        &engine.game.history,
+                        &engine.game.memories,
+                        &pack.metadata.initial_state.location,
+                    );
                     app.set_view(build_view(engine, pack, None, None));
                     app.follow_story_end();
                 }

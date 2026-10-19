@@ -49,6 +49,7 @@ fn entry(turn: u32) -> story_tui::StoryStackEntry {
         generation_secs: Some(42),
         player_action: Some("조용히 자리에 앉는다".to_string()),
         narration,
+        location: None,
     }
 }
 
@@ -56,7 +57,7 @@ fn entry(turn: u32) -> story_tui::StoryStackEntry {
 fn render_probe_full_stack_draw_timing() {
     let stack: Vec<_> = (1..=120).map(entry).collect();
     let mut app = App::new(sample_view(120));
-    app.set_lists(&[], &[]);
+    app.set_lists(&[], &[], &story_model::LocationId("cafe".to_string()));
     app.replace_story_stack(stack);
 
     let mut terminal = Terminal::new(TestBackend::new(100, 40)).expect("terminal");

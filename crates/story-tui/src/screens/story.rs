@@ -16,7 +16,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
 };
-use ratatui_image::Image;
+use ratatui_image::sliced::{SignedPosition, SlicedImage};
 use story_model::{AppViewModel, RiskLevel, TimeSlot};
 use unicode_width::UnicodeWidthStr;
 
@@ -49,7 +49,26 @@ pub struct StoryStackEntry {
     pub generation_secs: Option<u64>,
     pub player_action: Option<String>,
     pub narration: String,
+    /// Location this turn happened at (folded from the history's state
+    /// patches by `location_timeline`). `None` only for hand-built test
+    /// entries; drives inline scene images.
+    pub location: Option<String>,
 }
+
+/// One renderable unit of the transcript, in chronological order. The
+/// narration pane lays blocks out vertically: a scene image inserted before
+/// the turn that entered a new location, then that turn's text.
+#[derive(Clone)]
+pub enum StoryBlock<'a> {
+    /// A turn's text (header, meta, action, narration) or the opening text.
+    Text(std::borrow::Cow<'a, [Line<'static>]>),
+    /// A location image at a scene boundary.
+    Image(&'a SceneImage),
+}
+
+/// Blank rows rendered below an inline image so it never touches the `────`
+/// rule of the following turn block.
+pub const IMAGE_BLOCK_SPACER_ROWS: u16 = 1;
 
 pub fn render_list(frame: &mut Frame, area: Rect, mode: ListMode, items: &[String], scroll: u16) {
     let title = match mode {
@@ -225,10 +244,9 @@ pub fn render_story(
     narration_scroll: u16,
     input_mode: bool,
     input: &InputBuffer,
-    narration_text: Text,
+    blocks: &[StoryBlock<'_>],
     streaming_narration: Option<&str>,
     generation_elapsed_secs: Option<u64>,
-    scene_image: Option<&SceneImage>,
 ) -> u16 {
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         render_min_size_warning(frame, area, MIN_WIDTH, MIN_HEIGHT);
@@ -284,53 +302,82 @@ pub fn render_story(
         ])
         .split(body)
     };
-    // Scene image column: when the pack ships an image for the current
-    // location/character and the terminal is wide enough, the narration text
-    // shrinks to keep a readable minimum column. One blank gutter column
-    // keeps wrapped prose from touching the image pixels.
-    let (narration_region, image_region): (Rect, Option<Rect>) = if let Some(image) = scene_image
-        && image.fits_beside_narration(chunks[0].width.saturating_sub(1))
-        && chunks[0].height >= 4
-    {
-        let split = Layout::horizontal([
-            Constraint::Fill(1),
-            Constraint::Length(1),
-            Constraint::Length(image.cols),
-        ])
-        .split(chunks[0]);
-        (split[0], Some(split[2]))
-    } else {
-        (chunks[0], None)
-    };
-    if let Some(image) = scene_image
-        && let Some(region) = image_region
-    {
-        frame.render_widget(Image::new(&image.protocol), region);
-    }
+    // The transcript owns the full narration region: scene images are rows
+    // IN the transcript (inserted at scene boundaries), not a column beside
+    // it, so they scroll together with the prose.
+    let narration_region = chunks[0];
     // Decide the scrollbar against the width the text occupies *with* the
     // scrollbar present, so the one-column reservation cannot flip the
     // decision it feeds. When it fits at the narrower width it also fits at
     // the wider one, so the choice stays stable frame to frame.
-    let needs_scrollbar = wrapped_line_count(
-        &narration_text,
-        narration_region.width.saturating_sub(1).max(1),
-    ) > narration_region.height as usize;
+    let decide_width = narration_region.width.saturating_sub(1).max(1);
+    // Pass 1: each block's visual height. Text heights wrap at `decide_width`
+    // (see the text render below for why that is exact when it matters);
+    // image heights are exact cell counts.
+    let mut spans: Vec<(usize, u16)> = Vec::with_capacity(blocks.len());
+    let mut total_rows: usize = 0;
+    for block in blocks {
+        let height = match block {
+            StoryBlock::Text(lines) => wrapped_line_count(lines, decide_width) as u16,
+            StoryBlock::Image(image) => image.rows.saturating_add(IMAGE_BLOCK_SPACER_ROWS),
+        };
+        spans.push((total_rows, height));
+        total_rows += height as usize;
+    }
+    let needs_scrollbar = total_rows > narration_region.height as usize;
     let narration_chunks = if needs_scrollbar {
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(1)]).split(narration_region)
     } else {
         [narration_region, Rect::default()].into()
     };
     let narration_area = narration_chunks[0];
-    let content_lines = wrapped_line_count(&narration_text, narration_area.width);
-    let max_scroll = content_lines.saturating_sub(narration_area.height as usize) as u16;
-    let scroll_position = narration_scroll.min(max_scroll);
-    let narration = Paragraph::new(narration_text)
-        .wrap(Wrap { trim: false })
-        .style(Style::default().fg(Color::Gray));
     // Mouse wheels and PageDown can generate an offset beyond the wrapped
     // content. Clamp it here so the pane never becomes mysteriously blank.
-    let narration = narration.scroll((scroll_position, 0));
-    frame.render_widget(narration, narration_area);
+    let max_scroll = total_rows.saturating_sub(narration_area.height as usize) as u16;
+    let scroll_position = narration_scroll.min(max_scroll);
+    // Pass 2: render only the blocks intersecting the viewport. Text heights
+    // were computed at `decide_width`; with a scrollbar the text renders at
+    // exactly that width, so the counts are exact. Without a scrollbar the
+    // scroll clamps to zero — every block renders whole from its start — so a
+    // height computed at the narrower width is only an unused upper bound.
+    let viewport_top = scroll_position as usize;
+    let viewport_bottom = viewport_top + narration_area.height as usize;
+    for (block, (start, height)) in blocks.iter().zip(&spans) {
+        let end = start + *height as usize;
+        if end <= viewport_top || *start >= viewport_bottom {
+            continue;
+        }
+        match block {
+            StoryBlock::Text(lines) => {
+                // Wrap is per logical line, so a per-block paragraph produces
+                // the same rows the old whole-transcript paragraph did.
+                let paragraph = Paragraph::new(Text::from(lines.as_ref()))
+                    .wrap(Wrap { trim: false })
+                    .style(Style::default().fg(Color::Gray))
+                    .scroll((viewport_top.saturating_sub(*start) as u16, 0));
+                let visible_top = (*start).max(viewport_top);
+                let visible_bottom = end.min(viewport_bottom);
+                let rect = Rect {
+                    x: narration_area.x,
+                    y: narration_area.y + (visible_top - viewport_top) as u16,
+                    width: narration_area.width,
+                    height: (visible_bottom - visible_top) as u16,
+                };
+                frame.render_widget(paragraph, rect);
+            }
+            StoryBlock::Image(image) => {
+                // Position is relative to the viewport and negative when the
+                // image starts above it. The intersection guard bounds `y` to
+                // (-rows, viewport_height) — comfortably inside i16.
+                // SlicedImage maps skip/drop so a partially scrolled image
+                // shows the correct slice; plain `Image` would always pin the
+                // image's TOP rows to the visible rect.
+                let y = *start as i32 - scroll_position as i32;
+                let widget = SlicedImage::new(&image.protocol, SignedPosition::from((0, y as i16)));
+                frame.render_widget(widget, narration_area);
+            }
+        }
+    }
     if needs_scrollbar {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .thumb_symbol("┃")
@@ -525,9 +572,9 @@ pub fn home_shortcut_at(
 /// of the real content end. The greedy simulation below matches the wrapper
 /// for space-separated Korean prose; only a trailing-whitespace edge can
 /// differ by one line, which the scroll clamp absorbs.
-fn wrapped_line_count(text: &Text<'_>, width: u16) -> usize {
+fn wrapped_line_count(lines: &[Line<'_>], width: u16) -> usize {
     let width = width.max(1) as usize;
-    text.lines
+    lines
         .iter()
         .map(|line| {
             // Lines that already fit need no simulation — skip the allocation.
@@ -629,56 +676,55 @@ pub(crate) fn streaming_entry_lines(turn: u32, streaming: &str) -> Vec<Line<'sta
     lines
 }
 
-/// Compose the chronological stack into renderable lines. Exported to
-/// `crate::screens::story` so the App can cache the result per stack version
-/// instead of re-parsing markdown every frame.
-pub(crate) fn story_stack_text(entries: &[StoryStackEntry]) -> Vec<Line<'static>> {
+/// Compose one committed stack entry into renderable lines. `first` suppresses
+/// the separating blank/rule/blank chrome (the transcript's very first entry
+/// opens the pane directly). Exported so the App can cache the result per
+/// entry and interleave image blocks between them.
+pub(crate) fn story_entry_lines(entry: &StoryStackEntry, first: bool) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    for (index, entry) in entries.iter().enumerate() {
-        if index > 0 {
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "────────────────────────────────────────",
-                Style::default().fg(Color::DarkGray),
-            )));
-            lines.push(Line::from(""));
-        }
+    if !first {
+        lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            format!("턴 {} · {}", entry.turn, entry.scene_id),
+            "────────────────────────────────────────",
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled(
+        format!("턴 {} · {}", entry.turn, entry.scene_id),
+        Style::default()
+            .fg(Color::LightCyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    // Per-turn metadata: the model and how long the generation took,
+    // joined by " · " on one subtle line.
+    let mut meta: Vec<String> = Vec::new();
+    if let Some(model) = &entry.model {
+        meta.push(format!("모델 · {}", model_display_label(model)));
+    }
+    if let Some(secs) = entry.generation_secs {
+        meta.push(format!("생성 {}", fmt_duration(secs)));
+    }
+    if !meta.is_empty() {
+        lines.push(Line::from(Span::styled(
+            meta.join(" · "),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    if let Some(action) = &entry.player_action {
+        lines.push(Line::from(Span::styled(
+            "당신의 선택",
             Style::default()
-                .fg(Color::LightCyan)
+                .fg(Color::LightYellow)
                 .add_modifier(Modifier::BOLD),
         )));
-        // Per-turn metadata: the model and how long the generation took,
-        // joined by " · " on one subtle line.
-        let mut meta: Vec<String> = Vec::new();
-        if let Some(model) = &entry.model {
-            meta.push(format!("모델 · {}", model_display_label(model)));
-        }
-        if let Some(secs) = entry.generation_secs {
-            meta.push(format!("생성 {}", fmt_duration(secs)));
-        }
-        if !meta.is_empty() {
-            lines.push(Line::from(Span::styled(
-                meta.join(" · "),
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
-        if let Some(action) = &entry.player_action {
-            lines.push(Line::from(Span::styled(
-                "당신의 선택",
-                Style::default()
-                    .fg(Color::LightYellow)
-                    .add_modifier(Modifier::BOLD),
-            )));
-            lines.push(Line::from(Span::styled(
-                action.clone(),
-                Style::default().fg(Color::Yellow),
-            )));
-            lines.push(Line::from(""));
-        }
-        lines.extend(markdown_lines(&entry.narration));
+        lines.push(Line::from(Span::styled(
+            action.clone(),
+            Style::default().fg(Color::Yellow),
+        )));
+        lines.push(Line::from(""));
     }
+    lines.extend(markdown_lines(&entry.narration));
     lines
 }
 
@@ -1233,7 +1279,7 @@ fn render_error_overlay(frame: &mut Frame, area: Rect, err: &story_model::Domain
     // does not wrap by default, so calculate the wrapped body height before
     // centering the overlay; the message then remains inside its border.
     let inner_width = w.saturating_sub(2).max(1);
-    let h = (wrapped_line_count(&body, inner_width) as u16 + 2)
+    let h = (wrapped_line_count(&body.lines, inner_width) as u16 + 2)
         .max(5)
         .min(area.height);
     let centered = centered_rect(area, w, h);
@@ -1300,14 +1346,14 @@ fn risk_color(r: RiskLevel) -> Color {
 #[cfg(test)]
 mod tests {
     use super::{
-        SceneImage, choice_lines, fmt_duration, markdown_lines, render_story, speaker_dialogue_line,
+        SceneImage, StoryBlock, choice_lines, fmt_duration, markdown_lines, render_story,
+        speaker_dialogue_line,
     };
     use crate::input::InputBuffer;
     use image::DynamicImage;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
-    use ratatui::text::Text;
     use ratatui_image::picker::Picker;
     use story_model::{AppViewModel, ChoiceView, RiskLevel, StatusLine, TimeSlot};
     use unicode_width::UnicodeWidthStr;
@@ -1338,14 +1384,27 @@ mod tests {
         }
     }
 
+    /// Transcript blocks for the sample narration, optionally opening with a
+    /// scene image (as a scene boundary would).
+    fn sample_blocks<'a>(scene: Option<&'a SceneImage>) -> Vec<StoryBlock<'a>> {
+        let mut blocks: Vec<StoryBlock<'a>> = Vec::new();
+        if let Some(scene) = scene {
+            blocks.push(StoryBlock::Image(scene));
+        }
+        blocks.push(StoryBlock::Text(std::borrow::Cow::Owned(markdown_lines(
+            &sample_view().narration,
+        ))));
+        blocks
+    }
+
     fn draw_terminal(
-        scene_image: Option<&SceneImage>,
+        blocks: &[StoryBlock<'_>],
+        scroll: u16,
         width: u16,
         height: u16,
     ) -> Terminal<TestBackend> {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("terminal");
-        let narration = Text::from(markdown_lines(&sample_view().narration));
         terminal
             .draw(|frame| {
                 render_story(
@@ -1353,21 +1412,21 @@ mod tests {
                     frame.area(),
                     &sample_view(),
                     0,
-                    0,
+                    scroll,
                     false,
                     &InputBuffer::new(200),
-                    narration,
+                    blocks,
                     None,
                     None,
-                    scene_image,
                 );
             })
             .expect("draw");
         terminal
     }
 
-    fn draw_with(scene_image: Option<&SceneImage>, width: u16, height: u16) -> String {
-        let terminal = draw_terminal(scene_image, width, height);
+    fn draw_with(scene: Option<&SceneImage>, width: u16, height: u16) -> String {
+        let blocks = sample_blocks(scene);
+        let terminal = draw_terminal(&blocks, 0, width, height);
         let buffer = terminal.backend().buffer();
         let mut out = String::new();
         for y in 0..buffer.area.height {
@@ -1388,35 +1447,36 @@ mod tests {
         out
     }
 
-    #[test]
-    fn scene_image_renders_beside_narration_when_wide_enough() {
-        let picker = Picker::halfblocks();
-        // A checkerboard forces distinct halfblock glyphs/colors; a uniform
-        // image would encode as background-colored spaces.
-        let mut raw = image::Rgb32FImage::new(64, 64);
-        for y in 0..64 {
-            for x in 0..64 {
+    /// A checkerboard forces distinct halfblock glyphs/colors; a uniform
+    /// image would encode as background-colored spaces.
+    fn checkerboard(width: u32, height: u32) -> DynamicImage {
+        let mut raw = image::Rgb32FImage::new(width, height);
+        for y in 0..height {
+            for x in 0..width {
                 let value = if (x + y) % 2 == 0 { 1.0 } else { 0.0 };
                 raw.put_pixel(x, y, image::Rgb([value, value, value]));
             }
         }
-        let pixels = DynamicImage::from(raw);
-        let scene = SceneImage::encode(&picker, pixels).expect("halfblocks encode");
-        assert!(scene.fits_beside_narration(100));
+        DynamicImage::from(raw)
+    }
+
+    #[test]
+    fn inline_scene_image_precedes_its_turn_block() {
+        let scene = SceneImage::encode(&Picker::halfblocks(), checkerboard(64, 64))
+            .expect("halfblocks encode");
         let out = draw_with(Some(&scene), 100, 30);
         assert!(out.contains("비가 그쳤다"), "narration must remain: {out}");
         assert!(out.contains("사과한다"), "choices must remain: {out}");
 
-        // The image column (rightmost `cols` cells) holds rendered image
-        // cells: either glyphs or non-default colors.
-        let terminal = draw_terminal(Some(&scene), 100, 30);
+        // The image occupies the transcript's first rows (left-aligned, below
+        // the title rule): painted cells, not blank ones.
+        let terminal = draw_terminal(&sample_blocks(Some(&scene)), 0, 100, 30);
         let buffer = terminal.backend().buffer();
-        let image_left = buffer.area.width - scene.cols;
         let image_top = 2; // below the title rule
         let image_bottom = (image_top + scene.rows).min(buffer.area.height);
         let mut painted = 0usize;
         for y in image_top..image_bottom {
-            for x in image_left..buffer.area.width {
+            for x in 0..scene.cols {
                 let cell = &buffer[(x, y)];
                 if cell.symbol() != " "
                     || cell.fg != ratatui::style::Color::Reset
@@ -1428,7 +1488,7 @@ mod tests {
         }
         assert!(
             painted >= scene.cols as usize,
-            "image column must be painted (painted={painted}, cols={})",
+            "inline image rows must be painted (painted={painted}, cols={})",
             scene.cols
         );
     }
@@ -1444,13 +1504,13 @@ mod tests {
     }
 
     #[test]
-    fn narrow_terminal_skips_image_column() {
-        let picker = Picker::halfblocks();
-        let scene =
-            SceneImage::encode(&picker, DynamicImage::new_rgb8(64, 64)).expect("halfblocks encode");
-        // MIN_WIDTH is 60: the image would not fit beside a readable column.
+    fn inline_image_renders_at_min_width() {
+        let scene = SceneImage::encode(&Picker::halfblocks(), checkerboard(64, 64))
+            .expect("halfblocks encode");
+        // MIN_WIDTH is 60: a ≤26-col image fits on its own rows with the
+        // transcript full-width — no column, no fallback needed.
         let out = draw_with(Some(&scene), 60, 30);
-        assert!(out.contains("비가 그쳤다"), "text-only fallback: {out}");
+        assert!(out.contains("비가 그쳤다"), "text follows the image: {out}");
     }
 
     #[test]
@@ -1458,7 +1518,8 @@ mod tests {
         // Regression: an undercounting wrap estimate used to make the track
         // geometry disagree with the text, and the scrollbar column showed
         // gaps mid-transcript. The track must render on every narration row
-        // while the scrollbar is visible.
+        // while the scrollbar is visible — including across inline image
+        // rows, which now live inside the transcript.
         let view = sample_view();
         let mut long = String::new();
         for index in 0..40 {
@@ -1466,9 +1527,12 @@ mod tests {
                 "{index}번째 줄입니다. 비가 그친 카페의 창밖을 봅니다.\n\n"
             ));
         }
-        let narration = Text::from(markdown_lines(&long));
+        let text_only = vec![StoryBlock::Text(std::borrow::Cow::Owned(markdown_lines(
+            &long,
+        )))];
         let mut terminal = Terminal::new(TestBackend::new(100, 34)).expect("terminal");
         let mut max_scroll = 0u16;
+        let blocks = text_only.clone();
         terminal
             .draw(|frame| {
                 max_scroll = render_story(
@@ -1479,8 +1543,7 @@ mod tests {
                     5,
                     false,
                     &InputBuffer::new(200),
-                    narration.clone(),
-                    None,
+                    &blocks,
                     None,
                     None,
                 );
@@ -1488,8 +1551,8 @@ mod tests {
             .expect("draw");
         assert!(max_scroll > 0, "long transcript must be scrollable");
         let buffer = terminal.backend().buffer();
-        // No image: the scrollbar owns the last column of the narration area,
-        // which spans from below the title rule to above the choices panel.
+        // The scrollbar owns the last column of the narration area, which
+        // spans from below the title rule to above the choices panel.
         let column = buffer.area.width - 1;
         let missing: Vec<u16> = (3..22)
             .filter(|y| {
@@ -1502,12 +1565,12 @@ mod tests {
             "track missing at rows {missing:?} in column {column}"
         );
 
-        // Beside an image the same contiguity must hold: the order left to
-        // right is text | track | gutter | image, and no row may lose the
-        // track cell to the image or the gutter.
-        let picker = Picker::halfblocks();
-        let scene =
-            SceneImage::encode(&picker, DynamicImage::new_rgb8(64, 64)).expect("halfblocks encode");
+        // With an inline image the same contiguity must hold: the track is
+        // still the last column, and image rows must not steal track cells.
+        let scene = SceneImage::encode(&Picker::halfblocks(), checkerboard(64, 64))
+            .expect("halfblocks encode");
+        let mut blocks: Vec<StoryBlock<'_>> = vec![StoryBlock::Image(&scene)];
+        blocks.extend(text_only);
         let mut terminal = Terminal::new(TestBackend::new(100, 34)).expect("terminal");
         terminal
             .draw(|frame| {
@@ -1519,25 +1582,67 @@ mod tests {
                     5,
                     false,
                     &InputBuffer::new(200),
-                    narration.clone(),
+                    &blocks,
                     None,
                     None,
-                    Some(&scene),
                 );
             })
             .expect("draw");
         let buffer = terminal.backend().buffer();
-        let image_left = buffer.area.width.saturating_sub(scene.cols);
-        let track_column = image_left.saturating_sub(2);
         let missing: Vec<u16> = (3..22)
             .filter(|y| {
-                let symbol = buffer[(track_column, *y)].symbol();
+                let symbol = buffer[(column, *y)].symbol();
                 symbol != "│" && symbol != "┃"
             })
             .collect();
         assert!(
             missing.is_empty(),
-            "track missing beside image at rows {missing:?} in column {track_column} (image_left={image_left})"
+            "track missing across image rows at {missing:?} in column {column}"
+        );
+    }
+
+    #[test]
+    fn scrolling_past_an_image_reveals_the_lower_slice() {
+        // Row-encoded image: pixel row p paints red ≈ p/27, so every halfblock
+        // cell row carries a distinct color signature. This is the tripwire
+        // for the slice regression: a top-pinned render (plain `Image`
+        // clipping) would repeat the image's FIRST cell row at the viewport
+        // top after scrolling instead of the correct lower slice.
+        let mut raw = image::Rgb32FImage::new(26, 28);
+        for y in 0..28u32 {
+            for x in 0..26u32 {
+                let value = 0.05 + 0.9 * (y as f32 / 27.0);
+                raw.put_pixel(x, y, image::Rgb([value, 0.0, 0.0]));
+            }
+        }
+        let scene =
+            SceneImage::encode(&Picker::halfblocks(), DynamicImage::from(raw)).expect("encode");
+        let mut long = String::new();
+        for index in 0..40 {
+            long.push_str(&format!(
+                "{index}번째 줄입니다. 스크롤 여유용 본문입니다.\n\n"
+            ));
+        }
+        let colors_at = |scroll: u16| {
+            let blocks = vec![
+                StoryBlock::Image(&scene),
+                StoryBlock::Text(std::borrow::Cow::Owned(markdown_lines(&long))),
+            ];
+            let terminal = draw_terminal(&blocks, scroll, 100, 34);
+            let buffer = terminal.backend().buffer();
+            let top = &buffer[(0, 2)]; // first visible transcript row
+            let next = &buffer[(0, 3)];
+            ((top.fg, top.bg), (next.fg, next.bg))
+        };
+        let (top_at_zero, second_at_zero) = colors_at(0);
+        let (top_at_one, _) = colors_at(1);
+        assert_ne!(
+            top_at_zero, top_at_one,
+            "scrolling by one row must advance the visible image slice"
+        );
+        assert_eq!(
+            top_at_one, second_at_zero,
+            "the slice shown at scroll 1 must be the image's SECOND cell row, not a re-pinned top"
         );
     }
 
@@ -1564,10 +1669,10 @@ mod tests {
         // so max_scroll landed above the real last line. The word-aware count
         // must report every visual line the paragraph will render.
         use super::{markdown_lines, wrapped_line_count};
-        let text = Text::from(markdown_lines(
+        let lines = markdown_lines(
             "짙은 남색 코트는 옆 의자에 반듯하게 접혀 있고 오른손의 은색 시계가 빛난다",
-        ));
-        let count = wrapped_line_count(&text, 30);
+        );
+        let count = wrapped_line_count(&lines, 30);
         // The single 43-wide logical line cannot fit in fewer than 2 lines.
         assert!(count >= 2, "wrapped prose undercounted: {count}");
     }

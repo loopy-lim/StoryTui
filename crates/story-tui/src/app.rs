@@ -10,18 +10,19 @@
 //! storytui`) owns the event loop and the `EngineState`.
 
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use image::DynamicImage;
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::text::{Line, Text};
+use ratatui::text::Line;
 use ratatui_image::picker::Picker;
-use ratatui_image::protocol::Protocol;
+use ratatui_image::sliced::SlicedProtocol;
 use story_core::engine_cmd::EngineCommand;
 use story_model::uuid::Uuid;
-use story_model::{ActionType, AppViewModel, ParsedAction};
+use story_model::{ActionType, AppViewModel, LocationId, ParsedAction};
 use story_model::{ProviderConfigSafe, ProviderHealth};
 use story_persistence::SlotMeta;
 
@@ -33,9 +34,9 @@ use crate::screens::pack::pack_selection_at;
 use crate::screens::save_load::{render_save_load, save_load_selection_at};
 use crate::screens::settings::{SettingsView, render_settings};
 use crate::screens::story::{
-    ListMode, ModelRoleHints, StoryFooterAction, StoryStackEntry, choice_index_at,
+    ListMode, ModelRoleHints, StoryBlock, StoryFooterAction, StoryStackEntry, choice_index_at,
     footer_action_at, markdown_lines, model_picker_scroll, render_help_overlay, render_list,
-    render_model_picker, render_provider_picker, render_story, story_stack_text,
+    render_model_picker, render_provider_picker, render_story, story_entry_lines,
     streaming_entry_lines,
 };
 
@@ -116,11 +117,12 @@ struct SettingsState {
 }
 
 /// A scene image pre-encoded for the detected terminal graphics protocol.
-/// Encoding happens once on `set_scene_image`; rendering is cheap per frame.
-#[derive(Clone)]
+/// Encoding happens once per location when the host resolves it; rendering is
+/// cheap per frame. Held behind an `Arc` (the app's clone shares payloads),
+/// so the type itself needs no `Clone`.
 pub struct SceneImage {
-    pub protocol: Protocol,
-    /// Encoded size in terminal cells (aspect-fit into the scene column).
+    pub protocol: SlicedProtocol,
+    /// Encoded size in terminal cells (aspect-fit into the cell budget).
     pub cols: u16,
     pub rows: u16,
 }
@@ -136,23 +138,25 @@ impl std::fmt::Debug for SceneImage {
     }
 }
 
-/// Upper bound for the scene column so narration keeps the majority width.
+/// Upper bound for an inline scene image so it never dominates the transcript.
 const SCENE_IMAGE_MAX_COLS: u16 = 26;
 const SCENE_IMAGE_MAX_ROWS: u16 = 14;
-/// Narrowest narration column we accept before giving up on the image.
-const SCENE_IMAGE_MIN_TEXT_COLS: u16 = 40;
 
 impl SceneImage {
-    /// Encode `image` fitted into the scene column bounds. `None` when the
+    /// Encode `image` fitted into the inline cell budget. `None` when the
     /// protocol encode fails; the player then simply sees text only.
+    ///
+    /// The protocol is the `sliced` variant so the renderer can show the
+    /// correct slice of a partially scrolled image — plain protocols always
+    /// draw from the image's first row.
     pub fn encode(picker: &Picker, image: DynamicImage) -> Option<Self> {
-        let protocol = picker
-            .new_protocol(
-                image,
-                ratatui::layout::Size::new(SCENE_IMAGE_MAX_COLS, SCENE_IMAGE_MAX_ROWS),
-                ratatui_image::Resize::Fit(None),
-            )
-            .ok()?;
+        let protocol = SlicedProtocol::new_with_resize(
+            picker,
+            image,
+            ratatui::layout::Size::new(SCENE_IMAGE_MAX_COLS, SCENE_IMAGE_MAX_ROWS),
+            ratatui_image::Resize::Fit(None),
+        )
+        .ok()?;
         let size = protocol.size();
         Some(Self {
             protocol,
@@ -160,12 +164,16 @@ impl SceneImage {
             rows: size.height.max(1),
         })
     }
+}
 
-    /// Layout guard mirroring the renderer: does this image fit beside a
-    /// readable narration column in `width`?
-    pub fn fits_beside_narration(&self, width: u16) -> bool {
-        width.saturating_sub(self.cols) >= SCENE_IMAGE_MIN_TEXT_COLS
-    }
+/// One location's resolved image: the encoded payload plus the source path it
+/// came from. The path is the dedupe key — a pack whose locations all fall
+/// back to the same character portrait must not repeat that portrait at every
+/// scene boundary.
+#[derive(Clone, Debug)]
+struct LocationImage {
+    source: std::path::PathBuf,
+    image: Arc<SceneImage>,
 }
 
 /// Filesystem work requested by the UI. The host owns all actual save I/O.
@@ -231,8 +239,14 @@ pub struct App {
     images_enabled: bool,
     /// Set when the player toggled images in Settings (`i`).
     images_toggle_requested: bool,
-    /// Current pre-encoded scene image, if the pack ships one.
-    scene_image: Option<SceneImage>,
+    /// Per-location resolved images, keyed by location id. `None` = the host
+    /// resolved this location and found no usable art (or the encode failed) —
+    /// an authoritative absence that is not retried until the host resets it
+    /// on a pack switch.
+    location_images: HashMap<String, Option<LocationImage>>,
+    /// The pack's initial location, seeded by `set_lists` alongside the
+    /// history it seeds the location fold for.
+    initial_location: Option<String>,
     mouse_command: Option<EngineCommand>,
     /// Card import dialog (home menu "카드 가져오기"); `Some` = modal active.
     import_dialog: Option<ImportDialog>,
@@ -260,9 +274,10 @@ pub struct App {
     pub(crate) story_stack: Vec<StoryStackEntry>,
     /// Bumped on every `story_stack` replacement; keys the render cache.
     story_stack_version: u64,
-    /// Composed stack lines for `story_stack_version` — building them means
-    /// markdown-parsing the whole transcript, which must not happen per frame.
-    stack_lines_cache: Option<(u64, Vec<Line<'static>>)>,
+    /// Per-entry composed lines for `story_stack_version` — building them
+    /// means markdown-parsing the whole transcript, which must not happen per
+    /// frame. The outer Vec indexes 1:1 with `story_stack`.
+    stack_lines_cache: Option<(u64, Vec<Vec<Line<'static>>>)>,
 
     /// Ephemeral Writer text while the internal Director → Writer path is
     /// streaming. It is never saved and is replaced by the accepted turn.
@@ -337,7 +352,8 @@ impl App {
             image_backend: None,
             images_enabled: true,
             images_toggle_requested: false,
-            scene_image: None,
+            location_images: HashMap::new(),
+            initial_location: None,
             mouse_command: None,
             import_dialog: None,
             import_request: None,
@@ -804,7 +820,7 @@ impl App {
     }
 
     /// Record the terminal graphics capability. Call once at startup before
-    /// the first `set_scene_image`.
+    /// the first `set_location_image`.
     pub fn set_image_picker(&mut self, picker: Option<Picker>) {
         self.image_backend = picker.as_ref().map(|picker| match picker.protocol_type() {
             ratatui_image::picker::ProtocolType::Kitty => "kitty",
@@ -815,7 +831,7 @@ impl App {
         self.image_picker = picker;
     }
 
-    /// Settings-screen image toggle. The cached scene image is kept, so
+    /// Settings-screen image toggle. The per-location images are kept, so
     /// re-enabling is instant — no re-decode.
     pub fn set_images_enabled(&mut self, enabled: bool) {
         self.images_enabled = enabled;
@@ -835,21 +851,34 @@ impl App {
         std::mem::take(&mut self.images_toggle_requested)
     }
 
-    /// Replace the scene image. Decoding is host-owned; encoding happens here
-    /// once so per-frame rendering stays cheap. `None` clears the column.
-    pub fn set_scene_image(&mut self, image: Option<DynamicImage>) {
-        self.scene_image = match (image.as_ref(), self.image_picker.as_ref()) {
-            (Some(image), Some(picker)) => SceneImage::encode(picker, image.clone()),
+    /// Store one location's resolved image. Decoding is host-owned; encoding
+    /// happens here once so per-frame rendering stays cheap. `None` (no usable
+    /// art) and encode failures are both stored as authoritative absence — the
+    /// host does not re-resolve this location until the next pack switch.
+    /// `source` is the dedupe key shared by locations that resolve to the
+    /// same file (portrait fallback).
+    pub fn set_location_image(
+        &mut self,
+        location: &str,
+        resolved: Option<(std::path::PathBuf, DynamicImage)>,
+    ) {
+        let entry = match (resolved, self.image_picker.as_ref()) {
+            (Some((source, image)), Some(picker)) => {
+                SceneImage::encode(picker, image).map(|image| LocationImage {
+                    source,
+                    image: Arc::new(image),
+                })
+            }
             _ => None,
         };
+        self.location_images.insert(location.to_string(), entry);
     }
 
-    pub fn scene_image(&self) -> Option<&SceneImage> {
-        if self.images_enabled {
-            self.scene_image.as_ref()
-        } else {
-            None
-        }
+    /// Drop every per-location image. MUST move in lockstep with the host's
+    /// `LocationImageStore::clear` — clearing only one side lets the previous
+    /// pack's images survive a pack switch (the stale-portrait bug).
+    pub fn reset_location_images(&mut self) {
+        self.location_images.clear();
     }
 
     /// Patch only the TTS section of the Settings state (used by the `v`
@@ -985,12 +1014,18 @@ impl App {
     }
 
     /// Refresh the auxiliary list data from the host-owned engine state.
+    /// `initial_location` is the pack's starting location — the seed for the
+    /// per-turn location fold that drives inline scene images. Passing it
+    /// atomically with the history keeps the seed and the stack desync-proof.
     pub fn set_lists(
         &mut self,
         history: &[story_model::HistoryEntry],
         memories: &[story_model::MemoryEntry],
+        initial_location: &LocationId,
     ) {
         let previous_story_count = self.story_stack.len();
+        self.initial_location = Some(initial_location.0.clone());
+        let timeline = location_timeline(history, initial_location);
         self.history_items = history
             .iter()
             .rev()
@@ -1001,7 +1036,8 @@ impl App {
             .collect();
         let stack = history
             .iter()
-            .map(|entry| StoryStackEntry {
+            .zip(timeline)
+            .map(|(entry, location)| StoryStackEntry {
                 turn: entry.turn,
                 scene_id: entry.scene_id.clone(),
                 model: self.generation_models.get(&entry.generation_id).cloned(),
@@ -1011,6 +1047,7 @@ impl App {
                     .as_ref()
                     .map(|action| action.original_text.trim().to_string()),
                 narration: entry.narration.clone(),
+                location,
             })
             .collect();
         self.replace_story_stack(stack);
@@ -1315,13 +1352,13 @@ impl App {
         }
     }
 
-    /// Render the Story screen for the current view.
-    /// Compose the narration pane's text, reusing the cached stack lines
-    /// unless the stack changed. Only the live "작성 중" entry is rebuilt
-    /// per frame while a Writer stream is arriving.
-    fn narration_text(&mut self) -> Text<'static> {
+    /// Refresh the per-entry line cache if the stack changed. Split from
+    /// [`Self::story_blocks`] so the cache fill's mutable borrow ends before
+    /// the returned blocks borrow `self` immutably — `render` needs `&self`
+    /// for the view while the blocks are alive.
+    fn fill_block_cache(&mut self) {
         if self.story_stack.is_empty() {
-            return Text::from(markdown_lines(&self.view.narration));
+            return;
         }
         // The stored version IS the cache key: a set_lists bump invalidates
         // the cache on the very next frame.
@@ -1330,18 +1367,79 @@ impl App {
             .as_ref()
             .is_some_and(|(version, _)| *version == self.story_stack_version);
         if !cache_matches {
-            let lines = story_stack_text(&self.story_stack);
+            let lines: Vec<Vec<Line<'static>>> = self
+                .story_stack
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| story_entry_lines(entry, index == 0))
+                .collect();
             self.stack_lines_cache = Some((self.story_stack_version, lines));
         }
-        let mut lines = self
+    }
+
+    /// Blocks for the narration pane, in transcript order: a scene image
+    /// before each turn whose location's image differs from the previous
+    /// turn's, then the turn's text.
+    fn story_blocks(&self) -> Vec<StoryBlock<'_>> {
+        if self.story_stack.is_empty() {
+            let mut blocks: Vec<StoryBlock<'_>> = Vec::new();
+            // The opening turn shows the initial location's image, if the
+            // pack ships one — the transcript's first scene boundary.
+            if self.images_enabled
+                && let Some(initial) = self.initial_location.as_deref()
+                && let Some(Some(image)) = self.location_images.get(initial)
+            {
+                blocks.push(StoryBlock::Image(&image.image));
+            }
+            blocks.push(StoryBlock::Text(std::borrow::Cow::Owned(markdown_lines(
+                &self.view.narration,
+            ))));
+            if let Some(streaming) = self.streaming_narration.as_deref() {
+                blocks.push(StoryBlock::Text(std::borrow::Cow::Owned(
+                    streaming_entry_lines(self.view.status.turn, streaming),
+                )));
+            }
+            return blocks;
+        }
+        let cache = &self
             .stack_lines_cache
             .as_ref()
-            .map(|(_, lines)| lines.clone())
-            .unwrap_or_default();
-        if let Some(streaming) = self.streaming_narration.as_deref() {
-            lines.extend(streaming_entry_lines(self.view.status.turn, streaming));
+            .expect("fill_block_cache ran before story_blocks")
+            .1;
+        let mut blocks: Vec<StoryBlock<'_>> = Vec::with_capacity(cache.len() + 4);
+        // The dedupe key is the resolved SOURCE PATH, not the location id: a
+        // pack whose locations all fall back to the same character portrait
+        // must not repeat that portrait at every boundary, while genuinely
+        // different location artwork always shows. A location without art
+        // breaks the run, so returning to imaged art shows it again.
+        let mut previous_source: Option<&std::path::PathBuf> = None;
+        if !self.images_enabled {
+            for lines in cache {
+                blocks.push(StoryBlock::Text(std::borrow::Cow::Borrowed(lines)));
+            }
+        } else {
+            for (entry, lines) in self.story_stack.iter().zip(cache) {
+                let resolved = entry
+                    .location
+                    .as_deref()
+                    .and_then(|location| self.location_images.get(location))
+                    .and_then(|resolved| resolved.as_ref());
+                let source = resolved.as_ref().map(|image| &image.source);
+                if let Some(image) = resolved
+                    && source != previous_source
+                {
+                    blocks.push(StoryBlock::Image(&image.image));
+                }
+                previous_source = source;
+                blocks.push(StoryBlock::Text(std::borrow::Cow::Borrowed(lines)));
+            }
         }
-        Text::from(lines)
+        if let Some(streaming) = self.streaming_narration.as_deref() {
+            blocks.push(StoryBlock::Text(std::borrow::Cow::Owned(
+                streaming_entry_lines(self.view.status.turn, streaming),
+            )));
+        }
+        blocks
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
@@ -1494,7 +1592,8 @@ impl App {
             );
             return;
         }
-        let narration_text = self.narration_text();
+        self.fill_block_cache();
+        let blocks = self.story_blocks();
         let max_scroll = render_story(
             frame,
             area,
@@ -1503,10 +1602,9 @@ impl App {
             self.narration_scroll,
             self.input_mode,
             &self.input,
-            narration_text,
+            &blocks,
             self.streaming_narration.as_deref(),
             self.generation_elapsed_seconds(),
-            self.scene_image.as_ref(),
         );
         self.narration_max_scroll.set(max_scroll);
         if self.help_visible {
@@ -1983,6 +2081,29 @@ impl App {
     }
 }
 
+/// Per-entry location after folding `applied_patch.next_location` over the
+/// history in order, seeded by the pack's initial location.
+///
+/// `HistoryEntry` carries no location of its own — the reducer's state patch
+/// does — so the timeline is a pure function of (history, seed). Because the
+/// save payload mirrors history, the same fold reproduces the timeline after a
+/// load; the host reuses this for its "which locations to load" pass.
+pub fn location_timeline(
+    history: &[story_model::HistoryEntry],
+    initial: &LocationId,
+) -> Vec<Option<String>> {
+    let mut current = initial.0.clone();
+    history
+        .iter()
+        .map(|entry| {
+            if let Some(next) = &entry.applied_patch.next_location {
+                current = next.0.clone();
+            }
+            Some(current.clone())
+        })
+        .collect()
+}
+
 fn save_load_copy(state: &SaveLoadState) -> (&'static str, &'static str) {
     match (state.mode, state.overwrite_confirmation) {
         (SaveLoadMode::Save, true) => (
@@ -2292,23 +2413,208 @@ mod tests {
     }
 
     #[test]
-    fn images_toggle_via_settings_key_flips_state() {
-        let mut app = App::new(sample_view(0));
-        assert!(app.images_enabled(), "images default to on");
+    fn images_toggle_hides_blocks_without_clearing_the_map() {
+        let mut app = App::new(sample_view(1));
+        let initial = story_model::LocationId("cafe".to_string());
+        let history = vec![history_entry(1, None)];
+        app.set_lists(&history, &[], &initial);
+
+        let picker = ratatui_image::picker::Picker::halfblocks();
+        app.set_image_picker(Some(picker));
+        app.set_location_image(
+            "cafe",
+            Some((
+                std::path::PathBuf::from("/pack/cafe.png"),
+                image::DynamicImage::new_rgb8(16, 16),
+            )),
+        );
+        assert_eq!(
+            image_block_count(&mut app),
+            1,
+            "enabled state shows the image"
+        );
+
+        // The Settings `i` key still drives the toggle request.
         app.handle_key(key(KeyCode::Char('o')), None);
         app.handle_key(key(KeyCode::Char('i')), None);
         assert!(app.take_images_toggle_request(), "toggle requested");
-        app.set_images_enabled(false);
-        assert!(!app.images_enabled());
 
-        // With images disabled the renderer sees no image, but the cached
-        // scene survives: re-enabling is instant (no re-decode).
-        let picker = ratatui_image::picker::Picker::halfblocks();
-        app.set_image_picker(Some(picker));
-        app.set_scene_image(Some(image::DynamicImage::new_rgb8(16, 16)));
-        assert!(app.scene_image().is_none(), "disabled toggle hides image");
+        // Toggling off hides the image block but keeps the map warm, so
+        // re-enabling is instant (no re-decode, no host roundtrip).
+        app.set_images_enabled(false);
+        assert_eq!(
+            image_block_count(&mut app),
+            0,
+            "disabled state hides blocks"
+        );
         app.set_images_enabled(true);
-        assert!(app.scene_image().is_some(), "re-enable is instant");
+        assert_eq!(image_block_count(&mut app), 1, "re-enable is instant");
+    }
+
+    /// Count Image blocks the story pane would render for the current state.
+    fn image_block_count(app: &mut App) -> usize {
+        app.fill_block_cache();
+        app.story_blocks()
+            .iter()
+            .filter(|block| matches!(block, StoryBlock::Image(_)))
+            .count()
+    }
+
+    fn default_location() -> story_model::LocationId {
+        story_model::LocationId("station".to_string())
+    }
+
+    /// A history entry whose state patch optionally moves to `next_location`.
+    /// The fold attaches the POST-patch location to the entry — the turn's
+    /// narration narrates arriving there, and the engine's current location
+    /// (which drove the old side-image column) is post-patch too.
+    fn history_entry(turn: u32, next_location: Option<&str>) -> story_model::HistoryEntry {
+        story_model::HistoryEntry {
+            id: Uuid::new_v4(),
+            turn,
+            scene_id: format!("scene-{turn}"),
+            created_at: chrono::Utc::now(),
+            narration: format!("턴 {turn} 내레이션"),
+            player_action: None,
+            choices: Vec::new(),
+            applied_patch: story_model::StatePatch {
+                next_location: next_location.map(|loc| story_model::LocationId(loc.to_string())),
+                ..Default::default()
+            },
+            generation_id: Uuid::new_v4(),
+        }
+    }
+
+    fn halfblocks_app(view_choices: usize) -> App {
+        let mut app = App::new(sample_view(view_choices));
+        app.set_image_picker(Some(ratatui_image::picker::Picker::halfblocks()));
+        app
+    }
+
+    #[test]
+    fn location_timeline_folds_patches_in_order() {
+        let initial = default_location();
+        let history = vec![
+            history_entry(1, Some("cafe")),
+            history_entry(2, None),
+            history_entry(3, Some("docks")),
+        ];
+        let timeline = location_timeline(&history, &initial);
+        assert_eq!(
+            timeline,
+            vec![
+                Some("cafe".to_string()),
+                Some("cafe".to_string()),
+                Some("docks".to_string())
+            ]
+        );
+        // Empty history → empty timeline; the opening comes from the seed.
+        assert!(location_timeline(&[], &initial).is_empty());
+    }
+
+    #[test]
+    fn set_lists_folds_patch_locations_over_history() {
+        let mut app = App::new(sample_view(1));
+        let history = vec![
+            history_entry(1, Some("cafe")),
+            history_entry(2, None),
+            history_entry(3, Some("docks")),
+        ];
+        app.set_lists(&history, &[], &default_location());
+        assert_eq!(app.story_stack[0].location.as_deref(), Some("cafe"));
+        assert_eq!(app.story_stack[1].location.as_deref(), Some("cafe"));
+        assert_eq!(app.story_stack[2].location.as_deref(), Some("docks"));
+    }
+
+    #[test]
+    fn opening_turn_shows_the_initial_location_image() {
+        let mut app = halfblocks_app(0);
+        app.set_lists(&[], &[], &default_location());
+        app.set_location_image(
+            "station",
+            Some((
+                std::path::PathBuf::from("/pack/station.png"),
+                image::DynamicImage::new_rgb8(8, 8),
+            )),
+        );
+        assert_eq!(
+            image_block_count(&mut app),
+            1,
+            "opening shows the initial location's image"
+        );
+        // A location resolved to no art contributes no image block.
+        app.set_location_image("station", None);
+        assert_eq!(image_block_count(&mut app), 0);
+    }
+
+    #[test]
+    fn same_portrait_fallback_not_repeated_across_locations() {
+        let mut app = halfblocks_app(1);
+        let history = vec![
+            history_entry(1, Some("cafe")),
+            history_entry(2, Some("docks")),
+        ];
+        app.set_lists(&history, &[], &default_location());
+        // Every location resolves to the SAME portrait file (character
+        // fallback): the portrait shows once, not at every scene boundary.
+        let portrait = std::path::PathBuf::from("/pack/characters/mira.png");
+        for location in ["station", "cafe", "docks"] {
+            app.set_location_image(
+                location,
+                Some((portrait.clone(), image::DynamicImage::new_rgb8(8, 8))),
+            );
+        }
+        assert_eq!(
+            image_block_count(&mut app),
+            1,
+            "same source file must not repeat at every boundary"
+        );
+    }
+
+    #[test]
+    fn revisited_location_shows_the_image_again() {
+        let mut app = halfblocks_app(1);
+        let history = vec![
+            history_entry(1, Some("cafe")),
+            history_entry(2, Some("docks")),
+            history_entry(3, Some("cafe")),
+        ];
+        app.set_lists(&history, &[], &default_location());
+        for (location, name) in [("station", "station"), ("cafe", "cafe"), ("docks", "docks")] {
+            app.set_location_image(
+                location,
+                Some((
+                    std::path::PathBuf::from(format!("/pack/{name}.png")),
+                    image::DynamicImage::new_rgb8(8, 8),
+                )),
+            );
+        }
+        // Three distinct scene boundaries → three image blocks, including
+        // the return to cafe.
+        assert_eq!(image_block_count(&mut app), 3);
+    }
+
+    #[test]
+    fn location_image_without_a_picker_is_authoritatively_absent() {
+        // No set_image_picker: a resolution cannot become renderable. The
+        // absence is still recorded (no per-frame retry) and rendering stays
+        // text-only.
+        let mut app = App::new(sample_view(1));
+        let history = vec![history_entry(1, None)];
+        app.set_lists(&history, &[], &default_location());
+        app.set_location_image(
+            "station",
+            Some((
+                std::path::PathBuf::from("/pack/station.png"),
+                image::DynamicImage::new_rgb8(8, 8),
+            )),
+        );
+        let stored = app
+            .location_images
+            .get("station")
+            .expect("resolution recorded");
+        assert!(stored.is_none(), "no picker → authoritative absence");
+        assert_eq!(image_block_count(&mut app), 0);
     }
 
     #[test]
@@ -2356,7 +2662,7 @@ mod tests {
         }
 
         let mut app = App::new(sample_view(1));
-        app.set_lists(&[entry(1, "첫 번째 장면")], &[]);
+        app.set_lists(&[entry(1, "첫 번째 장면")], &[], &default_location());
         let first = draw(&mut app);
         assert!(first.contains("첫 번째 장면"));
 
@@ -2368,6 +2674,7 @@ mod tests {
                 entry(2, "두 번째 장면의 내레이션"),
             ],
             &[],
+            &default_location(),
         );
         let second = draw(&mut app);
         assert!(
@@ -2405,9 +2712,9 @@ mod tests {
             },
         ];
 
-        app.set_lists(&entries[..1], &[]);
+        app.set_lists(&entries[..1], &[], &default_location());
         assert_eq!(app.narration_scroll, 0, "first scene opens at the top");
-        app.set_lists(&entries, &[]);
+        app.set_lists(&entries, &[], &default_location());
 
         assert_eq!(app.story_stack.len(), 2);
         assert_eq!(app.story_stack[0].narration, "첫 장면");
@@ -2450,7 +2757,7 @@ mod tests {
         ];
 
         // No durations recorded yet → entries carry None.
-        app.set_lists(&entries, &[]);
+        app.set_lists(&entries, &[], &default_location());
         assert_eq!(app.story_stack[0].generation_secs, None);
         assert_eq!(app.story_stack[1].generation_secs, None);
 
@@ -2458,7 +2765,7 @@ mod tests {
         // completion path, before the committing dispatch).
         app.generation_durations.insert(g1, 47);
         app.generation_durations.insert(g2, 133);
-        app.set_lists(&entries, &[]);
+        app.set_lists(&entries, &[], &default_location());
         assert_eq!(app.story_stack[0].generation_secs, Some(47));
         assert_eq!(app.story_stack[1].generation_secs, Some(133));
     }
