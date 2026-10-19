@@ -2,7 +2,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
@@ -36,29 +36,38 @@ pub fn render_home(
         Constraint::Fill(1),
     ])
     .split(area)[1];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(crate::theme::BORDER_TYPE)
+        .border_style(crate::theme::Styles::border_primary())
+        .title(Span::styled(
+            " ✦ 시작 메뉴 ✦ ",
+            crate::theme::Styles::title(),
+        ));
     let mut lines = vec![Line::from(Span::styled(
-        "StoryTUI",
-        Style::default()
-            .fg(Color::LightCyan)
-            .add_modifier(Modifier::BOLD),
+        "✦  S T O R Y   T U I  ✦",
+        crate::theme::Styles::title(),
     ))];
     for (index, (label, hint, enabled)) in rows.iter().enumerate() {
         let active = index == selected && *enabled;
-        let prefix = if active { "▶ " } else { "  " };
         let style = if active {
             Style::default()
-                .fg(Color::Yellow)
+                .fg(crate::theme::Palette::SELECTED)
                 .add_modifier(Modifier::BOLD)
-                .add_modifier(Modifier::REVERSED)
         } else if *enabled {
-            Style::default().fg(Color::White)
+            Style::default().fg(crate::theme::Palette::PROSE)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(crate::theme::Palette::MUTED)
         };
-        lines.push(Line::from(Span::styled(format!("{prefix}{label}"), style)));
+        let item_text = if active {
+            format!("▶ [ {label} ]")
+        } else {
+            format!("    {label}  ")
+        };
+        lines.push(Line::from(Span::styled(item_text, style)));
         lines.push(Line::from(Span::styled(
             format!("    {hint}"),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(crate::theme::Palette::MUTED),
         )));
     }
     lines.push(Line::from(""));
@@ -67,21 +76,17 @@ pub fn render_home(
             line,
             if attention {
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(crate::theme::Palette::CAUTION)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(crate::theme::Palette::MUTED)
             },
         )));
     }
     lines.push(Line::from(Span::styled(
-        "↑↓ 이동 · Enter 선택 · q 종료",
-        Style::default().fg(Color::DarkGray),
+        "💡 마우스 클릭 · ↑↓ 이동 · Enter 선택 · q 종료",
+        Style::default().fg(crate::theme::Palette::MUTED),
     )));
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::LightCyan))
-        .title("시작 메뉴");
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines)

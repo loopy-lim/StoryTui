@@ -4,11 +4,26 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use super::popup::{POPUP_WIDTH_NARROW, centered_rect};
+
+/// Resolve a click row inside the greeting picker modal to an option index.
+pub fn greeting_selection_at(area: Rect, row: u16, option_count: usize) -> Option<usize> {
+    if option_count == 0 {
+        return None;
+    }
+    let popup = centered_rect(area, POPUP_WIDTH_NARROW, option_count as u16 + 6);
+    let start_row = popup.y.saturating_add(1);
+    let end_row = start_row.saturating_add(option_count as u16);
+    if row >= start_row && row < end_row {
+        Some((row - start_row) as usize)
+    } else {
+        None
+    }
+}
 
 /// Draw the modal listing `options` with `selected` highlighted.
 pub fn render_greeting_picker(frame: &mut Frame, area: Rect, options: &[String], selected: usize) {
@@ -22,24 +37,27 @@ pub fn render_greeting_picker(frame: &mut Frame, area: Rect, options: &[String],
         let prefix = if is_active { "▶ " } else { "  " };
         let style = if is_active {
             Style::default()
-                .fg(Color::Yellow)
+                .fg(crate::theme::Palette::SELECTED)
                 .add_modifier(Modifier::BOLD)
-                .add_modifier(Modifier::REVERSED)
         } else {
-            Style::default().fg(Color::Gray)
+            Style::default().fg(crate::theme::Palette::PROSE)
         };
         lines.push(Line::from(Span::styled(format!("{prefix}{option}"), style)));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "↑↓ 이동 · Enter 선택 · Esc 취소",
-        Style::default().fg(Color::DarkGray),
+        "💡 마우스 클릭 · ↑↓ 이동 · Enter 선택 · Esc 취소",
+        Style::default().fg(crate::theme::Palette::MUTED),
     )));
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::LightCyan))
-        .title("오프닝 선택");
+        .border_type(crate::theme::BORDER_TYPE)
+        .border_style(crate::theme::Styles::border_primary())
+        .title(Span::styled(
+            " ✦ 오프닝 선택 ✦ ",
+            crate::theme::Styles::title(),
+        ));
     frame.render_widget(
         Paragraph::new(lines)
             .block(block)

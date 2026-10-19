@@ -27,13 +27,16 @@ use story_persistence::SlotMeta;
 
 use crate::event::{KeyAction, SELECT_SENTINEL, map_key, parse_direct_select_index};
 use crate::input::InputBuffer;
+use crate::screens::greeting::greeting_selection_at;
 use crate::screens::home::{menu_selection_at, render_home};
-use crate::screens::save_load::render_save_load;
+use crate::screens::pack::pack_selection_at;
+use crate::screens::save_load::{render_save_load, save_load_selection_at};
 use crate::screens::settings::{SettingsView, render_settings};
 use crate::screens::story::{
-    ListMode, ModelRoleHints, StoryStackEntry, choice_index_at, home_shortcut_at, markdown_lines,
-    model_picker_scroll, render_help_overlay, render_list, render_model_picker,
-    render_provider_picker, render_story, story_stack_text, streaming_entry_lines,
+    ListMode, ModelRoleHints, StoryFooterAction, StoryStackEntry, choice_index_at,
+    footer_action_at, markdown_lines, model_picker_scroll, render_help_overlay, render_list,
+    render_model_picker, render_provider_picker, render_story, story_stack_text,
+    streaming_entry_lines,
 };
 
 /// Which manual save manager the host should open.
@@ -288,6 +291,9 @@ pub struct App {
     pack_picker: Option<usize>,
     pack_dirs: Vec<String>,
     pack_labels: Vec<String>,
+    /// One-line notice shown inside the pack picker (failed deletion);
+    /// cleared by the next `open_pack_picker`.
+    pack_notice: Option<String>,
     settings: Option<SettingsState>,
     settings_visible: bool,
     settings_opened: bool,
@@ -361,6 +367,7 @@ impl App {
             pack_picker: None,
             pack_dirs: Vec::new(),
             pack_labels: Vec::new(),
+            pack_notice: None,
             settings: None,
             settings_visible: false,
             settings_opened: false,
@@ -527,9 +534,16 @@ impl App {
         }
         self.pack_dirs = dirs;
         self.pack_labels = labels;
+        self.pack_notice = None;
         if self.pack_picker.is_none() {
             self.pack_picker = Some(0);
         }
+    }
+
+    /// Show a notice inside the open pack picker (e.g. a failed deletion).
+    /// Cleared by the next `open_pack_picker`.
+    pub fn set_pack_picker_notice(&mut self, notice: Option<String>) {
+        self.pack_notice = notice;
     }
 
     /// Keys while the pack picker owns the screen.
@@ -682,9 +696,12 @@ impl App {
                 }
                 KeyCode::Tab => {
                     // Park the typed text and switch to the file browser;
-                    // the host fills the listing ("" = start directory).
+                    // continue in the last import's directory when there is
+                    // one (`import_last_dir` already holds the folder),
+                    // otherwise the host opens at HOME ("" sentinel).
                     let buffer = buffer.clone();
-                    self.browse_request = Some(String::new());
+                    let start = self.import_last_dir.clone().unwrap_or_default();
+                    self.browse_request = Some(start);
                     *dialog = ImportDialog::Browse {
                         dir: String::new(),
                         entries: Vec::new(),
@@ -1376,7 +1393,13 @@ impl App {
             );
         }
         if let Some(selected) = self.pack_picker {
-            crate::screens::pack::render_pack_picker(frame, area, &self.pack_labels, selected);
+            crate::screens::pack::render_pack_picker(
+                frame,
+                area,
+                &self.pack_labels,
+                selected,
+                self.pack_notice.as_deref(),
+            );
         }
         if let Some(index) = self.pack_delete_confirm {
             let title = self
@@ -1511,22 +1534,74 @@ impl App {
         self.save_load = None;
     }
 
-    /// Handle mouse-wheel scrolling without changing the selected choice.
+    /// Handle mouse clicks and scrolling across all screens and modals.
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
-        // The import dialog and greeting/pack pickers are keyboard-only
-        // modals: clicks must not reach the home menu or story screen
-        // underneath.
-        if self.import_dialog.is_some()
-            || self.greeting_picker.is_some()
-            || self.pack_picker.is_some()
-        {
-            return;
-        }
-        if self.save_load.is_some() {
-            return;
-        }
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             let area = self.last_render_area.get();
+
+            // 1. Import dialog is keyboard-focused for path input.
+            if self.import_dialog.is_some() {
+                return;
+            }
+
+            // 2. Greeting picker modal click.
+            if self.greeting_picker.is_some() {
+                if let Some(picked) = greeting_selection_at(area, mouse.row, self.greetings.len()) {
+                    self.greeting_picker = None;
+                    self.greeting_selection = Some(picked);
+                    self.home_request = Some(HomeRequest::StartNew);
+                }
+                return;
+            }
+
+            // 3. Pack picker modal click.
+            if let Some(selected_idx) = self.pack_picker {
+                if let Some(clicked_idx) =
+                    pack_selection_at(area, mouse.row, self.pack_labels.len(), false)
+                {
+                    if clicked_idx == selected_idx {
+                        if let Some(dir) = self.pack_dirs.get(clicked_idx) {
+                            let dir = dir.clone();
+                            self.pack_picker = None;
+                            self.pack_swap_request = Some(dir);
+                        }
+                    } else {
+                        self.pack_picker = Some(clicked_idx);
+                    }
+                }
+                return;
+            }
+
+            // 4. Save/Load modal click.
+            if let Some(state) = self.save_load.as_mut() {
+                if let Some(clicked_slot) =
+                    save_load_selection_at(area, mouse.row, state.slots.len())
+                {
+                    state.selected = clicked_slot;
+                    let slot = &state.slots[clicked_slot];
+                    match state.mode {
+                        SaveLoadMode::Load if !slot.story_id.is_empty() => {
+                            self.save_load_request = Some(SaveLoadRequest::Load {
+                                slot_id: slot.slot_id.clone(),
+                            });
+                        }
+                        SaveLoadMode::Save
+                            if !slot.story_id.is_empty() && !state.overwrite_confirmation =>
+                        {
+                            state.overwrite_confirmation = true;
+                        }
+                        SaveLoadMode::Save => {
+                            self.save_load_request = Some(SaveLoadRequest::Save {
+                                slot_id: slot.slot_id.clone(),
+                            });
+                        }
+                        SaveLoadMode::Load => {}
+                    }
+                }
+                return;
+            }
+
+            // 5. Home screen menu click.
             if self.home_visible {
                 if let Some(selection) = menu_selection_at(area, mouse.row) {
                     self.home_selected = selection;
@@ -1534,6 +1609,8 @@ impl App {
                 }
                 return;
             }
+
+            // 6. Model picker modal click.
             if self.list_mode == Some(ListMode::ModelPicker) {
                 let scroll = model_picker_scroll(area, self.model_selected) as usize;
                 let index = scroll + mouse.row.saturating_sub(area.y.saturating_add(1)) as usize;
@@ -1544,6 +1621,8 @@ impl App {
                 }
                 return;
             }
+
+            // 7. Provider picker modal click.
             if self.list_mode == Some(ListMode::ProviderPicker) {
                 let scroll = model_picker_scroll(area, self.provider_selected) as usize;
                 let index = scroll + mouse.row.saturating_sub(area.y.saturating_add(1)) as usize;
@@ -1554,15 +1633,102 @@ impl App {
                 }
                 return;
             }
+
+            // 8. Settings screen clicks.
             if self.settings_visible && mouse.row == area.y.saturating_add(4) {
                 // The model row is the second line in the provider block.
                 self.list_mode = Some(ListMode::ModelPicker);
                 return;
             }
-            if home_shortcut_at(area, &self.view, self.input_mode, mouse.column, mouse.row) {
-                self.open_home_from_game();
+
+            // 9. Story screen footer shortcuts click.
+            if let Some(action) =
+                footer_action_at(area, &self.view, self.input_mode, mouse.column, mouse.row)
+            {
+                match action {
+                    StoryFooterAction::Home => {
+                        self.open_home_from_game();
+                    }
+                    StoryFooterAction::NewGame => {
+                        self.choose_home(0);
+                    }
+                    StoryFooterAction::Input => {
+                        if self.view.loading.is_none()
+                            && self.view.error.is_none()
+                            && !self.view.choices.is_empty()
+                        {
+                            self.input_mode = true;
+                        }
+                    }
+                    StoryFooterAction::Save => {
+                        if self.view.loading.is_none() && self.view.error.is_none() {
+                            self.save_load_request =
+                                Some(SaveLoadRequest::Open(SaveLoadMode::Save));
+                        }
+                    }
+                    StoryFooterAction::Load => {
+                        if self.view.loading.is_none() && self.view.error.is_none() {
+                            self.save_load_request =
+                                Some(SaveLoadRequest::Open(SaveLoadMode::Load));
+                        }
+                    }
+                    StoryFooterAction::Settings => {
+                        if self.view.loading.is_none() && self.view.error.is_none() {
+                            self.settings_visible = true;
+                        }
+                    }
+                    StoryFooterAction::History => {
+                        if self.view.loading.is_none() && self.view.error.is_none() {
+                            self.list_mode = Some(ListMode::History);
+                        }
+                    }
+                    StoryFooterAction::Memory => {
+                        if self.view.loading.is_none() && self.view.error.is_none() {
+                            self.list_mode = Some(ListMode::Memory);
+                        }
+                    }
+                    StoryFooterAction::Regenerate => {
+                        if self.view.loading.is_none()
+                            && self.view.error.is_none()
+                            && !self.view.choices.is_empty()
+                        {
+                            self.mouse_command = Some(EngineCommand::RegenerateChoices);
+                        }
+                    }
+                    StoryFooterAction::Help => {
+                        self.help_visible = true;
+                    }
+                    StoryFooterAction::InputSubmit => {
+                        if self.input_mode {
+                            let text = self.input.text();
+                            if !text.trim().is_empty() {
+                                self.input_mode = false;
+                                self.input.clear();
+                                self.mouse_command = Some(EngineCommand::SubmitFreeAction {
+                                    action: Box::new(ParsedAction {
+                                        action_type: ActionType::GeneralAction,
+                                        target: None,
+                                        intent: None,
+                                        tone: None,
+                                        content: text.trim().to_string(),
+                                        original_text: text,
+                                        confidence: Some(0.0),
+                                    }),
+                                });
+                            }
+                        }
+                    }
+                    StoryFooterAction::InputCancel => {
+                        if self.input_mode {
+                            self.input.clear();
+                            self.input_mode = false;
+                        }
+                    }
+                }
                 return;
             }
+
+            // 10. Story choice click.
             if self.view.error.is_none()
                 && let Some(index) = choice_index_at(area, &self.view, self.input_mode, mouse.row)
                 && let Some(choice) = self.view.choices.get(index)
@@ -2503,6 +2669,59 @@ mod tests {
     }
 
     #[test]
+    fn mouse_click_on_footer_shortcuts_triggers_actions() {
+        let app = App::new(sample_view(1));
+        let mut clicked_save = false;
+        let mut clicked_input = false;
+        let mut clicked_settings = false;
+
+        for column in 0..80 {
+            let mut candidate = app.clone();
+            candidate.last_render_area.set(Rect::new(0, 0, 80, 24));
+            candidate.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row: 23,
+                modifiers: KeyModifiers::NONE,
+            });
+            if candidate.save_load_request == Some(SaveLoadRequest::Open(SaveLoadMode::Save)) {
+                clicked_save = true;
+            }
+            if candidate.input_mode {
+                clicked_input = true;
+            }
+            if candidate.settings_visible {
+                clicked_settings = true;
+            }
+        }
+        assert!(clicked_save, "rendered [S] shortcut must be clickable");
+        assert!(clicked_input, "rendered [I] shortcut must be clickable");
+        assert!(clicked_settings, "rendered [O] shortcut must be clickable");
+    }
+
+    #[test]
+    fn mouse_click_on_save_load_slot_selects_and_executes() {
+        let mut app = App::new(sample_view(3));
+        app.open_save_load(SaveLoadMode::Load, vec![save_slot("slot-1", true)]);
+        app.last_render_area.set(Rect::new(0, 0, 80, 24));
+
+        // Click row 3 (first slot inside list_area: title occupies rows 0-1, list border at 2, slots at 3..)
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 10,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(
+            app.take_save_load_request(),
+            Some(SaveLoadRequest::Load {
+                slot_id: "slot-1".to_string()
+            })
+        );
+    }
+
+    #[test]
     fn follow_story_end_uses_the_layout_resolved_bottom_sentinel() {
         let mut app = App::new(sample_view(1));
         app.follow_story_end();
@@ -2896,5 +3115,46 @@ mod tests {
             Some("stories/beta")
         );
         assert!(app.pack_picker.is_none(), "picker closed while host works");
+    }
+
+    #[test]
+    fn tab_browser_starts_in_the_last_import_directory() {
+        let mut app = App::new(sample_view(0));
+        app.open_import_dialog();
+        // import_last_dir already holds the last import's folder.
+        app.import_last_dir = Some("/tmp/cards".to_string());
+
+        app.handle_key(key(KeyCode::Tab), None);
+        assert_eq!(
+            app.take_browse_request().as_deref(),
+            Some("/tmp/cards"),
+            "browser continues where the last import came from"
+        );
+
+        // Without history the host picks the start directory ("" sentinel).
+        let mut app = App::new(sample_view(0));
+        app.open_import_dialog();
+        app.handle_key(key(KeyCode::Tab), None);
+        assert_eq!(app.take_browse_request().as_deref(), Some(""));
+    }
+
+    #[test]
+    fn picker_notice_is_set_after_open_and_cleared_by_next_open() {
+        let mut app = App::new(sample_view(0));
+        app.open_pack_picker(
+            vec!["stories/alpha".to_string()],
+            vec!["알파 · ko-KR".to_string()],
+            "stories/alpha",
+        );
+        app.set_pack_picker_notice(Some("삭제 실패".to_string()));
+        assert_eq!(app.pack_notice.as_deref(), Some("삭제 실패"));
+
+        // A fresh scan (e.g. another deletion round) clears the stale notice.
+        app.open_pack_picker(
+            vec!["stories/alpha".to_string()],
+            vec!["알파 · ko-KR".to_string()],
+            "stories/alpha",
+        );
+        assert_eq!(app.pack_notice, None);
     }
 }

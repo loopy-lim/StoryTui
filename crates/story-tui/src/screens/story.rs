@@ -68,10 +68,11 @@ pub fn render_list(frame: &mut Frame, area: Rect, mode: ListMode, items: &[Strin
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::LightCyan))
+                .border_type(crate::theme::BORDER_TYPE)
+                .border_style(crate::theme::Styles::border_primary())
                 .title(Span::styled(
-                    format!("{} · PgUp/PgDn 스크롤 · Esc 닫기", title),
-                    Style::default().add_modifier(Modifier::BOLD),
+                    format!(" {} · PgUp/PgDn 스크롤 · Esc 닫기 ", title),
+                    crate::theme::Styles::title(),
                 )),
         )
         .wrap(Wrap { trim: false });
@@ -421,24 +422,37 @@ pub fn choice_index_at(
     None
 }
 
-/// Whether a click lands on the visible `[Home] 홈` segment of the shortcut
-/// footer. Keeping the hit test beside the renderer — both resolve the same
-/// [`active_footer_segments`] layout — prevents the label from becoming a
-/// keyboard-only affordance.
-pub fn home_shortcut_at(
+/// Actions triggered from mouse clicks on the story footer shortcuts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoryFooterAction {
+    Home,
+    NewGame,
+    Input,
+    Save,
+    Load,
+    Settings,
+    History,
+    Memory,
+    Regenerate,
+    Help,
+    InputSubmit,
+    InputCancel,
+}
+
+/// Resolve a click on the shortcut footer to a specific action.
+pub fn footer_action_at(
     area: Rect,
     view: &AppViewModel,
     input_mode: bool,
     column: u16,
     row: u16,
-) -> bool {
+) -> Option<StoryFooterAction> {
     if area.width < MIN_WIDTH
         || area.height < MIN_HEIGHT
-        || view.status.turn == 0
         || view.loading.is_some()
         || view.error.is_some()
     {
-        return false;
+        return None;
     }
     let frame_chunks = Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).split(area);
     let body = frame_chunks[1];
@@ -460,17 +474,45 @@ pub fn home_shortcut_at(
         .split(body)[2]
     };
     if row != status_area.y.saturating_add(2) {
-        return false;
+        return None;
     }
     let mut cursor = area.x;
     for (key, label) in active_footer_segments(view, input_mode, area.width) {
         let seg_width = (key.width() + label.width()) as u16;
-        if key == "[Home]" && column >= cursor && column < cursor.saturating_add(seg_width) {
-            return true;
+        if column >= cursor && column < cursor.saturating_add(seg_width) {
+            return match key {
+                "[Home]" => Some(StoryFooterAction::Home),
+                "[N]" => Some(StoryFooterAction::NewGame),
+                "[I]" => Some(StoryFooterAction::Input),
+                "[S]" => Some(StoryFooterAction::Save),
+                "[L]" => Some(StoryFooterAction::Load),
+                "[O]" => Some(StoryFooterAction::Settings),
+                "[H]" => Some(StoryFooterAction::History),
+                "[M]" => Some(StoryFooterAction::Memory),
+                "[R]" => Some(StoryFooterAction::Regenerate),
+                "[?]" => Some(StoryFooterAction::Help),
+                "[Enter]" => Some(StoryFooterAction::InputSubmit),
+                "[Esc]" => Some(StoryFooterAction::InputCancel),
+                _ => None,
+            };
         }
         cursor = cursor.saturating_add(seg_width + FOOTER_SEPARATOR.width() as u16);
     }
-    false
+    None
+}
+
+/// Whether a click lands on the visible `[Home] 홈` segment of the shortcut
+/// footer. Keeping the hit test beside the renderer — both resolve the same
+/// [`active_footer_segments`] layout — prevents the label from becoming a
+/// keyboard-only affordance.
+pub fn home_shortcut_at(
+    area: Rect,
+    view: &AppViewModel,
+    input_mode: bool,
+    column: u16,
+    row: u16,
+) -> bool {
+    footer_action_at(area, view, input_mode, column, row) == Some(StoryFooterAction::Home)
 }
 
 /// Count the visual lines `text` occupies when word-wrapped at `width`
@@ -854,11 +896,9 @@ fn render_choice_panel(
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(Span::styled(
-            title_text,
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
+        .border_type(crate::theme::BORDER_TYPE)
+        .border_style(crate::theme::Styles::border_muted())
+        .title(Span::styled(title_text, crate::theme::Styles::title()));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let lines = if view.loading.is_some() {
@@ -917,9 +957,8 @@ fn render_choice_panel(
                 );
                 if highlight {
                     line.style = Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD)
-                        .add_modifier(Modifier::REVERSED);
+                        .fg(crate::theme::Palette::SELECTED)
+                        .add_modifier(Modifier::BOLD);
                 }
                 lines.push(line);
             }
@@ -947,6 +986,9 @@ type FooterSegment = (&'static str, &'static str);
 fn active_footer_segments(view: &AppViewModel, input_mode: bool, width: u16) -> Vec<FooterSegment> {
     if input_mode {
         return vec![("[Enter]", " 전송"), ("[Esc]", " 취소")];
+    }
+    if view.status.turn == 0 && view.choices.is_empty() && view.loading.is_none() {
+        return vec![("[N]", " 게임 시작"), ("[?]", " 도움말")];
     }
     let has_choices = !view.choices.is_empty();
     // (visible, key, label, tier) — tier 2 shows only at the widest step.
@@ -984,8 +1026,8 @@ fn active_footer_segments(view: &AppViewModel, input_mode: bool, width: u16) -> 
 /// Build the footer line as styled spans: the bracketed key in cyan, the
 /// label in dim gray.
 fn footer_spans(view: &AppViewModel, input_mode: bool, width: u16) -> Vec<Span<'static>> {
-    let key_style = Style::default().fg(Color::LightCyan);
-    let label_style = Style::default().fg(Color::DarkGray);
+    let key_style = crate::theme::Styles::keycap();
+    let label_style = crate::theme::Styles::button_label();
     let mut spans = Vec::new();
     for (index, (key, label)) in active_footer_segments(view, input_mode, width)
         .into_iter()
@@ -1004,22 +1046,23 @@ fn render_input_panel(frame: &mut Frame, area: Rect, input: &InputBuffer) {
     // The grapheme counter stays visible so long pastes never surprise the
     // player with silent truncation.
     let title = format!(
-        "직접 입력 ({}/{}) · Enter 전송 · Esc 취소",
+        " 직접 입력 ({}/{}) · Enter 전송 · Esc 취소 ",
         input.char_count(),
         input.max_chars()
     );
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::LightCyan))
-        .title(title);
+        .border_type(crate::theme::BORDER_TYPE)
+        .border_style(crate::theme::Styles::border_primary())
+        .title(Span::styled(title, crate::theme::Styles::title()));
     let (before, after) = input.split_at_cursor();
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::raw(before),
-            Span::styled("▌", Style::default().fg(Color::Yellow)),
+            Span::styled("▌", Style::default().fg(crate::theme::Palette::SELECTED)),
             Span::raw(after),
         ]))
-        .style(Style::default().fg(Color::White))
+        .style(Style::default().fg(crate::theme::Palette::PROSE))
         .block(block),
         area,
     );

@@ -30,6 +30,27 @@ pub const MIN_HEIGHT: u16 = 12;
 /// - `footer`: small hint line (e.g. `"↑↓ 이동 · Enter 저장 · Esc 닫기"`).
 /// - `target`: one metadata line under the title — what the action applies
 ///   to (save mode names the story and turn; load mode passes `None`).
+/// Resolve a click row inside the Save/Load modal to a slot index.
+pub fn save_load_selection_at(area: Rect, row: u16, slot_count: usize) -> Option<usize> {
+    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT || slot_count == 0 {
+        return None;
+    }
+    let chunks = Layout::vertical([
+        Constraint::Length(2), // title
+        Constraint::Min(3),    // list
+        Constraint::Length(2), // footer
+    ])
+    .split(area);
+    let list_area = chunks[1];
+    let start_row = list_area.y.saturating_add(1);
+    let end_row = start_row.saturating_add(slot_count as u16);
+    if row >= start_row && row < end_row {
+        Some((row - start_row) as usize)
+    } else {
+        None
+    }
+}
+
 pub fn render_save_load(
     frame: &mut Frame,
     area: Rect,
@@ -77,10 +98,11 @@ pub fn render_save_load(
     // Slot list.
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
+        .border_type(crate::theme::BORDER_TYPE)
+        .border_style(crate::theme::Styles::border_muted())
         .title(Span::styled(
-            "슬롯",
-            Style::default().add_modifier(Modifier::BOLD),
+            " ✦ 슬롯 목록 ✦ ",
+            crate::theme::Styles::title(),
         ));
     let inner = block.inner(chunks[1]);
     frame.render_widget(block, chunks[1]);
@@ -88,7 +110,7 @@ pub fn render_save_load(
     let items: Vec<Line> = if slots.is_empty() {
         vec![Line::from(Span::styled(
             "저장된 슬롯이 없습니다.".to_string(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(crate::theme::Palette::MUTED),
         ))]
     } else {
         slots
@@ -97,7 +119,7 @@ pub fn render_save_load(
                 if s.story_id.is_empty() {
                     return Line::from(vec![
                         Span::raw(format!("[{}] ", s.slot_id)),
-                        Span::styled("빈 슬롯", Style::default().fg(Color::DarkGray)),
+                        Span::styled("빈 슬롯", Style::default().fg(crate::theme::Palette::MUTED)),
                     ]);
                 }
                 let desc = s
@@ -111,19 +133,18 @@ pub fn render_save_load(
                     Span::raw(" · "),
                     Span::raw(desc),
                     Span::raw(" · "),
-                    Span::styled(when, Style::default().fg(Color::DarkGray)),
+                    Span::styled(when, Style::default().fg(crate::theme::Palette::MUTED)),
                 ])
             })
             .collect()
     };
 
     let list = List::new(items)
-        .style(Style::default().fg(Color::White))
+        .style(Style::default().fg(crate::theme::Palette::PROSE))
         .highlight_style(
             Style::default()
                 .add_modifier(Modifier::BOLD)
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::REVERSED),
+                .fg(crate::theme::Palette::SELECTED),
         )
         .highlight_symbol("▶ ");
 

@@ -836,6 +836,11 @@ async fn handle_ui_requests(
             .map(|e| format!("{} · {}", e.title, e.language))
             .collect();
         app.open_pack_picker(dirs, labels, &current);
+        // After the reopen above: the notice renders inside the picker so a
+        // tall listing can never hide it (G3 F-3).
+        if let Err(error) = outcome {
+            app.set_pack_picker_notice(Some(error));
+        }
     }
     if let Some(request) = app.take_save_load_request() {
         saves::handle_request(
