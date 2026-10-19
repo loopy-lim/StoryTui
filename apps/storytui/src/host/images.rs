@@ -110,7 +110,12 @@ impl SceneImageCache {
         }
         let usable = load_scene_image(pack, engine);
         let path = usable.as_ref().map(|(path, _)| path.clone());
-        if path == self.last_path {
+        // `Unchanged` keeps whatever image the app currently shows, so it is
+        // only sound when we know that image's path. A fresh cache (pack
+        // switch) holding `last_path: None` must resolve authoritatively —
+        // reporting Unchanged here would let the previous pack's portrait
+        // survive a switch to a pack without images.
+        if path == self.last_path && self.last_path.is_some() {
             return SceneImageUpdate::Unchanged;
         }
         self.last_path = path;
@@ -284,6 +289,32 @@ mod tests {
         assert_eq!(
             load_scene_image(&pack, &engine).map(|(path, _)| path),
             Some(portrait)
+        );
+    }
+
+    #[test]
+    fn fresh_cache_without_image_reports_clear_not_unchanged() {
+        // A pack switch resets the cache. `Unchanged` would keep whatever the
+        // app currently shows — the previous pack's portrait — so a fresh
+        // cache over a pack without images must resolve to Clear.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pack = pack_at(dir.path());
+        let engine = EngineState::initial(&pack);
+
+        let mut cache = SceneImageCache::default();
+        assert_eq!(
+            cache.refresh(&pack, &engine),
+            SceneImageUpdate::Clear,
+            "fresh cache must be authoritative even when no image exists"
+        );
+        // Steady state: repeated turns over the same imageless pack keep
+        // reporting Clear (an idempotent no-op downstream), never Unchanged
+        // — `last_path` stays None, so the cache never claims to know what
+        // the app is showing.
+        assert_eq!(
+            cache.refresh(&pack, &engine),
+            SceneImageUpdate::Clear,
+            "None must not masquerade as a known-unchanged image"
         );
     }
 
