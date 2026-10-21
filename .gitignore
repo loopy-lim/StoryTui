@@ -1,6 +1,7 @@
 /saves/
 /config/omlx-api-key
 /config/*.local.toml
+/.scratch/
 
 # Rust build output
 /target/

@@ -57,3 +57,11 @@ cargo test --workspace
 
 `scripts/check-core-deps.sh` enforces ADR-003 by failing if `story-core` ever pulls in `ratatui`, `crossterm`, or `reqwest`.
 `scripts/check-public-config.sh` rejects tracked private profiles, model assignments in the public profile, and blocked model labels.
+
+## License & content
+
+Licensed under [Apache-2.0](./LICENSE). Bundled Story Packs are teen-rated
+drama/SF fiction — no adult content. The importer also accepts user-provided
+third-party character cards (`.charx`, c.ai dumps); narration generated from
+imported cards is produced by the locally configured model and remains the
+user's responsibility.
