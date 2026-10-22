@@ -25,6 +25,11 @@ use tokio_util::sync::CancellationToken;
 /// `Arc<dyn LlmProvider>`). The four methods are intentionally minimal:
 /// identity, advertised capabilities, health probe, and the single
 /// generation entry point.
+// Newer clippy (1.99+) fires `double_must_use` inside async_trait's
+// expansion: the macro emits a bare `#[must_use]` for methods that already
+// return `Result` (must_use by type). The attribute is the macro's, not
+// ours — silence it at the trait boundary.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
     /// Stable provider id (e.g. `"mock"`, `"openai-http"`), surfaced in logs.
