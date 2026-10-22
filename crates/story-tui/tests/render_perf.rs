@@ -50,6 +50,7 @@ fn entry(turn: u32) -> story_tui::StoryStackEntry {
         player_action: Some("조용히 자리에 앉는다".to_string()),
         narration,
         location: None,
+        emotion: story_model::Emotion::Neutral,
     }
 }
 

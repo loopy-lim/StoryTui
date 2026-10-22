@@ -95,6 +95,8 @@ fn snapshot_settings_loopback_ready() {
         tts_voice: None,
         images_enabled: true,
         image_backend: Some("kitty".to_string()),
+        use_director_writer: true,
+        expressions_enabled: true,
         theme_name: "default",
         returns_home: false,
     };
@@ -116,6 +118,8 @@ fn snapshot_settings_non_loopback_warning() {
         tts_voice: Some("shimmer".to_string()),
         images_enabled: false,
         image_backend: None,
+        use_director_writer: false,
+        expressions_enabled: false,
         theme_name: "default",
         returns_home: false,
     };
@@ -142,6 +146,8 @@ fn settings_below_min_size_renders_warning() {
         tts_voice: None,
         images_enabled: true,
         image_backend: Some("kitty".to_string()),
+        use_director_writer: true,
+        expressions_enabled: true,
         theme_name: "default",
         returns_home: false,
     };
@@ -184,6 +190,8 @@ fn settings_masked_secret_never_renders() {
         tts_voice: None,
         images_enabled: true,
         image_backend: Some("kitty".to_string()),
+        use_director_writer: true,
+        expressions_enabled: true,
         theme_name: "default",
         returns_home: false,
     };

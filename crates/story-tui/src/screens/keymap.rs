@@ -98,6 +98,14 @@ pub const KEYMAP: &[KeymapRow] = &[
         action_ko: "장면 이미지 켜기/끄기 (설정 화면)",
     },
     KeymapRow {
+        key: "g",
+        action_ko: "생성 방식 전환 — 단일 패스 ↔ 2단계 스트리밍 (설정 화면)",
+    },
+    KeymapRow {
+        key: "f",
+        action_ko: "표정 스프라이트 켜기/끄기 (설정 화면)",
+    },
+    KeymapRow {
         key: "Esc",
         action_ko: "오류·모달 닫기",
     },

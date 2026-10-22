@@ -23,6 +23,8 @@ pub fn refresh_view(
     tts: &TtsStatus,
     images_enabled: bool,
     image_backend: Option<String>,
+    use_director_writer: bool,
+    expressions_enabled: bool,
 ) {
     app.set_settings(
         provider_config_safe_with_models(
@@ -39,6 +41,8 @@ pub fn refresh_view(
         storytui_tts_display(tts),
         images_enabled,
         image_backend,
+        use_director_writer,
+        expressions_enabled,
     );
 }
 
@@ -294,6 +298,8 @@ async fn refresh_projection(
         &tts_status,
         app.images_enabled(),
         app.image_backend_label(),
+        app.use_director_writer(),
+        app.expressions_enabled(),
     );
 }
 
@@ -394,6 +400,8 @@ pub async fn apply_provider(
         &tts_status,
         app.images_enabled(),
         app.image_backend_label(),
+        app.use_director_writer(),
+        app.expressions_enabled(),
     );
     let roster: Vec<(String, String)> = providers
         .iter()

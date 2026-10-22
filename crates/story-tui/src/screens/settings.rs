@@ -75,6 +75,11 @@ pub struct SettingsView<'a> {
     /// Detected terminal graphics protocol (`kitty` 등). `None` = images
     /// unsupported by the terminal.
     pub image_backend: Option<String>,
+    /// `true` = the two-stage Director → Writer path (streaming narration);
+    /// `false` = the single-pass structured turn.
+    pub use_director_writer: bool,
+    /// Whether expression sprites are currently shown.
+    pub expressions_enabled: bool,
     /// Theme name placeholder (no theme switcher yet).
     pub theme_name: &'a str,
     /// True when Settings was opened from the start menu, so `Esc` goes back
@@ -90,12 +95,12 @@ pub fn render_settings(frame: &mut Frame, area: Rect, view: &SettingsView<'_>) {
         return;
     }
 
-    // Layout: title (2) | provider (6) | health + sampling side-by-side (8) |
-    // keymap (auto) | footer (2).
+    // Layout: title (2) | provider (6) | health + sampling side-by-side (9) |
+    // keymap (auto) | footer (2). The health block grew by the `표정 (f)` row.
     let chunks = Layout::vertical([
         Constraint::Length(2),
         Constraint::Length(7),
-        Constraint::Length(8),
+        Constraint::Length(9),
         Constraint::Min(3),
         Constraint::Length(2),
     ])
@@ -247,6 +252,40 @@ fn render_health_and_sampling(frame: &mut Frame, area: Rect, view: &SettingsView
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
+        Line::from(vec![
+            Span::raw("gen (g)    : "),
+            Span::styled(
+                if view.use_director_writer {
+                    "2단계 (Director → Writer 스트리밍)"
+                } else {
+                    "단일 패스"
+                },
+                Style::default()
+                    .fg(if view.use_director_writer {
+                        Color::Green
+                    } else {
+                        Color::DarkGray
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("표정 (f)   : "),
+            Span::styled(
+                if view.expressions_enabled {
+                    "켜짐"
+                } else {
+                    "꺼짐"
+                },
+                Style::default()
+                    .fg(if view.expressions_enabled {
+                        Color::Green
+                    } else {
+                        Color::DarkGray
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
     ];
     frame.render_widget(
         Paragraph::new(health_lines).wrap(Wrap { trim: false }),
@@ -320,7 +359,7 @@ fn render_footer(frame: &mut Frame, area: Rect, returns_home: bool) {
         "Esc 게임으로"
     };
     let para = Paragraph::new(Line::from(Span::styled(
-        format!("P 모델 · E 프로바이더 · {esc_hint} · q 종료"),
+        format!("P 모델 · E 프로바이더 · g 생성방식 · f 표정 · {esc_hint} · q 종료"),
         Style::default().fg(Color::DarkGray),
     )))
     .alignment(Alignment::Center);
@@ -370,6 +409,8 @@ mod tests {
             tts_voice: None,
             images_enabled: true,
             image_backend: Some("kitty".to_string()),
+            use_director_writer: false,
+            expressions_enabled: true,
             theme_name: "default",
             returns_home: false,
         };
@@ -384,6 +425,7 @@ mod tests {
             v.tts_enabled,
             v.tts_backend,
             v.tts_voice,
+            v.use_director_writer,
             v.theme_name,
             v.returns_home,
         );

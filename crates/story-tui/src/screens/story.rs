@@ -17,7 +17,7 @@ use ratatui::widgets::{
     Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
 };
 use ratatui_image::sliced::{SignedPosition, SlicedImage};
-use story_model::{AppViewModel, RiskLevel, TimeSlot};
+use story_model::{AppViewModel, Emotion, RiskLevel, TimeSlot};
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::SceneImage;
@@ -53,6 +53,9 @@ pub struct StoryStackEntry {
     /// patches by `location_timeline`). `None` only for hand-built test
     /// entries; drives inline scene images.
     pub location: Option<String>,
+    /// Narration's dominant emotion (keyword-classified by
+    /// `emotion_timeline`); drives inline expression sprites.
+    pub emotion: Emotion,
 }
 
 /// One renderable unit of the transcript, in chronological order. The

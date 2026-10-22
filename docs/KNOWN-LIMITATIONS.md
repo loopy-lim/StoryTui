@@ -61,14 +61,31 @@ chooses to load. Two principles the code enforces:
    in Korean. A model that ignores this instruction is a model-quality
    issue the engine cannot fully prevent.
 
-## No streaming in the MVP binary path
+## Streaming is the two-stage path, not the single-pass default
 
 The `OpenAiCompatibleProvider` implements both `direct` (Director) and
-`write_stream` (Writer SSE) — see W10. The MVP single-call path
-(`generate_turn`) does not stream tokens to the renderer; the loading
-overlay only reflects the start/end of one generation call. The
-`EngineState::use_director_writer` flag toggles the 2-stage path; the
-settings UI does not yet expose it.
+`write_stream` (Writer SSE) — see W10. The single-call path
+(`generate_turn`) does not stream tokens to the renderer: its response is
+one structured JSON draft (narration + choices + patch), so there is no
+prose to reveal early — the loading overlay reflects the whole call. The
+streaming experience lives in the optional 2-stage Director → Writer path
+(`EngineState::use_director_writer`): the Director plans silently, then the
+Writer's narration streams into the transcript live. Players toggle that
+path in Settings (`g`) or persist it in `user-settings.toml`; the shipped
+default stays single-pass (ADR-005) until the real-model A/B gate passes.
+
+## Expression sprites are keyword-classified, not model-judged
+
+Character expression sprites (`pack/images/expressions/<character-id>/<emotion>.png`,
+with the character portrait as the fallback) are picked by a zero-inference
+keyword classifier over each turn's narration (`story_tui::classify_emotion`)
+— deliberately NOT by a separate classifier model the way SillyTavern's
+Expressions extension runs one. A weak local setup pays no extra generation
+for expressions, and a misread degrades to "no sprite / neutral", never to
+wrong story state. The tradeoff: the rule table reads surface cues only
+(Korean-led, a few English cues) — sarcasm, negation, and who is speaking are
+out of reach, and narration in other languages classifies as neutral. The
+Settings `f` toggle turns sprites off without touching scene images (`i`).
 
 ## Cross-pack runtime evidence is still limited
 

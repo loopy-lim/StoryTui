@@ -199,16 +199,23 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
             None
         }
     };
+    // Player-owned overrides decide the effective generation path BEFORE any
+    // engine/resume stamping: every later reader (resume restore, pack swap,
+    // new game, saves) reads `config.use_director_writer`.
+    let mut user_settings = load_user_settings(&config.save_dir)?;
+    config.use_director_writer = user_settings
+        .use_director_writer
+        .unwrap_or(config.use_director_writer);
     let mut resume_engine = saves::restore_autosave(&save_store, &pack);
     let mut engine = EngineState::initial(&pack);
     engine.use_director_writer = config.use_director_writer;
     if let Some(restored) = resume_engine.as_mut() {
         restored.use_director_writer = config.use_director_writer;
     }
-    let mut scene_images = images::LocationImageStore::default();
+    let mut scene_images = SceneImageStores::default();
     let mut app = App::new(build_view(&engine, &pack, None, None));
     app.set_image_picker(image_picker);
-    refresh_location_images(&mut app, &pack, &engine, &mut scene_images);
+    refresh_scene_images(&mut app, &pack, &engine, &mut scene_images);
     app.set_lists(
         &engine.game.history,
         &engine.game.memories,
@@ -228,18 +235,19 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
             .collect();
         app.set_providers(&roster, &provider_config.name);
     }
-    let mut user_settings = load_user_settings(&config.save_dir)?;
     // The `v` toggle persists an explicit preference; absent means the [tts]
     // profile's `enabled` default decides.
     let tts_enabled = user_settings.tts_enabled.unwrap_or(config.tts.enabled);
     config.tts.enabled = tts_enabled;
     let images_enabled = user_settings.images_enabled.unwrap_or(true);
     app.set_images_enabled(images_enabled);
+    app.set_expressions_enabled(user_settings.expressions_enabled.unwrap_or(true));
     let tts = Arc::new(TtsService::new(config.tts.clone()));
     {
         let status = tts.status().await;
         let images_enabled = app.images_enabled();
         let image_backend = app.image_backend_label();
+        let expressions_enabled = app.expressions_enabled();
         settings::refresh_view(
             &mut app,
             &provider_config,
@@ -250,6 +258,8 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
             &status,
             images_enabled,
             image_backend,
+            config.use_director_writer,
+            expressions_enabled,
         );
     }
     // Start-menu status line: guide an unconfigured first run, and note a
@@ -469,7 +479,7 @@ fn swap_pack(
     pack_dir: &str,
     pack: &mut StoryPack,
     engine: &mut EngineState,
-    scene_images: &mut images::LocationImageStore,
+    scene_images: &mut SceneImageStores,
     config: &RuntimeConfig,
     cancellation: &mut Option<(story_model::uuid::Uuid, CancellationToken)>,
     resume_engine: &mut Option<EngineState>,
@@ -508,7 +518,7 @@ fn swap_pack(
     app.set_can_continue(false);
     app.set_greetings(greeting_labels(pack));
     app.set_current_pack_dir(pack_dir);
-    refresh_location_images(app, pack, engine, scene_images);
+    refresh_scene_images(app, pack, engine, scene_images);
     tracing::info!(pack = %pack_dir, "switched to the imported pack");
 }
 
@@ -542,19 +552,39 @@ fn read_greeting(pack: &StoryPack, index: usize) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
-/// Refresh the per-location image store and push newly resolved images into
-/// the view. Runs on every publish; a location decodes at most once per pack
-/// session, so the common case is a no-op scan of visited locations.
+/// Both resolved-image caches the host owns — location art and expression
+/// sprites. One bundle so every dispatch/reset/refresh signature threads a
+/// single handle and the pack-switch lockstep cannot forget one side.
+#[derive(Default)]
+struct SceneImageStores {
+    locations: images::LocationImageStore,
+    expressions: images::ExpressionImageStore,
+}
+
+/// Refresh both image stores and push newly resolved images into the view.
+/// Runs on every publish; a location or emotion decodes at most once per
+/// pack session, so the common case is a no-op scan.
+fn refresh_scene_images(
+    app: &mut App,
+    pack: &StoryPack,
+    engine: &EngineState,
+    stores: &mut SceneImageStores,
+) {
+    refresh_location_images(app, pack, engine, stores);
+    refresh_expression_images(app, pack, engine, stores);
+}
+
+/// Refresh the per-location image store. The opening location is always in
+/// play (the empty-stack opening shows its image).
 fn refresh_location_images(
     app: &mut App,
     pack: &StoryPack,
     engine: &EngineState,
-    store: &mut images::LocationImageStore,
+    stores: &mut SceneImageStores,
 ) {
     let primary = engine.game.characters.keys().next().map(|id| id.0.clone());
     let initial = &pack.metadata.initial_state.location;
-    // Distinct locations in play, order-preserving; the opening location is
-    // always in play (the empty-stack opening shows its image).
+    // Distinct locations in play, order-preserving.
     let mut seen = std::collections::HashSet::new();
     let mut locations = vec![initial.0.clone()];
     seen.insert(initial.0.clone());
@@ -566,20 +596,58 @@ fn refresh_location_images(
             locations.push(location);
         }
     }
-    for (location, resolved) in store.load_missing(pack, &locations, primary.as_deref()) {
+    for (location, resolved) in stores
+        .locations
+        .load_missing(pack, &locations, primary.as_deref())
+    {
         app.set_location_image(&location, resolved);
     }
 }
 
-/// Clear the per-location images on BOTH sides in lockstep.
+/// Refresh the per-emotion sprite store. Zero inference: the emotions come
+/// from `classify_emotion` over the opening narration and the history, so a
+/// weak local setup pays no extra generation for expression sprites.
+/// Skipped entirely while the player keeps sprites off (`f`).
+fn refresh_expression_images(
+    app: &mut App,
+    pack: &StoryPack,
+    engine: &EngineState,
+    stores: &mut SceneImageStores,
+) {
+    if !app.expressions_enabled() {
+        return;
+    }
+    let Some(character) = engine.game.characters.keys().next().map(|id| id.0.clone()) else {
+        return;
+    };
+    // Distinct emotions in play, order-preserving; the opening narration is
+    // the transcript's first beat and is classified exactly like the App's
+    // empty-stack branch classifies it.
+    let mut seen = std::collections::HashSet::new();
+    let mut emotions = Vec::new();
+    for emotion in std::iter::once(story_tui::classify_emotion(&app.view.narration))
+        .chain(story_tui::emotion_timeline(&engine.game.history))
+    {
+        if seen.insert(emotion) {
+            emotions.push(emotion);
+        }
+    }
+    for (emotion, resolved) in stores.expressions.load_missing(pack, &character, &emotions) {
+        app.set_expression_image(emotion, resolved);
+    }
+}
+
+/// Clear the per-location AND per-emotion images on BOTH sides in lockstep.
 ///
-/// Invariant: the host's decode store and the app's encoded image map must be
-/// reset together. Clearing only one side lets the previous pack's images
+/// Invariant: the host's decode stores and the app's encoded image maps must
+/// be reset together. Clearing only one side lets the previous pack's images
 /// survive a pack switch — the stale-portrait bug fixed 2026-10-19 (a fresh
 /// cache that answered `Unchanged` instead of `Clear` for an imageless pack).
-fn reset_scene_images(app: &mut App, store: &mut images::LocationImageStore) {
-    store.clear();
+fn reset_scene_images(app: &mut App, stores: &mut SceneImageStores) {
+    stores.locations.clear();
+    stores.expressions.clear();
     app.reset_location_images();
+    app.reset_expression_images();
 }
 
 #[allow(clippy::too_many_arguments)] // consumes all host-owned UI requests in one place
@@ -593,7 +661,7 @@ async fn handle_ui_requests(
     config: &mut RuntimeConfig,
     save_store: &SaveStore,
     tts: &TtsService,
-    scene_images: &mut images::LocationImageStore,
+    scene_images: &mut SceneImageStores,
     tx: &UnboundedSender<HostMessage>,
     cancellation: &mut Option<(story_model::uuid::Uuid, CancellationToken)>,
     resume_engine: &mut Option<EngineState>,
@@ -726,7 +794,7 @@ async fn handle_ui_requests(
                 );
                 app.follow_story_end();
                 app.close_home();
-                refresh_location_images(app, pack, engine, scene_images);
+                refresh_scene_images(app, pack, engine, scene_images);
                 dispatch(
                     EngineCommand::StartNewGame,
                     engine,
@@ -754,7 +822,7 @@ async fn handle_ui_requests(
                     );
                     app.follow_story_end();
                     app.set_can_continue(false);
-                    refresh_location_images(app, pack, engine, scene_images);
+                    refresh_scene_images(app, pack, engine, scene_images);
                 }
             }
             HomeRequest::PickPack => {
@@ -777,6 +845,19 @@ async fn handle_ui_requests(
         save_user_settings(&config.save_dir, user_settings)?;
         app.update_settings_images(enabled, app.image_backend_label());
     }
+    if app.take_expressions_toggle_request() {
+        let enabled = !app.expressions_enabled();
+        app.set_expressions_enabled(enabled);
+        user_settings.expressions_enabled = Some(enabled);
+        save_user_settings(&config.save_dir, user_settings)?;
+        app.update_settings_expressions(enabled);
+        if enabled {
+            // A session that STARTED with sprites off has a cold sprite
+            // store — resolve the beats in play now instead of waiting for
+            // the next publish, so re-enabling really is instant.
+            refresh_scene_images(app, pack, engine, scene_images);
+        }
+    }
     if app.take_tts_toggle_request() {
         let enabled = !tts.enabled().await;
         tts.set_enabled(enabled).await;
@@ -788,6 +869,19 @@ async fn handle_ui_requests(
             backend: status.backend.as_str().to_string(),
             voice: status.voice.clone(),
         });
+    }
+    if app.take_generation_toggle_request() {
+        // Flip the session value AND the live engine: the next
+        // SubmitChoice/SubmitFreeAction reads the engine flag, while saves
+        // and new games read the config. An in-flight generation (cancelled
+        // when Settings opened) is unaffected — accept commands never
+        // consult the flag.
+        let two_stage = !config.use_director_writer;
+        config.use_director_writer = two_stage;
+        engine.use_director_writer = two_stage;
+        user_settings.use_director_writer = Some(two_stage);
+        save_user_settings(&config.save_dir, user_settings)?;
+        app.update_settings_generation(two_stage);
     }
     if let Some(path) = app.take_import_request() {
         // ADR-003: the host owns all file I/O. The importer runs off the UI
@@ -895,7 +989,7 @@ async fn handle_ui_requests(
             config.use_director_writer,
             cancellation,
         );
-        refresh_location_images(app, pack, engine, scene_images);
+        refresh_scene_images(app, pack, engine, scene_images);
     }
     Ok(())
 }
@@ -937,7 +1031,7 @@ async fn dispatch(
     config: &RuntimeConfig,
     save_store: &SaveStore,
     tts: &TtsService,
-    scene_images: &mut images::LocationImageStore,
+    scene_images: &mut SceneImageStores,
     tx: &UnboundedSender<HostMessage>,
     cancellation: &mut Option<(story_model::uuid::Uuid, CancellationToken)>,
 ) -> Result<(), String> {
@@ -974,7 +1068,7 @@ async fn dispatch(
                 if turn_completed && !narration.trim().is_empty() {
                     tts.speak(narration).await;
                 }
-                refresh_location_images(app, pack, engine, scene_images);
+                refresh_scene_images(app, pack, engine, scene_images);
             }
             EngineEffect::ShowRecoverableError(error) => app.view.error = Some(error),
             // No model selected yet (first run before auto-setup succeeded):
@@ -1233,6 +1327,36 @@ mod tests {
                 "schema: UUID parsing failed".to_string()
             )),
             "assistant_schema"
+        );
+    }
+    #[test]
+    fn enabling_expressions_mid_session_resolves_sprites_immediately() {
+        use super::{SceneImageStores, images, refresh_expression_images};
+        use story_core::engine::{EngineState, build_view};
+        use story_tui::App;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pack = images::tests::pack_at(dir.path());
+        let sprite = dir.path().join("images/expressions/yuna/neutral.png");
+        images::tests::write_png(&sprite);
+
+        let engine = EngineState::initial(&pack);
+        let mut app = App::new(build_view(&engine, &pack, None, None));
+        let mut stores = SceneImageStores::default();
+
+        // Off: the refresh is skipped entirely — nothing resolves.
+        app.set_expressions_enabled(false);
+        refresh_expression_images(&mut app, &pack, &engine, &mut stores);
+        assert_eq!(app.expression_sprite_count(), 0);
+
+        // A session that STARTED off must not wait for the next publish:
+        // turning ON resolves the beats in play right away (F-1).
+        app.set_expressions_enabled(true);
+        refresh_expression_images(&mut app, &pack, &engine, &mut stores);
+        assert_eq!(
+            app.expression_sprite_count(),
+            1,
+            "cold toggle-on resolves the opening emotion immediately"
         );
     }
 }

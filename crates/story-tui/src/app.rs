@@ -22,7 +22,7 @@ use ratatui_image::picker::Picker;
 use ratatui_image::sliced::SlicedProtocol;
 use story_core::engine_cmd::EngineCommand;
 use story_model::uuid::Uuid;
-use story_model::{ActionType, AppViewModel, LocationId, ParsedAction};
+use story_model::{ActionType, AppViewModel, Emotion, LocationId, ParsedAction};
 use story_model::{ProviderConfigSafe, ProviderHealth};
 use story_persistence::SlotMeta;
 
@@ -114,6 +114,10 @@ struct SettingsState {
     tts: TtsDisplay,
     images_enabled: bool,
     image_backend: Option<String>,
+    /// Two-stage Director → Writer generation path (streaming narration).
+    use_director_writer: bool,
+    /// Whether expression sprites are currently shown.
+    expressions_enabled: bool,
 }
 
 /// A scene image pre-encoded for the detected terminal graphics protocol.
@@ -141,6 +145,10 @@ impl std::fmt::Debug for SceneImage {
 /// Upper bound for an inline scene image so it never dominates the transcript.
 const SCENE_IMAGE_MAX_COLS: u16 = 26;
 const SCENE_IMAGE_MAX_ROWS: u16 = 14;
+/// Tighter portrait budget for expression sprites — an emotion beat must
+/// stay visually subordinate to the location art around it.
+const EMOTE_IMAGE_MAX_COLS: u16 = 14;
+const EMOTE_IMAGE_MAX_ROWS: u16 = 14;
 
 impl SceneImage {
     /// Encode `image` fitted into the inline cell budget. `None` when the
@@ -150,10 +158,21 @@ impl SceneImage {
     /// correct slice of a partially scrolled image — plain protocols always
     /// draw from the image's first row.
     pub fn encode(picker: &Picker, image: DynamicImage) -> Option<Self> {
+        Self::encode_in(picker, image, SCENE_IMAGE_MAX_COLS, SCENE_IMAGE_MAX_ROWS)
+    }
+
+    /// Encode with an explicit cell budget — the expression sprites use a
+    /// tighter portrait budget than location art.
+    pub fn encode_in(
+        picker: &Picker,
+        image: DynamicImage,
+        max_cols: u16,
+        max_rows: u16,
+    ) -> Option<Self> {
         let protocol = SlicedProtocol::new_with_resize(
             picker,
             image,
-            ratatui::layout::Size::new(SCENE_IMAGE_MAX_COLS, SCENE_IMAGE_MAX_ROWS),
+            ratatui::layout::Size::new(max_cols, max_rows),
             ratatui_image::Resize::Fit(None),
         )
         .ok()?;
@@ -166,12 +185,11 @@ impl SceneImage {
     }
 }
 
-/// One location's resolved image: the encoded payload plus the source path it
-/// came from. The path is the dedupe key — a pack whose locations all fall
-/// back to the same character portrait must not repeat that portrait at every
-/// scene boundary.
+/// One resolved image (location art or expression sprite): the encoded
+/// payload plus the source path it came from. The path is the dedupe key —
+/// transcript positions resolving to the same file must not repeat it.
 #[derive(Clone, Debug)]
-struct LocationImage {
+struct ResolvedImage {
     source: std::path::PathBuf,
     image: Arc<SceneImage>,
 }
@@ -239,11 +257,20 @@ pub struct App {
     images_enabled: bool,
     /// Set when the player toggled images in Settings (`i`).
     images_toggle_requested: bool,
+    /// Set when the player toggled the generation path in Settings (`g`).
+    generation_toggle_requested: bool,
+    /// Player toggle for expression sprites from the Settings screen (`f`).
+    expressions_enabled: bool,
+    /// Set when the player toggled expressions in Settings (`f`).
+    expressions_toggle_requested: bool,
     /// Per-location resolved images, keyed by location id. `None` = the host
     /// resolved this location and found no usable art (or the encode failed) —
     /// an authoritative absence that is not retried until the host resets it
     /// on a pack switch.
-    location_images: HashMap<String, Option<LocationImage>>,
+    location_images: HashMap<String, Option<ResolvedImage>>,
+    /// Per-emotion resolved expression sprites, keyed by [`Emotion`]. Same
+    /// authoritative-absence contract as `location_images`.
+    expression_images: HashMap<Emotion, Option<ResolvedImage>>,
     /// The pack's initial location, seeded by `set_lists` alongside the
     /// history it seeds the location fold for.
     initial_location: Option<String>,
@@ -352,7 +379,11 @@ impl App {
             image_backend: None,
             images_enabled: true,
             images_toggle_requested: false,
+            generation_toggle_requested: false,
+            expressions_enabled: true,
+            expressions_toggle_requested: false,
             location_images: HashMap::new(),
+            expression_images: HashMap::new(),
             initial_location: None,
             mouse_command: None,
             import_dialog: None,
@@ -805,6 +836,8 @@ impl App {
         tts: TtsDisplay,
         images_enabled: bool,
         image_backend: Option<String>,
+        use_director_writer: bool,
+        expressions_enabled: bool,
     ) {
         self.settings = Some(SettingsState {
             provider,
@@ -816,6 +849,8 @@ impl App {
             tts,
             images_enabled,
             image_backend,
+            use_director_writer,
+            expressions_enabled,
         });
     }
 
@@ -851,6 +886,11 @@ impl App {
         std::mem::take(&mut self.images_toggle_requested)
     }
 
+    /// Consume a generation-path toggle request from the Settings screen.
+    pub fn take_generation_toggle_request(&mut self) -> bool {
+        std::mem::take(&mut self.generation_toggle_requested)
+    }
+
     /// Store one location's resolved image. Decoding is host-owned; encoding
     /// happens here once so per-frame rendering stays cheap. `None` (no usable
     /// art) and encode failures are both stored as authoritative absence — the
@@ -864,7 +904,7 @@ impl App {
     ) {
         let entry = match (resolved, self.image_picker.as_ref()) {
             (Some((source, image)), Some(picker)) => {
-                SceneImage::encode(picker, image).map(|image| LocationImage {
+                SceneImage::encode(picker, image).map(|image| ResolvedImage {
                     source,
                     image: Arc::new(image),
                 })
@@ -874,11 +914,66 @@ impl App {
         self.location_images.insert(location.to_string(), entry);
     }
 
+    /// Store one emotion's resolved expression sprite. Mirrors
+    /// [`Self::set_location_image`] with the tighter portrait cell budget.
+    pub fn set_expression_image(
+        &mut self,
+        emotion: Emotion,
+        resolved: Option<(std::path::PathBuf, DynamicImage)>,
+    ) {
+        let entry = match (resolved, self.image_picker.as_ref()) {
+            (Some((source, image)), Some(picker)) => {
+                SceneImage::encode_in(picker, image, EMOTE_IMAGE_MAX_COLS, EMOTE_IMAGE_MAX_ROWS)
+                    .map(|image| ResolvedImage {
+                        source,
+                        image: Arc::new(image),
+                    })
+            }
+            _ => None,
+        };
+        self.expression_images.insert(emotion, entry);
+    }
+
     /// Drop every per-location image. MUST move in lockstep with the host's
     /// `LocationImageStore::clear` — clearing only one side lets the previous
     /// pack's images survive a pack switch (the stale-portrait bug).
     pub fn reset_location_images(&mut self) {
         self.location_images.clear();
+    }
+
+    /// Drop every per-emotion sprite. Same lockstep contract as
+    /// [`Self::reset_location_images`] (`reset_scene_images` on the host).
+    pub fn reset_expression_images(&mut self) {
+        self.expression_images.clear();
+    }
+
+    /// Settings-screen expression toggle. Per-emotion sprites are kept, so
+    /// re-enabling is instant — no re-decode.
+    pub fn set_expressions_enabled(&mut self, enabled: bool) {
+        self.expressions_enabled = enabled;
+    }
+
+    pub fn expressions_enabled(&self) -> bool {
+        self.expressions_enabled
+    }
+
+    /// Resolved expression sprite entries (diagnostics seam — lets the host
+    /// assert the cold-toggle refresh path without rendering).
+    pub fn expression_sprite_count(&self) -> usize {
+        self.expression_images.len()
+    }
+
+    /// Consume an expression toggle request from the Settings screen.
+    pub fn take_expressions_toggle_request(&mut self) -> bool {
+        std::mem::take(&mut self.expressions_toggle_requested)
+    }
+
+    /// Patch only the expression section of the Settings state (the `f`
+    /// toggle).
+    pub fn update_settings_expressions(&mut self, expressions_enabled: bool) {
+        if let Some(settings) = self.settings.as_mut() {
+            settings.expressions_enabled = expressions_enabled;
+        }
     }
 
     /// Patch only the TTS section of the Settings state (used by the `v`
@@ -895,6 +990,24 @@ impl App {
             settings.images_enabled = images_enabled;
             settings.image_backend = image_backend;
         }
+    }
+
+    /// Patch only the generation-path section of the Settings state (the `g`
+    /// toggle).
+    pub fn update_settings_generation(&mut self, use_director_writer: bool) {
+        if let Some(settings) = self.settings.as_mut() {
+            settings.use_director_writer = use_director_writer;
+        }
+    }
+
+    /// Generation-path value currently shown on the Settings screen. The
+    /// host's `config.use_director_writer` stays the authoritative session
+    /// value; this mirror lets settings refreshes read it without threading
+    /// the runtime config through every `apply_*` path.
+    pub fn use_director_writer(&self) -> bool {
+        self.settings
+            .as_ref()
+            .is_some_and(|settings| settings.use_director_writer)
     }
 
     pub fn set_can_continue(&mut self, can_continue: bool) {
@@ -1026,6 +1139,7 @@ impl App {
         let previous_story_count = self.story_stack.len();
         self.initial_location = Some(initial_location.0.clone());
         let timeline = location_timeline(history, initial_location);
+        let emotions = emotion_timeline(history);
         self.history_items = history
             .iter()
             .rev()
@@ -1037,7 +1151,8 @@ impl App {
         let stack = history
             .iter()
             .zip(timeline)
-            .map(|(entry, location)| StoryStackEntry {
+            .zip(emotions)
+            .map(|((entry, location), emotion)| StoryStackEntry {
                 turn: entry.turn,
                 scene_id: entry.scene_id.clone(),
                 model: self.generation_models.get(&entry.generation_id).cloned(),
@@ -1048,6 +1163,7 @@ impl App {
                     .map(|action| action.original_text.trim().to_string()),
                 narration: entry.narration.clone(),
                 location,
+                emotion,
             })
             .collect();
         self.replace_story_stack(stack);
@@ -1243,6 +1359,14 @@ impl App {
                 KeyCode::Char('i' | 'ㅑ') => {
                     self.images_toggle_requested = true;
                 }
+                // Same physical key under Korean 2-beolsik: g=ㅎ.
+                KeyCode::Char('g' | 'ㅎ') => {
+                    self.generation_toggle_requested = true;
+                }
+                // Same physical key under Korean 2-beolsik: f=ㄹ.
+                KeyCode::Char('f' | 'ㄹ') => {
+                    self.expressions_toggle_requested = true;
+                }
                 KeyCode::Char('q' | 'ㅂ') => self.should_quit = true,
                 _ => {}
             }
@@ -1379,15 +1503,33 @@ impl App {
 
     /// Blocks for the narration pane, in transcript order: a scene image
     /// before each turn whose location's image differs from the previous
-    /// turn's, then the turn's text.
+    /// turn's, an expression sprite before each turn whose emotion's sprite
+    /// differs, then the turn's text.
     fn story_blocks(&self) -> Vec<StoryBlock<'_>> {
+        let mut blocks: Vec<StoryBlock<'_>> = Vec::new();
+        // The dedupe key is the resolved SOURCE PATH, not the location or
+        // emotion id: a pack whose locations all fall back to the same
+        // character portrait must not repeat that portrait at every boundary,
+        // while genuinely different artwork always shows. A location without
+        // art breaks the run, so returning to imaged art shows it again.
+        let mut previous_source: Option<&std::path::PathBuf> = None;
         if self.story_stack.is_empty() {
-            let mut blocks: Vec<StoryBlock<'_>> = Vec::new();
             // The opening turn shows the initial location's image, if the
             // pack ships one — the transcript's first scene boundary.
             if self.images_enabled
                 && let Some(initial) = self.initial_location.as_deref()
                 && let Some(Some(image)) = self.location_images.get(initial)
+            {
+                blocks.push(StoryBlock::Image(&image.image));
+                previous_source = Some(&image.source);
+            }
+            // The opening narration's emotion is the first expression beat;
+            // it dedupes against the scene image above.
+            if self.expressions_enabled
+                && let Some(Some(image)) = self
+                    .expression_images
+                    .get(&classify_emotion(&self.view.narration))
+                && previous_source != Some(&image.source)
             {
                 blocks.push(StoryBlock::Image(&image.image));
             }
@@ -1407,30 +1549,59 @@ impl App {
             .expect("fill_block_cache ran before story_blocks")
             .1;
         let mut blocks: Vec<StoryBlock<'_>> = Vec::with_capacity(cache.len() + 4);
-        // The dedupe key is the resolved SOURCE PATH, not the location id: a
-        // pack whose locations all fall back to the same character portrait
-        // must not repeat that portrait at every boundary, while genuinely
-        // different location artwork always shows. A location without art
-        // breaks the run, so returning to imaged art shows it again.
-        let mut previous_source: Option<&std::path::PathBuf> = None;
-        if !self.images_enabled {
+        if !self.images_enabled && !self.expressions_enabled {
             for lines in cache {
                 blocks.push(StoryBlock::Text(std::borrow::Cow::Borrowed(lines)));
             }
         } else {
+            // Two independent dedupe runs — scenery and expression each
+            // repeat only when their own visual actually changes — plus one
+            // shared rule: neither kind may repeat the source the other kind
+            // is currently showing (portrait-fallback collisions).
+            let mut scene_run: Option<&std::path::PathBuf> = None;
+            let mut expression_run: Option<&std::path::PathBuf> = None;
             for (entry, lines) in self.story_stack.iter().zip(cache) {
-                let resolved = entry
-                    .location
-                    .as_deref()
-                    .and_then(|location| self.location_images.get(location))
-                    .and_then(|resolved| resolved.as_ref());
-                let source = resolved.as_ref().map(|image| &image.source);
-                if let Some(image) = resolved
-                    && source != previous_source
-                {
-                    blocks.push(StoryBlock::Image(&image.image));
+                if self.images_enabled {
+                    let resolved = entry
+                        .location
+                        .as_deref()
+                        .and_then(|location| self.location_images.get(location))
+                        .and_then(|resolved| resolved.as_ref());
+                    if let Some(image) = resolved {
+                        if Some(&image.source) != scene_run && Some(&image.source) != expression_run
+                        {
+                            blocks.push(StoryBlock::Image(&image.image));
+                        }
+                        scene_run = Some(&image.source);
+                    } else {
+                        // No art at this boundary: break the scenery run so
+                        // returning to imaged art shows it again.
+                        scene_run = None;
+                    }
+                } else {
+                    scene_run = None;
                 }
-                previous_source = source;
+                if self.expressions_enabled {
+                    let sprite = self
+                        .expression_images
+                        .get(&entry.emotion)
+                        .and_then(|resolved| resolved.as_ref());
+                    match sprite {
+                        Some(image) => {
+                            if Some(&image.source) != expression_run
+                                && Some(&image.source) != scene_run
+                            {
+                                blocks.push(StoryBlock::Image(&image.image));
+                            }
+                            expression_run = Some(&image.source);
+                        }
+                        // No usable sprite this turn: break the expression
+                        // run so a returning sprite shows again.
+                        None => expression_run = None,
+                    }
+                } else {
+                    expression_run = None;
+                }
                 blocks.push(StoryBlock::Text(std::borrow::Cow::Borrowed(lines)));
             }
         }
@@ -1586,6 +1757,8 @@ impl App {
                     tts_voice: settings.tts.voice.clone(),
                     images_enabled: settings.images_enabled,
                     image_backend: settings.image_backend.clone(),
+                    use_director_writer: settings.use_director_writer,
+                    expressions_enabled: settings.expressions_enabled,
                     theme_name: "default",
                     returns_home: self.settings_returns_home,
                 },
@@ -2104,6 +2277,126 @@ pub fn location_timeline(
         .collect()
 }
 
+/// Narration cues per [`Emotion`], Korean-led with a few English cues. Table
+/// order is the tie-break order when two emotions score equally.
+///
+/// This is the zero-inference stand-in for SillyTavern's separate classifier
+/// model: a weak local setup pays no extra generation for expression
+/// sprites, and the worst case of a miss is "no sprite / neutral", never
+/// wrong story state.
+const EMOTION_CUES: &[(Emotion, &[&str])] = &[
+    (
+        Emotion::Happy,
+        &[
+            "기쁘",
+            "즐거",
+            "행복",
+            "환한 미소",
+            "방긋",
+            "신나",
+            "웃음",
+            "smiles",
+        ],
+    ),
+    (
+        Emotion::Sad,
+        &[
+            "슬프",
+            "슬픈",
+            "눈물",
+            "울먹",
+            "씁쓸",
+            "가라앉",
+            "서러",
+            "먹먹",
+            "흐느",
+            "tears",
+        ],
+    ),
+    (
+        Emotion::Angry,
+        &[
+            "분노",
+            "노기",
+            "성난",
+            "화를 내",
+            "화가 나",
+            "째려",
+            "이를 갈",
+            "snaps",
+        ],
+    ),
+    (
+        Emotion::Anxious,
+        &[
+            "불안",
+            "초조",
+            "긴장",
+            "걱정",
+            "조마조마",
+            "떨리는 숨",
+            "restless",
+        ],
+    ),
+    (
+        Emotion::Surprised,
+        &["놀라", "깜짝", "벌떡", "숨을 삼키", "눈을 동그랗", "gasps"],
+    ),
+    (
+        Emotion::Affectionate,
+        &[
+            "다정",
+            "애정",
+            "사랑",
+            "설렘",
+            "껴안",
+            "살갑",
+            "살며시 안",
+            "hugs",
+        ],
+    ),
+    (
+        Emotion::Cold,
+        &["차갑", "차가", "싸늘", "무심", "서늘", "냉랭", "coldly"],
+    ),
+    (
+        Emotion::Embarrassed,
+        &["붉어", "빨개", "부끄", "머쓱", "당황", "허둥", "blushes"],
+    ),
+    (
+        Emotion::Guilty,
+        &["죄책", "미안", "참회", "고개를 숙", "apolog"],
+    ),
+];
+
+/// Classify the dominant emotion of one narration passage. Pure keyword
+/// counting — no model call, fully deterministic. Highest hit count wins;
+/// equal scores resolve to the earlier table entry; no hits are `Neutral`.
+/// English cues must be lowercase (the haystack is lowercased once).
+pub fn classify_emotion(narration: &str) -> Emotion {
+    let haystack = narration.to_lowercase();
+    let mut best = (Emotion::Neutral, 0usize);
+    for (emotion, cues) in EMOTION_CUES {
+        let hits: usize = cues.iter().map(|cue| haystack.matches(cue).count()).sum();
+        if hits > best.1 {
+            best = (*emotion, hits);
+        }
+    }
+    best.0
+}
+
+/// Per-entry emotion after classifying each turn's narration in order.
+///
+/// Mirrors [`location_timeline`]: a pure function of the history, so the same
+/// fold reproduces the timeline after a save load. The opening turn is not
+/// part of the history — classify `App::view.narration` separately there.
+pub fn emotion_timeline(history: &[story_model::HistoryEntry]) -> Vec<Emotion> {
+    history
+        .iter()
+        .map(|entry| classify_emotion(&entry.narration))
+        .collect()
+}
+
 fn save_load_copy(state: &SaveLoadState) -> (&'static str, &'static str) {
     match (state.mode, state.overwrite_confirmation) {
         (SaveLoadMode::Save, true) => (
@@ -2451,6 +2744,106 @@ mod tests {
         assert_eq!(image_block_count(&mut app), 1, "re-enable is instant");
     }
 
+    #[test]
+    fn expression_sprite_inserts_on_emotion_change_and_dedupes() {
+        let mut app = halfblocks_app(1);
+        app.set_expression_image(
+            Emotion::Happy,
+            Some((
+                std::path::PathBuf::from("/pack/expressions/happy.png"),
+                image::DynamicImage::new_rgb8(16, 16),
+            )),
+        );
+        app.set_expression_image(
+            Emotion::Sad,
+            Some((
+                std::path::PathBuf::from("/pack/expressions/sad.png"),
+                image::DynamicImage::new_rgb8(16, 16),
+            )),
+        );
+
+        // Three turns: happy → sad → sad again. The repeat must not re-insert.
+        let mut first = history_entry(1, None);
+        first.narration = "유나는 환한 미소를 지었다.".to_string();
+        let mut second = history_entry(2, None);
+        second.narration = "그녀의 눈에 눈물이 맺혔다.".to_string();
+        let mut third = history_entry(3, None);
+        third.narration = "또다시 눈물이 맺혔다.".to_string();
+        app.set_lists(&[first, second, third], &[], &default_location());
+
+        assert_eq!(
+            image_block_count(&mut app),
+            2,
+            "happy + sad only; the consecutive sad dedupes"
+        );
+
+        // The `f` toggle hides sprite blocks but keeps the map warm.
+        app.set_expressions_enabled(false);
+        assert_eq!(image_block_count(&mut app), 0, "disabled hides sprites");
+        app.set_expressions_enabled(true);
+        assert_eq!(image_block_count(&mut app), 2, "re-enable is instant");
+    }
+
+    #[test]
+    fn expression_sprite_shares_the_scene_dedupe_key() {
+        let mut app = halfblocks_app(1);
+        // Portrait fallback: the scene boundary AND the happy sprite resolve
+        // to the SAME file — only one may render.
+        let portrait = std::path::PathBuf::from("/pack/characters/yuna.png");
+        app.set_location_image(
+            "cafe",
+            Some((portrait.clone(), image::DynamicImage::new_rgb8(16, 16))),
+        );
+        app.set_expression_image(
+            Emotion::Happy,
+            Some((portrait, image::DynamicImage::new_rgb8(16, 16))),
+        );
+
+        let mut turn = history_entry(1, Some("cafe"));
+        turn.narration = "유나는 환한 미소를 지었다.".to_string();
+        app.set_lists(&[turn], &[], &default_location());
+
+        assert_eq!(
+            image_block_count(&mut app),
+            1,
+            "the portrait-fallback sprite must not repeat the scene image"
+        );
+    }
+
+    #[test]
+    fn opening_narration_drives_the_first_expression_beat() {
+        let mut app = halfblocks_app(1);
+        app.set_expression_image(
+            Emotion::Sad,
+            Some((
+                std::path::PathBuf::from("/pack/expressions/sad.png"),
+                image::DynamicImage::new_rgb8(16, 16),
+            )),
+        );
+        app.view.narration = "그녀의 눈에 눈물이 맺혔다.".to_string();
+        assert_eq!(
+            image_block_count(&mut app),
+            1,
+            "the empty-stack opening classifies its narration"
+        );
+    }
+
+    #[test]
+    fn settings_f_key_requests_the_expression_toggle_once() {
+        let mut app = halfblocks_app(1);
+        app.handle_key(key(KeyCode::Char('o')), None);
+        app.handle_key(key(KeyCode::Char('f')), None);
+        assert!(app.take_expressions_toggle_request(), "toggle requested");
+        assert!(
+            !app.take_expressions_toggle_request(),
+            "request is consumed"
+        );
+
+        // Korean 2-beolsik ㄹ hits the same physical key branch.
+        app.handle_key(key(KeyCode::Char('ㄹ')), None);
+        assert!(app.take_expressions_toggle_request());
+    }
+
     /// Count Image blocks the story pane would render for the current state.
     fn image_block_count(app: &mut App) -> usize {
         app.fill_block_cache();
@@ -2510,6 +2903,56 @@ mod tests {
         );
         // Empty history → empty timeline; the opening comes from the seed.
         assert!(location_timeline(&[], &initial).is_empty());
+    }
+
+    #[test]
+    fn classify_emotion_maps_narration_keywords_to_emotions() {
+        let cases: &[(&str, Emotion)] = &[
+            ("유나는 환한 미소를 지으며 커피를 내밀었다.", Emotion::Happy),
+            ("그녀의 눈에 눈물이 맺혔다.", Emotion::Sad),
+            ("그는 화를 내며 책상을 쳤다.", Emotion::Angry),
+            ("불안한 마음을 감추려 앞만 보았다.", Emotion::Anxious),
+            ("깜짝 놀라 한 걸음 물러섰다.", Emotion::Surprised),
+            ("다정한 목소리로 이름을 불러주었다.", Emotion::Affectionate),
+            ("차가운 시선이 스쳐 지나갔다.", Emotion::Cold),
+            (
+                "볼이 붉어지고 부끄러워 고개를 돌렸다.",
+                Emotion::Embarrassed,
+            ),
+            ("죄책감에 미안하다는 말이 목에 걸렸다.", Emotion::Guilty),
+            // English cues match against the lowercased narration.
+            ("She smiles at the joke.", Emotion::Happy),
+            ("He hugs her tightly.", Emotion::Affectionate),
+            ("그녀는 조용히 창밖을 바라보았다.", Emotion::Neutral),
+        ];
+        for (text, want) in cases {
+            assert_eq!(classify_emotion(text), *want, "narration: {text}");
+        }
+    }
+
+    #[test]
+    fn classify_emotion_counts_hits_and_breaks_ties_by_table_order() {
+        // Sad scores 2 against Happy's 1 — majority wins.
+        assert_eq!(
+            classify_emotion("슬픈 눈물을 닦으며 억지 웃음을 지었다."),
+            Emotion::Sad
+        );
+        // Equal scores resolve to the earlier table entry (Happy precedes Sad).
+        assert_eq!(classify_emotion("웃음과 눈물"), Emotion::Happy);
+    }
+
+    #[test]
+    fn emotion_timeline_classifies_each_turn_narration() {
+        let mut first = history_entry(1, None);
+        first.narration = "그녀의 눈에 눈물이 맺혔다.".to_string();
+        let mut second = history_entry(2, None);
+        second.narration = "유나는 환한 미소를 지었다.".to_string();
+        let history = vec![first, second];
+        assert_eq!(
+            emotion_timeline(&history),
+            vec![Emotion::Sad, Emotion::Happy]
+        );
+        assert!(emotion_timeline(&[]).is_empty());
     }
 
     #[test]
@@ -2822,6 +3265,8 @@ mod tests {
             },
             true,
             Some("halfblocks".to_string()),
+            false,
+            false,
         );
         app.show_home();
         app.handle_key(key(KeyCode::Down), None);
@@ -2898,6 +3343,8 @@ mod tests {
             },
             true,
             Some("halfblocks".to_string()),
+            false,
+            false,
         );
         app.show_home();
         app.handle_key(key(KeyCode::Down), None);
@@ -2911,6 +3358,54 @@ mod tests {
         app.handle_key(key(KeyCode::Down), None);
         app.handle_key(key(KeyCode::Enter), None);
         assert_eq!(app.take_selected_model().as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn settings_g_key_requests_the_generation_toggle_once() {
+        let mut app = App::new(sample_view(0));
+        app.set_settings(
+            ProviderConfigSafe {
+                base_url: "http://127.0.0.1:8000".to_string(),
+                model: "a".to_string(),
+                director_model: None,
+                choice_model: None,
+                writer_model: None,
+                structured_output: "auto".to_string(),
+                request_timeout_ms: 1_000,
+                connect_timeout_ms: 1_000,
+                max_retries: 0,
+                is_loopback: true,
+            },
+            ProviderHealth::Ready,
+            0.7,
+            0.9,
+            40,
+            1_200,
+            TtsDisplay {
+                enabled: false,
+                backend: "say".to_string(),
+                voice: None,
+            },
+            true,
+            Some("halfblocks".to_string()),
+            false,
+            false,
+        );
+        assert!(!app.use_director_writer(), "mirrors the seeded value");
+
+        // Open Settings (`o`), then `g` (2-beolsik ㅎ) requests the toggle;
+        // the Korean variant hits the same branch.
+        app.handle_key(key(KeyCode::Char('o')), None);
+        app.handle_key(key(KeyCode::Char('g')), None);
+        assert!(app.take_generation_toggle_request());
+        assert!(!app.take_generation_toggle_request(), "request is consumed");
+
+        app.handle_key(key(KeyCode::Char('ㅎ')), None);
+        assert!(app.take_generation_toggle_request());
+
+        // The host flips the session value, then patches the display.
+        app.update_settings_generation(true);
+        assert!(app.use_director_writer());
     }
 
     #[test]

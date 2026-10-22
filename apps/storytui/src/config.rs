@@ -31,9 +31,10 @@ pub struct FileConfig {
     pub save_dir: PathBuf,
     #[serde(default)]
     pub player: PlayerProfile,
-    /// Maintainer-only two-stage Director → Writer rollout switch. It remains
-    /// off until the local-model quality gate has been satisfied; it is not a
-    /// player-facing story control.
+    /// Base default for the two-stage Director → Writer path (ADR-005). It
+    /// stays `false` until the local-model quality gate passes; players opt
+    /// in per machine through the Settings `g` toggle, which persists to
+    /// `user-settings.toml` and overrides this base value.
     #[serde(default)]
     pub use_director_writer: bool,
 }
@@ -78,6 +79,15 @@ pub struct UserSettings {
     /// Scene image preference from the Settings `i` toggle. `None` means on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub images_enabled: Option<bool>,
+    /// Expression sprite preference from the Settings `f` toggle. `None`
+    /// means on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expressions_enabled: Option<bool>,
+    /// Generation-path preference from the Settings `g` toggle (`true` = the
+    /// two-stage Director → Writer streaming path). `None` inherits the base
+    /// config's `use_director_writer` (ADR-005 default: `false`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub use_director_writer: Option<bool>,
 }
 
 impl UserSettings {
@@ -847,6 +857,46 @@ mod tests {
     }
 
     #[test]
+    fn user_settings_generation_mode_round_trips_and_absent_inherits() {
+        let dir = test_dir("generation-toggle-persist");
+        // Absent field: a pre-toggle file (or none at all) loads as `None`,
+        // which means "inherit the base config default".
+        assert!(
+            load_user_settings(&dir)
+                .expect("missing file")
+                .use_director_writer
+                .is_none()
+        );
+        let settings = UserSettings {
+            use_director_writer: Some(true),
+            ..UserSettings::default()
+        };
+        save_user_settings(&dir, &settings).expect("save");
+        assert_eq!(load_user_settings(&dir).expect("load"), settings);
+        fs::remove_dir_all(dir).expect("clean test directory");
+    }
+
+    #[test]
+    fn user_settings_expression_toggle_round_trips_and_absent_means_on() {
+        let dir = test_dir("expression-toggle-persist");
+        // Absent field: a pre-toggle file (or none at all) loads as `None`,
+        // which means "expression sprites on".
+        assert!(
+            load_user_settings(&dir)
+                .expect("missing file")
+                .expressions_enabled
+                .is_none()
+        );
+        let settings = UserSettings {
+            expressions_enabled: Some(false),
+            ..UserSettings::default()
+        };
+        save_user_settings(&dir, &settings).expect("save");
+        assert_eq!(load_user_settings(&dir).expect("load"), settings);
+        fs::remove_dir_all(dir).expect("clean test directory");
+    }
+
+    #[test]
     fn player_profile_is_optional_and_loads_from_toml() {
         let config: FileConfig =
             toml::from_str("[player]\nname = \"민준\"\npersona = \"말수가 적고 관찰력이 좋다\"\n")
@@ -886,6 +936,8 @@ mod tests {
                 temperature: Some(0.7),
                 tts_enabled: None,
                 images_enabled: None,
+                expressions_enabled: None,
+                use_director_writer: None,
             },
         )
         .expect("save settings");
@@ -920,6 +972,8 @@ mod tests {
             temperature: Some(0.2),
             tts_enabled: Some(true),
             images_enabled: Some(false),
+            expressions_enabled: Some(false),
+            use_director_writer: Some(true),
         };
         let path = user_settings_path(&dir);
         fs::write(&path, "base_url = \"must-not-survive\"\n").expect("old settings");

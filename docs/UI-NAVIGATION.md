@@ -87,7 +87,8 @@ stateDiagram-v2
 | `p/ㅔ` | 모델 선택 (메인/기획/선택지/본문) | user-settings.toml |
 | `e/ㄷ` | 프로바이더 전환 (재시작 불필요) | user-settings.toml |
 | `i/ㅑ` | **장면 이미지 켜기/끄기** | user-settings.toml |
-| 상태 블록 | TTS(v) 상태·백엔드·보이스, 이미지 프로토콜(kitty 등) 표시 | — |
+| `g/ㅎ` | **생성 방식 전환** — 단일 패스 ↔ 2단계(기획→본문 스트리밍). 다음 턴부터 적용 | user-settings.toml |
+| 상태 블록 | TTS(v) 상태·백엔드·보이스, 이미지 프로토콜(kitty 등), 생성 방식 표시 | — |
 | `Esc` | 닫기 · `q` 종료 | — |
 
 ### 오프닝 선택 (greetings)
@@ -125,9 +126,14 @@ stateDiagram-v2
 
 - 경로: `pack/images/locations/<장소id>.png` → 없으면 `pack/images/characters/<캐릭터id>.png`
   (확장자 png→jpg→jpeg→webp 순, 손상 파일은 건너뜀)
+- 표정 스프라이트: `pack/images/expressions/<캐릭터id>/<감정>.png`
+  (`neutral`·`happy`·`sad`·`angry`·`anxious`·`surprised`·`affectionate`·`cold`·
+  `embarrassed`·`guilty`) → 없으면 캐릭터 초상으로 폴백. 감정은 각 턴 내레이션을
+  키워드 분류한 결과 — **모델 추가 호출 없이** 결정되며, 감정이 바뀐 턴 앞에만
+  인라인 삽입된다 (같은 그림 연속·초상 중복은 생략).
 - 프로토콜: 시작 시 터미널 질의 — kitty(Ghostty/kitty/WezTerm)·sixel·halfblocks 자동 감지,
   미지원이면 비활성. 설정 화면의 상태 블록에서 감지 결과를 확인할 수 있다.
-- 끄는 방법: 설정에서 `i` — 이미지 파일을 지울 필요 없다.
+- 끄는 방법: 장면 이미지는 설정에서 `i`, 표정 스프라이트는 `f` — 이미지 파일을 지울 필요 없다.
 
 ## 게임 중 변경 가능 항목 요약
 
@@ -137,6 +143,8 @@ stateDiagram-v2
 | 프로바이더 (엔드포인트+키) | 설정 `e` | ✓ |
 | TTS 낭독 | `v` | ✓ |
 | 장면 이미지 | 설정 `i` | ✓ |
+| 표정 스프라이트 | 설정 `f` | ✓ |
+| 생성 방식 (단일 패스 ↔ 2단계 스트리밍) | 설정 `g` | ✓ (다음 턴부터) |
 | 저장/불러오기 | `s` / `l` | ✓ |
 | 스토리 팩 전환 | 시작 메뉴 "팩 선택" | ✓ (엔진 리셋) |
 | 엔드포인트 자유 입력 | 불가 (TOML 프로필 정의 → TUI는 전환) | — |
