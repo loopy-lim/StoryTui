@@ -21,6 +21,7 @@ use story_model::{ProviderConfigSafe, ProviderHealth};
 use crate::screens::keymap::keymap_lines_two_columns;
 use crate::screens::model_display_label;
 use crate::screens::popup::render_min_size_warning;
+use crate::theme::{BORDER_TYPE, Palette, Styles};
 
 /// Minimum supported terminal size for the Settings screen.
 pub const MIN_WIDTH: u16 = 80;
@@ -40,11 +41,11 @@ pub struct HealthLabel(pub &'static str, pub Color);
 /// Map a [`ProviderHealth`] to its Korean label + color (FR-037).
 pub fn health_label(health: ProviderHealth) -> HealthLabel {
     match health {
-        ProviderHealth::Ready => HealthLabel(HEALTH_LABEL_READY, Color::Green),
-        ProviderHealth::Loading => HealthLabel(HEALTH_LABEL_LOADING, Color::Yellow),
-        ProviderHealth::Degraded => HealthLabel(HEALTH_LABEL_DEGRADED, Color::Yellow),
-        ProviderHealth::Unavailable => HealthLabel(HEALTH_LABEL_UNAVAILABLE, Color::Red),
-        ProviderHealth::Misconfigured => HealthLabel(HEALTH_LABEL_MISCONFIGURED, Color::Magenta),
+        ProviderHealth::Ready => HealthLabel(HEALTH_LABEL_READY, Palette::SAFE),
+        ProviderHealth::Loading => HealthLabel(HEALTH_LABEL_LOADING, Palette::CAUTION),
+        ProviderHealth::Degraded => HealthLabel(HEALTH_LABEL_DEGRADED, Palette::CAUTION),
+        ProviderHealth::Unavailable => HealthLabel(HEALTH_LABEL_UNAVAILABLE, Palette::DANGER),
+        ProviderHealth::Misconfigured => HealthLabel(HEALTH_LABEL_MISCONFIGURED, Palette::DANGER),
     }
 }
 
@@ -75,6 +76,9 @@ pub struct SettingsView<'a> {
     /// Detected terminal graphics protocol (`kitty` 등). `None` = images
     /// unsupported by the terminal.
     pub image_backend: Option<String>,
+    /// Whether the displayed protocol was player-forced (Settings `b` cycle)
+    /// rather than auto-detected.
+    pub image_backend_manual: bool,
     /// `true` = the two-stage Director → Writer path (streaming narration);
     /// `false` = the single-pass structured turn.
     pub use_director_writer: bool,
@@ -114,15 +118,10 @@ pub fn render_settings(frame: &mut Frame, area: Rect, view: &SettingsView<'_>) {
 }
 
 fn render_title(frame: &mut Frame, area: Rect) {
-    let line = Line::from(vec![Span::styled(
-        "설정",
-        Style::default()
-            .add_modifier(Modifier::BOLD)
-            .fg(Color::Cyan),
-    )]);
+    let line = Line::from(vec![Span::styled(" ✦ 설정 ✦ ", Styles::title())]);
     let block = Block::default()
         .borders(Borders::BOTTOM)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Styles::border_muted());
     let para = Paragraph::new(line)
         .block(block)
         .alignment(Alignment::Center);
@@ -132,60 +131,69 @@ fn render_title(frame: &mut Frame, area: Rect) {
 fn render_provider_block(frame: &mut Frame, area: Rect, view: &SettingsView<'_>) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(Span::styled(
-            "공급자",
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
+        .border_type(BORDER_TYPE)
+        .border_style(Styles::border_muted())
+        .title(Span::styled(" ✦ 공급자 ✦ ", Styles::title()));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let mut lines: Vec<Line> = Vec::with_capacity(5);
     lines.push(Line::from(vec![
-        Span::raw("base_url   : "),
-        Span::raw(view.provider.base_url.clone()),
+        Span::styled("base_url   : ", Styles::subtle()),
+        Span::styled(view.provider.base_url.clone(), Styles::item_normal()),
     ]));
     lines.push(Line::from(vec![
-        Span::raw("model      : "),
-        Span::raw(model_display_label(&view.provider.model)),
+        Span::styled("model      : ", Styles::subtle()),
+        Span::styled(
+            model_display_label(&view.provider.model),
+            Styles::item_normal(),
+        ),
     ]));
     if let Some(dm) = &view.provider.director_model {
         lines.push(Line::from(vec![
-            Span::styled("director   : ", Style::default().fg(Color::Yellow)),
-            Span::raw(model_display_label(dm)),
+            Span::styled("director   : ", Style::default().fg(Palette::ACCENT)),
+            Span::styled(model_display_label(dm), Styles::item_normal()),
         ]));
     }
     if let Some(cm) = &view.provider.choice_model {
         lines.push(Line::from(vec![
-            Span::styled("choice     : ", Style::default().fg(Color::Cyan)),
-            Span::raw(model_display_label(cm)),
+            Span::styled("choice     : ", Style::default().fg(Palette::PRIMARY)),
+            Span::styled(model_display_label(cm), Styles::item_normal()),
         ]));
     }
     if let Some(wm) = &view.provider.writer_model {
         lines.push(Line::from(vec![
-            Span::styled("writer     : ", Style::default().fg(Color::Green)),
-            Span::raw(model_display_label(wm)),
+            Span::styled("writer     : ", Style::default().fg(Palette::SAFE)),
+            Span::styled(model_display_label(wm), Styles::item_normal()),
         ]));
     }
     lines.push(Line::from(vec![
-        Span::raw("structured : "),
-        Span::raw(view.provider.structured_output.clone()),
-        Span::raw("  · retries "),
-        Span::raw(view.provider.max_retries.to_string()),
-        Span::raw("  · timeout "),
-        Span::raw(view.provider.request_timeout_ms.to_string()),
-        Span::raw("ms"),
+        Span::styled("structured : ", Styles::subtle()),
+        Span::styled(
+            view.provider.structured_output.clone(),
+            Styles::item_normal(),
+        ),
+        Span::styled("  · retries ", Styles::muted()),
+        Span::styled(view.provider.max_retries.to_string(), Styles::item_normal()),
+        Span::styled("  · timeout ", Styles::muted()),
+        Span::styled(
+            view.provider.request_timeout_ms.to_string(),
+            Styles::item_normal(),
+        ),
+        Span::styled("ms", Styles::muted()),
     ]));
     // Non-loopback warning.
     if !view.provider.is_loopback {
         lines.push(Line::from(vec![Span::styled(
             "⚠ 주의: base_url이 루프백이 아닙니다 — 외부로 전송될 수 있습니다.",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Palette::DANGER)
+                .add_modifier(Modifier::BOLD),
         )]));
     } else {
         lines.push(Line::from(vec![Span::styled(
             "✓ 루프백(127.0.0.1) — 이 머신 안에서만 통신합니다.",
-            Style::default().fg(Color::DarkGray),
+            Styles::muted(),
         )]));
     }
 
@@ -194,66 +202,80 @@ fn render_provider_block(frame: &mut Frame, area: Rect, view: &SettingsView<'_>)
 }
 
 fn render_health_and_sampling(frame: &mut Frame, area: Rect, view: &SettingsView<'_>) {
+    // Balanced columns: the longest health row ("꺼짐 · halfblocks (수동)")
+    // must fit unwrapped at the 80-col minimum, while sampling values are
+    // short.
     let chunks =
-        Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).split(area);
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area);
 
     // Health block.
     let h_block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(Span::styled(
-            "상태",
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
+        .border_type(BORDER_TYPE)
+        .border_style(Styles::border_muted())
+        .title(Span::styled(" ✦ 상태 ✦ ", Styles::title()));
     let h_inner = h_block.inner(chunks[0]);
     frame.render_widget(h_block, chunks[0]);
     let HealthLabel(label, color) = health_label(view.health);
     let health_lines = vec![
         Line::from(vec![
-            Span::raw("provider   : "),
+            Span::styled("provider   : ", Styles::subtle()),
             Span::styled(
                 label,
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(vec![
-            Span::raw("tts (v)    : "),
+            Span::styled("tts (v)    : ", Styles::subtle()),
             Span::styled(
                 if view.tts_enabled { "켜짐" } else { "꺼짐" },
                 Style::default()
                     .fg(if view.tts_enabled {
-                        Color::Green
+                        Palette::SAFE
                     } else {
-                        Color::DarkGray
+                        Palette::MUTED
                     })
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(format!(" · {}", view.tts_backend)),
+            Span::styled(format!(" · {}", view.tts_backend), Styles::muted()),
         ]),
         Line::from(vec![
-            Span::raw("tts voice  : "),
-            Span::raw(view.tts_voice.as_deref().unwrap_or("자동(기본 보이스)")),
+            Span::styled("tts voice  : ", Styles::subtle()),
+            Span::styled(
+                view.tts_voice.as_deref().unwrap_or("자동(기본 보이스)"),
+                Styles::item_normal(),
+            ),
         ]),
         Line::from(vec![
-            Span::raw("image (i)  : "),
+            Span::styled("image (i)  : ", Styles::subtle()),
             Span::styled(
                 match (view.images_enabled, view.image_backend.as_deref()) {
-                    (true, Some(backend)) => format!("켜짐 · {backend}"),
+                    (true, Some(backend)) => {
+                        format!(
+                            "켜짐 · {backend} ({})",
+                            image_mode_label(view.image_backend_manual)
+                        )
+                    }
                     (true, None) => "터미널 미지원".to_string(),
-                    (false, Some(_)) => "꺼짐".to_string(),
+                    (false, Some(backend)) => {
+                        format!(
+                            "꺼짐 · {backend} ({})",
+                            image_mode_label(view.image_backend_manual)
+                        )
+                    }
                     (false, None) => "꺼짐 (터미널 미지원)".to_string(),
                 },
                 Style::default()
                     .fg(match (view.images_enabled, view.image_backend.as_deref()) {
-                        (true, Some(_)) => Color::Green,
-                        (true, None) => Color::Yellow,
-                        (false, _) => Color::DarkGray,
+                        (true, Some(_)) => Palette::SAFE,
+                        (true, None) => Palette::CAUTION,
+                        (false, _) => Palette::MUTED,
                     })
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(vec![
-            Span::raw("gen (g)    : "),
+            Span::styled("gen (g)    : ", Styles::subtle()),
             Span::styled(
                 if view.use_director_writer {
                     "2단계 (Director → Writer 스트리밍)"
@@ -262,15 +284,15 @@ fn render_health_and_sampling(frame: &mut Frame, area: Rect, view: &SettingsView
                 },
                 Style::default()
                     .fg(if view.use_director_writer {
-                        Color::Green
+                        Palette::SAFE
                     } else {
-                        Color::DarkGray
+                        Palette::MUTED
                     })
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(vec![
-            Span::raw("표정 (f)   : "),
+            Span::styled("표정 (f)   : ", Styles::subtle()),
             Span::styled(
                 if view.expressions_enabled {
                     "켜짐"
@@ -279,9 +301,9 @@ fn render_health_and_sampling(frame: &mut Frame, area: Rect, view: &SettingsView
                 },
                 Style::default()
                     .fg(if view.expressions_enabled {
-                        Color::Green
+                        Palette::SAFE
                     } else {
-                        Color::DarkGray
+                        Palette::MUTED
                     })
                     .add_modifier(Modifier::BOLD),
             ),
@@ -295,36 +317,31 @@ fn render_health_and_sampling(frame: &mut Frame, area: Rect, view: &SettingsView
     // Sampling block.
     let s_block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(Span::styled(
-            "샘플링",
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
+        .border_type(BORDER_TYPE)
+        .border_style(Styles::border_muted())
+        .title(Span::styled(" ✦ 샘플링 ✦ ", Styles::title()));
     let s_inner = s_block.inner(chunks[1]);
     frame.render_widget(s_block, chunks[1]);
     let sampling_lines = vec![
         Line::from(vec![
-            Span::raw("temperature : "),
-            Span::raw(format!("{:.2}", view.temperature)),
+            Span::styled("temperature : ", Styles::subtle()),
+            Span::styled(format!("{:.2}", view.temperature), Styles::item_normal()),
         ]),
         Line::from(vec![
-            Span::raw("top_p       : "),
-            Span::raw(format!("{:.2}", view.top_p)),
+            Span::styled("top_p       : ", Styles::subtle()),
+            Span::styled(format!("{:.2}", view.top_p), Styles::item_normal()),
         ]),
         Line::from(vec![
-            Span::raw("top_k       : "),
-            Span::raw(view.top_k.to_string()),
+            Span::styled("top_k       : ", Styles::subtle()),
+            Span::styled(view.top_k.to_string(), Styles::item_normal()),
         ]),
         Line::from(vec![
-            Span::raw("max_tokens  : "),
-            Span::raw(view.max_tokens.to_string()),
+            Span::styled("max_tokens  : ", Styles::subtle()),
+            Span::styled(view.max_tokens.to_string(), Styles::item_normal()),
         ]),
         Line::from(vec![
-            Span::raw("theme       : "),
-            Span::styled(
-                view.theme_name.to_string(),
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled("theme       : ", Styles::subtle()),
+            Span::styled(view.theme_name.to_string(), Styles::muted()),
         ]),
     ];
     frame.render_widget(
@@ -336,11 +353,9 @@ fn render_health_and_sampling(frame: &mut Frame, area: Rect, view: &SettingsView
 fn render_keymap_block(frame: &mut Frame, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(Span::styled(
-            "단축키",
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
+        .border_type(BORDER_TYPE)
+        .border_style(Styles::border_muted())
+        .title(Span::styled(" ✦ 단축키 ✦ ", Styles::title()));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     // Two balanced columns keep the full table visible on mid-size
@@ -354,16 +369,32 @@ fn render_keymap_block(frame: &mut Frame, area: Rect) {
 
 fn render_footer(frame: &mut Frame, area: Rect, returns_home: bool) {
     let esc_hint = if returns_home {
-        "Esc 시작 메뉴"
+        "시작 메뉴"
     } else {
-        "Esc 게임으로"
+        "게임으로"
     };
-    let para = Paragraph::new(Line::from(Span::styled(
-        format!("P 모델 · E 프로바이더 · g 생성방식 · f 표정 · {esc_hint} · q 종료"),
-        Style::default().fg(Color::DarkGray),
-    )))
+    let para = Paragraph::new(Line::from(vec![
+        Span::styled("[P]", Styles::keycap()),
+        Span::styled(" 모델  ", Styles::button_label()),
+        Span::styled("[E]", Styles::keycap()),
+        Span::styled(" 프로바이더  ", Styles::button_label()),
+        Span::styled("[G]", Styles::keycap()),
+        Span::styled(" 생성방식  ", Styles::button_label()),
+        Span::styled("[F]", Styles::keycap()),
+        Span::styled(" 표정  ", Styles::button_label()),
+        Span::styled("[Esc]", Styles::keycap()),
+        Span::styled(format!(" {esc_hint}  "), Styles::button_label()),
+        Span::styled("[Q]", Styles::keycap()),
+        Span::styled(" 종료", Styles::button_label()),
+    ]))
     .alignment(Alignment::Center);
     frame.render_widget(para, area);
+}
+
+/// `자동`/`수동` marker for the image backend label — kept visible even while
+/// images are off so the `b` protocol cycle always shows its effect.
+fn image_mode_label(manual: bool) -> &'static str {
+    if manual { "수동" } else { "자동" }
 }
 
 #[cfg(test)]
@@ -390,8 +421,8 @@ mod tests {
         let ready = health_label(ProviderHealth::Ready);
         let unav = health_label(ProviderHealth::Unavailable);
         assert_eq!(ready.0, HEALTH_LABEL_READY);
-        assert_eq!(ready.1, Color::Green);
-        assert_eq!(unav.1, Color::Red);
+        assert_eq!(ready.1, Palette::SAFE);
+        assert_eq!(unav.1, Palette::DANGER);
     }
 
     #[test]
@@ -409,6 +440,7 @@ mod tests {
             tts_voice: None,
             images_enabled: true,
             image_backend: Some("kitty".to_string()),
+            image_backend_manual: false,
             use_director_writer: false,
             expressions_enabled: true,
             theme_name: "default",

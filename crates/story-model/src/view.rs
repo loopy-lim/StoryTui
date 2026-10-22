@@ -43,6 +43,11 @@ pub struct AppViewModel {
     pub loading: Option<LoadingState>,
     /// Non-empty when a recoverable error should be shown (error overlay).
     pub error: Option<DomainErrorView>,
+    /// Checkpoint the player can rewind to with one keypress (the newest
+    /// committed state older than the current turn). `None` when there is
+    /// nothing to undo (fresh game, save restore, or mid-generation).
+    #[serde(default)]
+    pub undo_checkpoint_id: Option<Uuid>,
 }
 
 /// Top-level screen identifier. Only [`Screen::Story`] is rendered in the W5
@@ -154,10 +159,31 @@ mod tests {
                 message_ko: "알 수 없는 플래그입니다.".to_string(),
                 recoverable: true,
             }),
+            undo_checkpoint_id: Some(Uuid::nil()),
         };
         let json = serde_json::to_string(&view).expect("serialize");
         let back: AppViewModel = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, view);
+    }
+
+    #[test]
+    fn view_undo_roundtrip() {
+        // Views serialized before undo shipped carry no `undo_checkpoint_id`;
+        // the field must deserialize to None instead of failing.
+        let json = r#"{
+            "screen": "story",
+            "story_title": "비",
+            "chapter": "chapter-1",
+            "location_display": "카페",
+            "time_slot": "evening",
+            "narration": "내레이션",
+            "choices": [],
+            "status": {"route": null, "affection": null, "trust": null, "tension": null, "turn": 2},
+            "loading": null,
+            "error": null
+        }"#;
+        let back: AppViewModel = serde_json::from_str(json).expect("deserialize legacy view");
+        assert_eq!(back.undo_checkpoint_id, None);
     }
 
     #[test]
@@ -187,6 +213,7 @@ mod tests {
             },
             loading: None,
             error: None,
+            undo_checkpoint_id: None,
         };
         let json = serde_json::to_string(&view).unwrap();
         let back: AppViewModel = serde_json::from_str(&json).unwrap();

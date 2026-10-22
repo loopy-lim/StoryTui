@@ -33,6 +33,7 @@ fn sample_view(turn: u32) -> AppViewModel {
         },
         loading: None,
         error: None,
+        undo_checkpoint_id: None,
     }
 }
 

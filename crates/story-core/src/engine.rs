@@ -409,6 +409,9 @@ fn reduce_start_new_game(state: &EngineState, pack: &StoryPack) -> Result<Transi
     next.pending = Some(pending.clone());
     next.retry_pending = None;
     next.lineage = vec![generation_id];
+    // A fresh game must not offer undos into the previous playthrough, even
+    // in-memory: clear the rewind ring.
+    next.checkpoints = Vec::new();
 
     let loading_view = build_view(&next, pack, Some(&pending), None);
     let effects = if state.use_director_writer {
@@ -654,11 +657,23 @@ fn reduce_restore_checkpoint(
     let mut next = clone_state(state);
     next.game = cp.game;
     next.pending = None;
+    // A failed retry anchored to the pre-rewind state must not replay an old
+    // turn on top of the rewound game.
+    next.retry_pending = None;
     next.lineage = Vec::new();
     let view = build_view(&next, pack, None, None);
+    let mut effects = vec![EngineEffect::PublishView(Box::new(view))];
+    // Keep the autosave slot on the rewound state so quitting and resuming
+    // does not resurrect the undone turn. Same gate as the accept path.
+    if next.autosave_on_accept {
+        effects.push(EngineEffect::PersistStableState {
+            slot_id: AUTOSAVE_SLOT.to_string(),
+            description: Some(format!("턴 {}", next.game.turn)),
+        });
+    }
     Transition {
         state: next,
-        effects: vec![EngineEffect::PublishView(Box::new(view))],
+        effects,
         audit: Vec::new(),
     }
 }
@@ -1975,6 +1990,16 @@ pub fn build_view(
         message_ko: "생성 중...".to_string(),
     });
 
+    // Newest committed checkpoint strictly older than the current turn: the
+    // one-key undo target. Same-turn entries (choice refreshes) and the
+    // current turn never match, so undo always steps back one full turn.
+    let undo_checkpoint_id = state
+        .checkpoints
+        .iter()
+        .rev()
+        .find(|checkpoint| checkpoint.game.turn < game.turn)
+        .map(|checkpoint| checkpoint.id);
+
     AppViewModel {
         screen: Screen::Story,
         story_title: pack.metadata.title.clone(),
@@ -1992,6 +2017,7 @@ pub fn build_view(
         },
         loading: loading_state,
         error,
+        undo_checkpoint_id,
     }
 }
 

@@ -63,6 +63,12 @@ impl Styles {
         Style::default().fg(Palette::MUTED)
     }
 
+    /// Danger/warning border style.
+    #[inline]
+    pub fn border_danger() -> Style {
+        Style::default().fg(Palette::DANGER)
+    }
+
     /// Active/focused border style.
     #[inline]
     pub fn border_selected() -> Style {
@@ -85,6 +91,18 @@ impl Styles {
         Style::default().fg(Palette::PROSE)
     }
 
+    /// Muted/disabled text style.
+    #[inline]
+    pub fn muted() -> Style {
+        Style::default().fg(Palette::MUTED)
+    }
+
+    /// Subtle secondary text style.
+    #[inline]
+    pub fn subtle() -> Style {
+        Style::default().fg(Palette::SUBTLE)
+    }
+
     /// Button keycap badge (e.g. `[ Enter ]`, `[ S ]`).
     #[inline]
     pub fn keycap() -> Style {
@@ -99,16 +117,21 @@ impl Styles {
         Style::default().fg(Palette::SUBTLE)
     }
 
-    /// Risk level indicator style.
+    /// Risk level color.
     #[inline]
-    pub fn risk_style(risk: RiskLevel) -> Style {
-        let color = match risk {
+    pub fn risk_color(risk: RiskLevel) -> Color {
+        match risk {
             RiskLevel::Safe => Palette::SAFE,
             RiskLevel::Low => Palette::PRIMARY,
             RiskLevel::Medium => Palette::CAUTION,
             RiskLevel::High | RiskLevel::Severe => Palette::DANGER,
-        };
-        Style::default().fg(color)
+        }
+    }
+
+    /// Risk level indicator style.
+    #[inline]
+    pub fn risk_style(risk: RiskLevel) -> Style {
+        Style::default().fg(Self::risk_color(risk))
     }
 }
 

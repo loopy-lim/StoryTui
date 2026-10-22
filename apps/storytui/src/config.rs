@@ -131,6 +131,12 @@ pub struct UserSettings {
     /// means on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expressions_enabled: Option<bool>,
+    /// Image render protocol forced from the Settings `b` cycle (`kitty` /
+    /// `sixel` / `iterm2` / `halfblocks`). `None` — or any unrecognized
+    /// value — means auto: follow the terminal capability detected at
+    /// startup.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_protocol: Option<String>,
     /// Generation-path preference from the Settings `g` toggle (`true` = the
     /// two-stage Director → Writer streaming path). `None` inherits the base
     /// config's `use_director_writer` (ADR-005 default: `false`).
@@ -956,6 +962,24 @@ mod tests {
         };
         save_user_settings(&dir, &settings).expect("save");
         assert_eq!(load_user_settings(&dir).expect("load"), settings);
+        fs::remove_dir_all(dir).expect("clean test directory");
+    }
+
+    #[test]
+    fn user_settings_image_protocol_round_trips_and_tolerates_unknown() {
+        let dir = test_dir("image-protocol-persist");
+        let settings = UserSettings {
+            image_protocol: Some("halfblocks".to_string()),
+            ..UserSettings::default()
+        };
+        save_user_settings(&dir, &settings).expect("save");
+        assert_eq!(load_user_settings(&dir).expect("load"), settings);
+        // A stale/unknown value must not break the whole settings file: the
+        // value round-trips verbatim and the host treats it as auto.
+        let path = user_settings_path(&dir);
+        fs::write(&path, "image_protocol = \"kity\"\n").expect("write unknown value");
+        let loaded = load_user_settings(&dir).expect("unknown value still parses");
+        assert_eq!(loaded.image_protocol.as_deref(), Some("kity"));
         fs::remove_dir_all(dir).expect("clean test directory");
     }
 

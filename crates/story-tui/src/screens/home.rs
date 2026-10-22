@@ -36,6 +36,12 @@ pub fn render_home(
         Constraint::Fill(1),
     ])
     .split(area)[1];
+    let content = Layout::horizontal([
+        Constraint::Fill(1),
+        Constraint::Length(64.min(area.width)),
+        Constraint::Fill(1),
+    ])
+    .split(content)[1];
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(crate::theme::BORDER_TYPE)
@@ -46,18 +52,18 @@ pub fn render_home(
         ));
     let mut lines = vec![Line::from(Span::styled(
         "✦  S T O R Y   T U I  ✦",
-        crate::theme::Styles::title(),
+        Style::default()
+            .fg(crate::theme::Palette::ACCENT)
+            .add_modifier(Modifier::BOLD),
     ))];
     for (index, (label, hint, enabled)) in rows.iter().enumerate() {
         let active = index == selected && *enabled;
         let style = if active {
-            Style::default()
-                .fg(crate::theme::Palette::SELECTED)
-                .add_modifier(Modifier::BOLD)
+            crate::theme::Styles::item_selected()
         } else if *enabled {
-            Style::default().fg(crate::theme::Palette::PROSE)
+            crate::theme::Styles::item_normal()
         } else {
-            Style::default().fg(crate::theme::Palette::MUTED)
+            crate::theme::Styles::muted()
         };
         let item_text = if active {
             format!("▶ [ {label} ]")
@@ -67,7 +73,11 @@ pub fn render_home(
         lines.push(Line::from(Span::styled(item_text, style)));
         lines.push(Line::from(Span::styled(
             format!("    {hint}"),
-            Style::default().fg(crate::theme::Palette::MUTED),
+            if active {
+                crate::theme::Styles::subtle()
+            } else {
+                crate::theme::Styles::muted()
+            },
         )));
     }
     lines.push(Line::from(""));

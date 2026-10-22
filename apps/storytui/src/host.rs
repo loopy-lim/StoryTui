@@ -189,7 +189,9 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
         TerminalGuard::enter().map_err(|e| format!("터미널을 초기화하지 못했습니다: {e}"))?;
     // Terminal graphics query must happen before the input EventStream starts
     // reading stdin. Failure just means text-only rendering.
-    let image_picker = match ratatui_image::picker::Picker::from_query_stdio() {
+    // Kept for the whole session: the Settings `b` cycle rebuilds the
+    // effective picker from this detected base.
+    let base_image_picker = match ratatui_image::picker::Picker::from_query_stdio() {
         Ok(picker) => Some(picker),
         Err(error) => {
             tracing::info!(
@@ -215,7 +217,13 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
     }
     let mut scene_images = SceneImageStores::default();
     let mut app = App::new(build_view(&engine, &pack, None, None));
-    app.set_image_picker(image_picker);
+    // A persisted protocol override (Settings `b` cycle) rides on top of the
+    // detected capability; an unrecognized value behaves as auto.
+    let (picker, manual) = build_image_picker(
+        base_image_picker.as_ref(),
+        user_settings.image_protocol.as_deref(),
+    );
+    app.set_image_picker(picker, manual);
     refresh_scene_images(&mut app, &pack, &engine, &mut scene_images);
     app.set_lists(
         &engine.game.history,
@@ -315,7 +323,8 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                         handle_ui_requests(
                             &mut app, &mut engine, &mut pack, &mut provider_config,
                             &mut provider, &mut user_settings, &mut config,
-                            &save_store, &tts, &mut scene_images, &tx, &mut cancellation, &mut resume_engine,
+                            &save_store, &tts, &mut scene_images, base_image_picker.as_ref(),
+                            &tx, &mut cancellation, &mut resume_engine,
                         ).await?;
                         needs_redraw = true;
                     }
@@ -340,7 +349,8 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                         handle_ui_requests(
                             &mut app, &mut engine, &mut pack, &mut provider_config,
                             &mut provider, &mut user_settings, &mut config,
-                            &save_store, &tts, &mut scene_images, &tx, &mut cancellation, &mut resume_engine,
+                            &save_store, &tts, &mut scene_images, base_image_picker.as_ref(),
+                            &tx, &mut cancellation, &mut resume_engine,
                         ).await?;
                         // Movement carries no render state (hover is not
                         // rendered): a full frame per move event starved the
@@ -655,6 +665,55 @@ fn reset_scene_images(app: &mut App, stores: &mut SceneImageStores) {
     app.reset_expression_images();
 }
 
+/// Recognized `image_protocol` values in cycle order after auto.
+const IMAGE_PROTOCOL_CYCLE: [&str; 4] = ["kitty", "sixel", "iterm2", "halfblocks"];
+
+/// Next value for the Settings `b` cycle: auto (`None`) first, then each
+/// recognized protocol in [`IMAGE_PROTOCOL_CYCLE`] order, wrapping back to
+/// auto. An unrecognized stored value is treated as auto. Without a detected
+/// picker (`base_available = false`) the cell size is unknown, so only
+/// halfblocks — which needs no cell query — can be forced.
+fn next_image_protocol_setting(current: Option<&str>, base_available: bool) -> Option<String> {
+    let position = current.and_then(|value| {
+        IMAGE_PROTOCOL_CYCLE
+            .iter()
+            .position(|candidate| *candidate == value)
+    });
+    let start = position.map_or(0, |index| index + 1);
+    IMAGE_PROTOCOL_CYCLE[start..]
+        .iter()
+        .find(|candidate| base_available || **candidate == "halfblocks")
+        .map(|candidate| candidate.to_string()) // empty slice = back to auto
+}
+
+/// Build the effective picker for an `image_protocol` setting. Auto keeps the
+/// detected picker; halfblocks is always buildable; the other protocols ride
+/// on the detected picker's cell size, so they require a base. Unrecognized
+/// values behave as auto. Returns the picker plus whether it is player-forced.
+fn build_image_picker(
+    base: Option<&ratatui_image::picker::Picker>,
+    setting: Option<&str>,
+) -> (Option<ratatui_image::picker::Picker>, bool) {
+    let forced = match (setting, base.is_some()) {
+        (Some("kitty"), true) => Some(ratatui_image::picker::ProtocolType::Kitty),
+        (Some("sixel"), true) => Some(ratatui_image::picker::ProtocolType::Sixel),
+        (Some("iterm2"), true) => Some(ratatui_image::picker::ProtocolType::Iterm2),
+        (Some("halfblocks"), _) => Some(ratatui_image::picker::ProtocolType::Halfblocks),
+        _ => None,
+    };
+    match forced {
+        Some(protocol) => {
+            let mut picker = match base {
+                Some(base) => base.clone(),
+                None => ratatui_image::picker::Picker::halfblocks(),
+            };
+            picker.set_protocol_type(protocol);
+            (Some(picker), true)
+        }
+        None => (base.cloned(), false),
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // consumes all host-owned UI requests in one place
 async fn handle_ui_requests(
     app: &mut App,
@@ -667,6 +726,7 @@ async fn handle_ui_requests(
     save_store: &SaveStore,
     tts: &TtsService,
     scene_images: &mut SceneImageStores,
+    base_image_picker: Option<&ratatui_image::picker::Picker>,
     tx: &UnboundedSender<HostMessage>,
     cancellation: &mut Option<(story_model::uuid::Uuid, CancellationToken)>,
     resume_engine: &mut Option<EngineState>,
@@ -850,6 +910,22 @@ async fn handle_ui_requests(
         user_settings.images_enabled = Some(enabled);
         save_user_settings(&config.save_dir, user_settings)?;
         app.update_settings_images(enabled, app.image_backend_label());
+    }
+    if app.take_image_backend_cycle_request() {
+        let next = next_image_protocol_setting(
+            user_settings.image_protocol.as_deref(),
+            base_image_picker.is_some(),
+        );
+        user_settings.image_protocol = next.clone();
+        save_user_settings(&config.save_dir, user_settings)?;
+        let (picker, manual) = build_image_picker(base_image_picker, next.as_deref());
+        app.set_image_picker(picker, manual);
+        app.update_settings_images(app.images_enabled(), app.image_backend_label());
+        // Encoded images still carry the previous protocol — resolve every
+        // location/emotion again so the transcript reflects the new one
+        // immediately (same lockstep as a pack switch).
+        reset_scene_images(app, scene_images);
+        refresh_scene_images(app, pack, engine, scene_images);
     }
     if app.take_expressions_toggle_request() {
         let enabled = !app.expressions_enabled();
@@ -1286,8 +1362,74 @@ fn provider_failure_stage(error: &ProviderError) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{provider_error_view, provider_failure_stage};
+    use super::{
+        build_image_picker, next_image_protocol_setting, provider_error_view,
+        provider_failure_stage,
+    };
     use story_model::ProviderError;
+
+    #[test]
+    fn image_protocol_cycle_skips_unavailable_protocols() {
+        // With a detected picker: auto → kitty → sixel → iterm2 → halfblocks → auto.
+        assert_eq!(
+            next_image_protocol_setting(None, true).as_deref(),
+            Some("kitty")
+        );
+        assert_eq!(
+            next_image_protocol_setting(Some("kitty"), true).as_deref(),
+            Some("sixel")
+        );
+        assert_eq!(
+            next_image_protocol_setting(Some("iterm2"), true).as_deref(),
+            Some("halfblocks")
+        );
+        assert_eq!(next_image_protocol_setting(Some("halfblocks"), true), None);
+        // Without a detected picker only halfblocks is reachable.
+        assert_eq!(
+            next_image_protocol_setting(None, false).as_deref(),
+            Some("halfblocks")
+        );
+        assert_eq!(next_image_protocol_setting(Some("halfblocks"), false), None);
+        // An unrecognized stored value is treated as auto.
+        assert_eq!(
+            next_image_protocol_setting(Some("kity"), true).as_deref(),
+            Some("kitty")
+        );
+    }
+
+    #[test]
+    fn build_image_picker_forces_only_recognized_values() {
+        let base = ratatui_image::picker::Picker::halfblocks();
+        // Auto keeps the detected picker and is never manual.
+        let (picker, manual) = build_image_picker(Some(&base), None);
+        assert_eq!(
+            picker.as_ref().map(|p| p.protocol_type()),
+            Some(ratatui_image::picker::ProtocolType::Halfblocks)
+        );
+        assert!(!manual);
+        // A forced protocol rides on the base picker's cell size.
+        let (picker, manual) = build_image_picker(Some(&base), Some("sixel"));
+        assert_eq!(
+            picker.as_ref().map(|p| p.protocol_type()),
+            Some(ratatui_image::picker::ProtocolType::Sixel)
+        );
+        assert!(manual);
+        // Halfblocks can be forced even without a detected picker.
+        let (picker, manual) = build_image_picker(None, Some("halfblocks"));
+        assert_eq!(
+            picker.as_ref().map(|p| p.protocol_type()),
+            Some(ratatui_image::picker::ProtocolType::Halfblocks)
+        );
+        assert!(manual);
+        // kitty/sixel/iterm2 without a base fall back to auto.
+        let (picker, manual) = build_image_picker(None, Some("kitty"));
+        assert!(picker.is_none());
+        assert!(!manual);
+        // Unrecognized values behave as auto.
+        let (picker, manual) = build_image_picker(Some(&base), Some("kity"));
+        assert!(picker.is_some());
+        assert!(!manual);
+    }
 
     #[test]
     fn invalid_generation_hides_parser_internals_from_player() {

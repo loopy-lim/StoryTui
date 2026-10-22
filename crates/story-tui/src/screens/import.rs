@@ -3,15 +3,17 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+
+use crate::theme::{BORDER_TYPE, Palette, Styles};
 
 use super::popup::{POPUP_WIDTH_WIDE, centered_rect};
 
 /// Per-frame dialog state as plain display data.
 pub enum ImportDialogView<'a> {
-    /// Path input; the cursor cell renders reversed.
+    /// Path input; the cursor cell renders highlighted.
     Input { before: &'a str, after: &'a str },
     /// Browsing directories; `entries` pairs a name with `is_dir`.
     Browse {
@@ -34,21 +36,22 @@ pub enum ImportDialogView<'a> {
 pub fn render_import_dialog(frame: &mut Frame, area: Rect, view: ImportDialogView<'_>) {
     let (title, mut body, footer) = match view {
         ImportDialogView::Input { before, after } => (
-            "카드 가져오기",
+            " ✦ 카드 가져오기 ✦ ",
             vec![
-                Line::from("카드 파일을 경로로 입력하거나, Tab으로 파일 브라우저를 여세요."),
-                Line::from("지원 형식: PNG/JSON/CHARX · 옵션은 CLI: storytui import --help"),
+                Line::from(Span::styled(
+                    "카드 파일을 경로로 입력하거나, Tab으로 파일 브라우저를 여세요.",
+                    Styles::item_normal(),
+                )),
+                Line::from(Span::styled(
+                    "지원 형식: PNG/JSON/CHARX · 옵션은 CLI: storytui import --help",
+                    Styles::muted(),
+                )),
                 Line::from(""),
                 Line::from(vec![
-                    Span::raw("> "),
-                    Span::raw(before),
-                    Span::styled(
-                        " ",
-                        Style::default()
-                            .add_modifier(Modifier::REVERSED)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(after),
+                    Span::styled("> ", Styles::keycap()),
+                    Span::styled(before, Styles::item_normal()),
+                    Span::styled("▌", Style::default().fg(Palette::SELECTED)),
+                    Span::styled(after, Styles::item_normal()),
                 ]),
             ],
             "Enter 임포트 · Tab 파일 브라우저 · Esc 취소",
@@ -65,13 +68,13 @@ pub fn render_import_dialog(frame: &mut Frame, area: Rect, view: ImportDialogVie
             let window_start = active.saturating_sub(VISIBLE_ROWS.saturating_sub(1));
             let window_end = (window_start + VISIBLE_ROWS).min(entries.len());
             let mut body = vec![
-                Line::from(Span::styled(dir, Style::default().fg(Color::DarkGray))),
+                Line::from(Span::styled(dir, Styles::subtle())),
                 Line::from(""),
             ];
             if entries.is_empty() {
                 body.push(Line::from(Span::styled(
                     "표시할 항목이 없습니다 (읽기 실패했을 수 있습니다).",
-                    Style::default().fg(Color::DarkGray),
+                    Styles::muted(),
                 )));
             } else {
                 for (index, (name, is_dir)) in entries[window_start..window_end].iter().enumerate()
@@ -85,57 +88,64 @@ pub fn render_import_dialog(frame: &mut Frame, area: Rect, view: ImportDialogVie
                     if index == active {
                         body.push(Line::from(Span::styled(
                             format!("▶ {label}"),
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD)
-                                .add_modifier(Modifier::REVERSED),
+                            Styles::item_selected(),
+                        )));
+                    } else if *is_dir {
+                        body.push(Line::from(Span::styled(
+                            format!("  {label}"),
+                            Style::default().fg(Palette::PRIMARY),
                         )));
                     } else {
                         body.push(Line::from(Span::styled(
                             format!("  {label}"),
-                            Style::default().fg(Color::Gray),
+                            Styles::item_normal(),
                         )));
                     }
                 }
                 if entries.len() > VISIBLE_ROWS {
                     body.push(Line::from(Span::styled(
                         format!("전체 {}개 항목", entries.len()),
-                        Style::default().fg(Color::DarkGray),
+                        Styles::muted(),
                     )));
                 }
             }
             (
-                "카드 가져오기 — 파일 브라우저",
+                " ✦ 카드 가져오기 — 파일 브라우저 ✦ ",
                 body,
                 "Enter 폴더 열기/카드 선택 · Backspace 상위 · Tab 경로 입력 · Esc 취소",
             )
         }
         ImportDialogView::Running { path } => (
-            "카드 가져오기",
+            " ✦ 카드 가져오기 ✦ ",
             vec![
-                Line::from("임포트 중…"),
+                Line::from(Span::styled(
+                    "임포트 중…",
+                    Style::default()
+                        .fg(Palette::ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                )),
                 Line::from(""),
-                Line::from(Span::styled(path, Style::default().fg(Color::DarkGray))),
+                Line::from(Span::styled(path, Styles::muted())),
             ],
             "잠시만 기다려 주세요",
         ),
         ImportDialogView::Report { path, lines, ready } => {
             let mut body = vec![
-                Line::from(Span::styled(path, Style::default().fg(Color::DarkGray))),
+                Line::from(Span::styled(path, Styles::subtle())),
                 Line::from(""),
             ];
             body.extend(lines.iter().map(|line| {
                 if line.starts_with('!') {
                     Line::from(Span::styled(
                         line.clone(),
-                        Style::default().fg(Color::Yellow),
+                        Style::default().fg(Palette::CAUTION),
                     ))
                 } else {
-                    Line::from(line.clone())
+                    Line::from(Span::styled(line.clone(), Styles::item_normal()))
                 }
             }));
             (
-                "임포트 리포트",
+                " ✦ 임포트 리포트 ✦ ",
                 body,
                 if ready {
                     "Enter 이 팩 불러오기 · Esc 닫기"
@@ -146,18 +156,16 @@ pub fn render_import_dialog(frame: &mut Frame, area: Rect, view: ImportDialogVie
         }
     };
     body.push(Line::from(""));
-    body.push(Line::from(Span::styled(
-        footer,
-        Style::default().fg(Color::DarkGray),
-    )));
+    body.push(Line::from(Span::styled(footer, Styles::muted())));
 
     let height = (body.len() as u16 + 2).clamp(7, area.height.max(7));
     let popup = centered_rect(area, POPUP_WIDTH_WIDE, height);
     frame.render_widget(Clear, popup);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::LightCyan))
-        .title(title);
+        .border_type(BORDER_TYPE)
+        .border_style(Styles::border_primary())
+        .title(Span::styled(title, Styles::title()));
     frame.render_widget(
         Paragraph::new(body)
             .block(block)

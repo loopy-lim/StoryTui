@@ -7,9 +7,11 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
+
+use crate::theme::Palette;
 
 /// Popup widths, in terminal columns. One shared scale keeps the modals from
 /// drifting apart (they used to be 60/70/72 ad-hoc).
@@ -50,7 +52,7 @@ pub fn render_min_size_warning(frame: &mut Frame, area: Rect, min_width: u16, mi
     );
     let para = Paragraph::new(Line::from(msg))
         .alignment(Alignment::Center)
-        .style(Style::default().fg(Color::Yellow));
+        .style(Style::default().fg(Palette::CAUTION));
     frame.render_widget(para, area);
 }
 

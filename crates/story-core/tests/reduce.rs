@@ -1395,6 +1395,214 @@ fn second_consecutive_no_progress_turn_is_repaired_before_commit() {
     assert!(instruction.content.contains("직전 턴에 이어 변화가 없다"));
 }
 
+// ---------------------------------------------------------------------------
+// one-key undo (RestoreCheckpoint): the player recovers from a bad decision
+// ---------------------------------------------------------------------------
+
+/// 오프닝 수락 → 선택 확정 → 수락까지 진행한 상태(턴 2)와 함께 오프닝 턴의
+/// 체크포인트 id를 돌려준다.
+fn two_accepted_turns(pack: &StoryPack) -> (EngineState, uuid::Uuid, uuid::Uuid) {
+    let (state, opening_gid) = start_and_pending_id(pack);
+    let opened = reduce(
+        &state,
+        EngineCommand::AcceptGeneration {
+            draft: Box::new(valid_draft(opening_gid, 1)),
+        },
+        pack,
+    )
+    .expect("accept opening");
+    let submitted = reduce(
+        &opened.state,
+        EngineCommand::SubmitChoice {
+            choice_id: "choice-0".to_string(),
+        },
+        pack,
+    )
+    .expect("submit choice");
+    let turn_gid = submitted.state.pending.as_ref().unwrap().generation_id;
+    let accepted = reduce(
+        &submitted.state,
+        EngineCommand::AcceptGeneration {
+            draft: Box::new(valid_draft(turn_gid, -1)),
+        },
+        pack,
+    )
+    .expect("accept turn");
+    let undo_id = published_view(&accepted)
+        .undo_checkpoint_id
+        .expect("undo target offered after two accepted turns");
+    (accepted.state, undo_id, opening_gid)
+}
+
+#[test]
+fn undo_target_appears_only_after_a_committed_turn() {
+    let pack = sample_pack();
+    let (state, opening_gid) = start_and_pending_id(&pack);
+    let opened = reduce(
+        &state,
+        EngineCommand::AcceptGeneration {
+            draft: Box::new(valid_draft(opening_gid, 1)),
+        },
+        &pack,
+    )
+    .expect("accept opening");
+    // 오프닝 직후: 같은 턴의 체크포인트만 있어 되돌릴 대상이 없다.
+    assert_eq!(opened.state.game.turn, 1);
+    assert!(published_view(&opened).undo_checkpoint_id.is_none());
+    // 두 번째 턴 확정 후: 직전 턴(오프닝)으로 되돌릴 수 있다.
+    let submitted = reduce(
+        &opened.state,
+        EngineCommand::SubmitChoice {
+            choice_id: "choice-0".to_string(),
+        },
+        &pack,
+    )
+    .expect("submit");
+    let gid = submitted.state.pending.as_ref().unwrap().generation_id;
+    let accepted = reduce(
+        &submitted.state,
+        EngineCommand::AcceptGeneration {
+            draft: Box::new(valid_draft(gid, 1)),
+        },
+        &pack,
+    )
+    .expect("accept turn");
+    assert_eq!(accepted.state.game.turn, 2);
+    assert!(published_view(&accepted).undo_checkpoint_id.is_some());
+}
+
+#[test]
+fn restore_checkpoint_rewinds_one_turn_and_persists() {
+    let pack = sample_pack();
+    let (state, undo_id, _opening_gid) = two_accepted_turns(&pack);
+    assert_eq!(state.game.turn, 2);
+
+    let restored = reduce(
+        &state,
+        EngineCommand::RestoreCheckpoint {
+            checkpoint_id: undo_id,
+        },
+        &pack,
+    )
+    .expect("restore");
+
+    assert_eq!(restored.state.game.turn, 1, "rewound to the opening turn");
+    assert_eq!(
+        restored.state.game.history.len(),
+        1,
+        "the undone turn's history entry is gone"
+    );
+    assert!(restored.state.pending.is_none());
+    assert!(
+        restored.state.retry_pending.is_none(),
+        "stale retry cleared"
+    );
+    let view = published_view(&restored);
+    assert_eq!(view.status.turn, 1);
+    assert_eq!(view.choices.len(), 3, "the rewound turn's choices are back");
+    assert!(
+        view.undo_checkpoint_id.is_none(),
+        "only same-turn checkpoints remain after undo"
+    );
+    // 되돌린 상태가 자동 저장된다: 종료→이어하기가 되돌린 지점에서 시작.
+    let persist = restored
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            EngineEffect::PersistStableState { slot_id, .. } => Some(slot_id.clone()),
+            _ => None,
+        })
+        .expect("restore persists the rewound state");
+    assert_eq!(persist, AUTOSAVE_SLOT);
+}
+
+#[test]
+fn undo_after_recommit_still_walks_back_one_turn() {
+    let pack = sample_pack();
+    let (rewound, undo_id, _gid) = two_accepted_turns(&pack);
+    let restored = reduce(
+        &rewound,
+        EngineCommand::RestoreCheckpoint {
+            checkpoint_id: undo_id,
+        },
+        &pack,
+    )
+    .expect("restore");
+    assert_eq!(restored.state.game.turn, 1);
+
+    // 되돌린 지점에서 같은 선택을 다시 확정해도 되돌리기 대상은 여전히
+    // 직전 턴이다 — 오래된 동일 턴 체크포인트가 redo처럼 잡히지 않는다.
+    let resubmitted = reduce(
+        &restored.state,
+        EngineCommand::SubmitChoice {
+            choice_id: "choice-0".to_string(),
+        },
+        &pack,
+    )
+    .expect("resubmit");
+    let gid = resubmitted.state.pending.as_ref().unwrap().generation_id;
+    let recommitted = reduce(
+        &resubmitted.state,
+        EngineCommand::AcceptGeneration {
+            draft: Box::new(valid_draft(gid, 2)),
+        },
+        &pack,
+    )
+    .expect("recommit turn");
+    assert_eq!(recommitted.state.game.turn, 2);
+    let view = published_view(&recommitted);
+    let again = view.undo_checkpoint_id.expect("undo offered again");
+    let restored_again = reduce(
+        &recommitted.state,
+        EngineCommand::RestoreCheckpoint {
+            checkpoint_id: again,
+        },
+        &pack,
+    )
+    .expect("restore again");
+    assert_eq!(restored_again.state.game.turn, 1);
+}
+
+#[test]
+fn start_new_game_clears_the_undo_ring() {
+    // 방어선: 새 세션의 게임에서 이전 플레이의 체크포인트로 되돌릴 경로가
+    // 없어야 한다(선택 술어가 보호하지만 링 자체를 비운다).
+    let pack = sample_pack();
+    let (state, _undo_id, _gid) = two_accepted_turns(&pack);
+    assert!(!state.checkpoints.is_empty());
+
+    let restarted = reduce(&state, EngineCommand::StartNewGame, &pack).expect("restart");
+    assert!(
+        restarted.state.checkpoints.is_empty(),
+        "a fresh game starts with no rewind targets"
+    );
+}
+
+#[test]
+fn restore_with_unknown_checkpoint_id_is_noop() {
+    let pack = sample_pack();
+    let (state, undo_id, _gid) = two_accepted_turns(&pack);
+    let before = state.game.clone();
+    let noop = reduce(
+        &state,
+        EngineCommand::RestoreCheckpoint {
+            checkpoint_id: uuid::Uuid::new_v4(),
+        },
+        &pack,
+    )
+    .expect("noop restore");
+    assert_eq!(noop.state.game.turn, before.turn);
+    assert!(
+        noop.effects.is_empty()
+            || !noop
+                .effects
+                .iter()
+                .any(|e| matches!(e, EngineEffect::PersistStableState { .. })),
+        "a no-op restore must not overwrite the autosave"
+    );
+    let _ = undo_id;
+}
+
 fn published_view(t: &Transition) -> AppViewModel {
     t.effects
         .iter()

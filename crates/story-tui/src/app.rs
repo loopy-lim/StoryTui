@@ -114,6 +114,8 @@ struct SettingsState {
     tts: TtsDisplay,
     images_enabled: bool,
     image_backend: Option<String>,
+    /// Whether `image_backend` was player-forced (Settings `b` cycle).
+    image_backend_manual: bool,
     /// Two-stage Director → Writer generation path (streaming narration).
     use_director_writer: bool,
     /// Whether expression sprites are currently shown.
@@ -253,10 +255,15 @@ pub struct App {
     image_picker: Option<Picker>,
     /// Human-readable protocol name for the Settings screen (kitty 등).
     image_backend: Option<&'static str>,
+    /// Whether the current protocol was player-forced (Settings `b` cycle)
+    /// rather than the startup detection.
+    image_backend_manual: bool,
     /// Player toggle from the Settings screen — rendering skips when off.
     images_enabled: bool,
     /// Set when the player toggled images in Settings (`i`).
     images_toggle_requested: bool,
+    /// Set when the player cycled the image render protocol in Settings (`b`).
+    image_backend_cycle_requested: bool,
     /// Set when the player toggled the generation path in Settings (`g`).
     generation_toggle_requested: bool,
     /// Player toggle for expression sprites from the Settings screen (`f`).
@@ -286,6 +293,13 @@ pub struct App {
     pack_swap_request: Option<String>,
     /// Pack delete confirmation modal: the selected index into `pack_dirs`.
     pack_delete_confirm: Option<usize>,
+    /// Set while the in-game `n` confirmation modal is up (AC: one stray
+    /// keypress must not reset a run).
+    new_game_confirm: bool,
+    /// The confirm was opened from the home menu's "새 게임" row; on Enter the
+    /// original home arm (greeting picker / home_request) replays instead of
+    /// the in-game engine command.
+    new_game_confirm_from_home: bool,
     /// Set when the player confirms deletion; the host validates and removes.
     pack_delete_request: Option<String>,
     /// Alternate openings for the current pack: index 0 is the pack opening.
@@ -377,8 +391,10 @@ impl App {
             tts_toggle_requested: false,
             image_picker: None,
             image_backend: None,
+            image_backend_manual: false,
             images_enabled: true,
             images_toggle_requested: false,
+            image_backend_cycle_requested: false,
             generation_toggle_requested: false,
             expressions_enabled: true,
             expressions_toggle_requested: false,
@@ -390,6 +406,8 @@ impl App {
             import_request: None,
             browse_request: None,
             pack_delete_confirm: None,
+            new_game_confirm: false,
+            new_game_confirm_from_home: false,
             pack_delete_request: None,
             pack_swap_request: None,
             greetings: Vec::new(),
@@ -849,20 +867,23 @@ impl App {
             tts,
             images_enabled,
             image_backend,
+            image_backend_manual: self.image_backend_manual,
             use_director_writer,
             expressions_enabled,
         });
     }
 
     /// Record the terminal graphics capability. Call once at startup before
-    /// the first `set_location_image`.
-    pub fn set_image_picker(&mut self, picker: Option<Picker>) {
+    /// the first `set_location_image`. `manual` marks a player-forced
+    /// protocol (Settings `b` cycle) as opposed to the detected default.
+    pub fn set_image_picker(&mut self, picker: Option<Picker>, manual: bool) {
         self.image_backend = picker.as_ref().map(|picker| match picker.protocol_type() {
             ratatui_image::picker::ProtocolType::Kitty => "kitty",
             ratatui_image::picker::ProtocolType::Sixel => "sixel",
             ratatui_image::picker::ProtocolType::Iterm2 => "iterm2",
             ratatui_image::picker::ProtocolType::Halfblocks => "halfblocks",
         });
+        self.image_backend_manual = manual;
         self.image_picker = picker;
     }
 
@@ -881,9 +902,19 @@ impl App {
         self.image_backend.map(str::to_string)
     }
 
+    /// Whether the displayed protocol was player-forced rather than detected.
+    pub fn image_backend_manual(&self) -> bool {
+        self.image_backend_manual
+    }
+
     /// Consume an image toggle request from the Settings screen.
     pub fn take_images_toggle_request(&mut self) -> bool {
         std::mem::take(&mut self.images_toggle_requested)
+    }
+
+    /// Consume an image render-protocol cycle request from the Settings screen.
+    pub fn take_image_backend_cycle_request(&mut self) -> bool {
+        std::mem::take(&mut self.image_backend_cycle_requested)
     }
 
     /// Consume a generation-path toggle request from the Settings screen.
@@ -984,11 +1015,13 @@ impl App {
         }
     }
 
-    /// Patch only the image section of the Settings state (the `i` toggle).
+    /// Patch only the image section of the Settings state (the `i` toggle
+    /// and the `b` protocol cycle).
     pub fn update_settings_images(&mut self, images_enabled: bool, image_backend: Option<String>) {
         if let Some(settings) = self.settings.as_mut() {
             settings.images_enabled = images_enabled;
             settings.image_backend = image_backend;
+            settings.image_backend_manual = self.image_backend_manual;
         }
     }
 
@@ -1225,6 +1258,39 @@ impl App {
             self.handle_pack_delete_confirm_key(key);
             return None;
         }
+        if self.new_game_confirm {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                self.should_quit = true;
+                return None;
+            }
+            return match key.code {
+                KeyCode::Enter => {
+                    self.new_game_confirm = false;
+                    if self.new_game_confirm_from_home {
+                        // Home origin: replay the home arm — the guard lets
+                        // the from-home origin through; clear it afterwards
+                        // so a cancelled greeting picker re-asks next time.
+                        self.choose_home(0);
+                        self.new_game_confirm_from_home = false;
+                        None
+                    } else {
+                        Some(EngineCommand::StartNewGame)
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('n' | 'ㅜ') => {
+                    self.new_game_confirm = false;
+                    self.new_game_confirm_from_home = false;
+                    None
+                }
+                KeyCode::Char('q' | 'ㅂ') => {
+                    self.should_quit = true;
+                    self.new_game_confirm = false;
+                    self.new_game_confirm_from_home = false;
+                    None
+                }
+                _ => None,
+            };
+        }
         if self.pack_picker.is_some() {
             self.handle_pack_picker_key(key);
             return None;
@@ -1367,6 +1433,10 @@ impl App {
                 KeyCode::Char('f' | 'ㄹ') => {
                     self.expressions_toggle_requested = true;
                 }
+                // Same physical key under Korean 2-beolsik: b=ㅠ.
+                KeyCode::Char('b' | 'ㅠ') => {
+                    self.image_backend_cycle_requested = true;
+                }
                 KeyCode::Char('q' | 'ㅂ') => self.should_quit = true,
                 _ => {}
             }
@@ -1383,9 +1453,14 @@ impl App {
             return None;
         }
         // While a turn is being generated, choices must stay visually and
-        // logically fixed. Only cancellation and quitting remain available.
+        // logically fixed. Only cancellation, re-rolling the turn in flight
+        // (`r` → RegenerateCurrentTurn in map_key), and quitting remain
+        // available.
         if self.view.loading.is_some()
-            && !matches!(key.code, KeyCode::Char('c' | 'ㅊ' | 'q' | 'ㅂ'))
+            && !matches!(
+                key.code,
+                KeyCode::Char('c' | 'ㅊ' | 'q' | 'ㅂ' | 'r' | 'ㄱ')
+            )
             && !key.modifiers.contains(KeyModifiers::CONTROL)
         {
             return None;
@@ -1427,6 +1502,15 @@ impl App {
                 }
                 KeyCode::Char('v' | 'ㅓ') => {
                     self.tts_toggle_requested = true;
+                    return None;
+                }
+                KeyCode::Char('n' | 'ㅜ') if self.view.status.turn > 0 => {
+                    // One accidental keypress must not wipe an in-progress
+                    // run — StartNewGame clears the rewind ring too, so undo
+                    // cannot recover it. Ask first. Before the opening
+                    // (turn 0) the guard fails and map_key starts directly.
+                    self.new_game_confirm = true;
+                    self.new_game_confirm_from_home = false;
                     return None;
                 }
                 _ => {}
@@ -1678,6 +1762,9 @@ impl App {
                 .unwrap_or("");
             crate::screens::pack::render_pack_delete_confirm(frame, area, title);
         }
+        if self.new_game_confirm {
+            crate::screens::story::render_new_game_confirm(frame, area, self.view.status.turn);
+        }
     }
 
     fn render_base(&mut self, frame: &mut Frame, area: Rect) {
@@ -1757,6 +1844,7 @@ impl App {
                     tts_voice: settings.tts.voice.clone(),
                     images_enabled: settings.images_enabled,
                     image_backend: settings.image_backend.clone(),
+                    image_backend_manual: settings.image_backend_manual,
                     use_director_writer: settings.use_director_writer,
                     expressions_enabled: settings.expressions_enabled,
                     theme_name: "default",
@@ -1809,6 +1897,12 @@ impl App {
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             let area = self.last_render_area.get();
+
+            // 0. The new-game confirm owns the screen: clicks must not drive
+            // the story (footer undo/home/...) from behind the modal.
+            if self.new_game_confirm {
+                return;
+            }
 
             // 1. Import dialog is keyboard-focused for path input.
             if self.import_dialog.is_some() {
@@ -1964,6 +2058,15 @@ impl App {
                             && !self.view.choices.is_empty()
                         {
                             self.mouse_command = Some(EngineCommand::RegenerateChoices);
+                        }
+                    }
+                    StoryFooterAction::Undo => {
+                        if self.view.loading.is_none()
+                            && self.view.error.is_none()
+                            && let Some(checkpoint_id) = self.view.undo_checkpoint_id
+                        {
+                            self.mouse_command =
+                                Some(EngineCommand::RestoreCheckpoint { checkpoint_id });
                         }
                     }
                     StoryFooterAction::Help => {
@@ -2128,6 +2231,15 @@ impl App {
     fn choose_home(&mut self, selection: usize) {
         match selection {
             0 => {
+                // The destructive default row: with a run in progress, a
+                // stray Enter (or click, or `n`) on the home menu must not
+                // reset it — same confirm modal as the in-game `n`. The
+                // from-home origin replays this exact arm after Enter.
+                if self.view.status.turn > 0 && !self.new_game_confirm_from_home {
+                    self.new_game_confirm = true;
+                    self.new_game_confirm_from_home = true;
+                    return;
+                }
                 // Alternate openings gate the start — but with a single
                 // option there is nothing to choose; skip the modal.
                 if self.greetings.len() > 1 {
@@ -2249,6 +2361,10 @@ impl App {
             EngineCommand::CancelGeneration { .. } => {
                 pending.map(|gid| EngineCommand::CancelGeneration { generation_id: gid })
             }
+            EngineCommand::RestoreCheckpoint { checkpoint_id } if checkpoint_id.is_nil() => self
+                .view
+                .undo_checkpoint_id
+                .map(|id| EngineCommand::RestoreCheckpoint { checkpoint_id: id }),
             other => Some(other),
         }
     }
@@ -2445,6 +2561,7 @@ mod tests {
             },
             loading: None,
             error: None,
+            undo_checkpoint_id: None,
         }
     }
 
@@ -2713,7 +2830,7 @@ mod tests {
         app.set_lists(&history, &[], &initial);
 
         let picker = ratatui_image::picker::Picker::halfblocks();
-        app.set_image_picker(Some(picker));
+        app.set_image_picker(Some(picker), false);
         app.set_location_image(
             "cafe",
             Some((
@@ -2844,6 +2961,88 @@ mod tests {
         assert!(app.take_expressions_toggle_request());
     }
 
+    #[test]
+    fn settings_b_key_requests_the_backend_cycle_once() {
+        let mut app = halfblocks_app(1);
+        app.handle_key(key(KeyCode::Char('o')), None);
+        app.handle_key(key(KeyCode::Char('b')), None);
+        assert!(app.take_image_backend_cycle_request(), "cycle requested");
+        assert!(
+            !app.take_image_backend_cycle_request(),
+            "request is consumed"
+        );
+
+        // Korean 2-beolsik ㅠ hits the same physical key branch.
+        app.handle_key(key(KeyCode::Char('ㅠ')), None);
+        assert!(app.take_image_backend_cycle_request());
+    }
+
+    #[test]
+    fn settings_screen_renders_the_forced_backend_marker() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use unicode_width::UnicodeWidthStr;
+
+        let mut app = halfblocks_app(1);
+        // Player-forced protocol (Settings `b` cycle): the marker must reach
+        // the screen through the real App → SettingsView projection, not a
+        // hand-built view.
+        app.set_image_picker(Some(ratatui_image::picker::Picker::halfblocks()), true);
+        app.set_settings(
+            ProviderConfigSafe {
+                base_url: "http://127.0.0.1:8000".to_string(),
+                model: "a".to_string(),
+                director_model: None,
+                choice_model: None,
+                writer_model: None,
+                structured_output: "auto".to_string(),
+                request_timeout_ms: 1_000,
+                connect_timeout_ms: 1_000,
+                max_retries: 0,
+                is_loopback: true,
+            },
+            ProviderHealth::Ready,
+            0.8,
+            0.9,
+            40,
+            1_800,
+            TtsDisplay {
+                enabled: true,
+                backend: "say".to_string(),
+                voice: None,
+            },
+            true,
+            app.image_backend_label(),
+            false,
+            true,
+        );
+        app.settings_visible = true;
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).expect("terminal");
+        terminal
+            .draw(|frame| app.render(frame, frame.area()))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buffer.area.height {
+            let mut previous_was_wide = false;
+            for x in 0..buffer.area.width {
+                let symbol = buffer[(x, y)].symbol();
+                if previous_was_wide && symbol == " " {
+                    previous_was_wide = false;
+                    continue;
+                }
+                previous_was_wide = symbol.width() == 2;
+                out.push_str(symbol);
+            }
+            out.push('\n');
+        }
+        assert!(
+            out.contains("halfblocks (수동)"),
+            "forced-protocol marker missing from the settings screen:\n{out}"
+        );
+    }
+
     /// Count Image blocks the story pane would render for the current state.
     fn image_block_count(app: &mut App) -> usize {
         app.fill_block_cache();
@@ -2880,7 +3079,7 @@ mod tests {
 
     fn halfblocks_app(view_choices: usize) -> App {
         let mut app = App::new(sample_view(view_choices));
-        app.set_image_picker(Some(ratatui_image::picker::Picker::halfblocks()));
+        app.set_image_picker(Some(ratatui_image::picker::Picker::halfblocks()), false);
         app
     }
 
@@ -3216,6 +3415,7 @@ mod tests {
     #[test]
     fn home_menu_emits_start_and_continue_requests() {
         let mut app = App::new(sample_view(0));
+        app.view.status.turn = 0;
         app.set_can_continue(true);
         app.show_home();
 
@@ -3358,6 +3558,213 @@ mod tests {
         app.handle_key(key(KeyCode::Down), None);
         app.handle_key(key(KeyCode::Enter), None);
         assert_eq!(app.take_selected_model().as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn u_key_resolves_the_view_undo_checkpoint() {
+        let mut app = App::new(sample_view(3));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('u')), None),
+            None,
+            "no undo target in the view: the key is a no-op"
+        );
+        let checkpoint_id = Uuid::new_v4();
+        app.view.undo_checkpoint_id = Some(checkpoint_id);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('u')), None),
+            Some(EngineCommand::RestoreCheckpoint { checkpoint_id })
+        );
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('ㅕ')), None),
+            Some(EngineCommand::RestoreCheckpoint { checkpoint_id }),
+            "korean layout resolves the same checkpoint"
+        );
+    }
+
+    #[test]
+    fn loading_and_error_block_the_undo_key() {
+        let mut app = App::new(sample_view(3));
+        app.view.undo_checkpoint_id = Some(Uuid::new_v4());
+        app.view.loading = Some(story_model::LoadingState {
+            generation_id: Uuid::nil(),
+            message_ko: "생성 중...".to_string(),
+        });
+        assert_eq!(app.handle_key(key(KeyCode::Char('u')), None), None);
+        app.view.loading = None;
+        app.view.error = Some(story_model::DomainErrorView {
+            code: "test".to_string(),
+            title_ko: "오류".to_string(),
+            message_ko: "재시도 필요".to_string(),
+            recoverable: true,
+        });
+        assert_eq!(app.handle_key(key(KeyCode::Char('u')), None), None);
+    }
+
+    #[test]
+    fn u_key_survives_a_resolved_ending_with_no_choices() {
+        // D1 regression: after an ending resolves, the engine clears the
+        // choices but the undo target (the pre-ending turn) stays offered.
+        // The keyboard path must match the footer/[U] click path here.
+        let mut app = App::new(sample_view(0));
+        let checkpoint_id = Uuid::new_v4();
+        app.view.choices = Vec::new();
+        app.view.undo_checkpoint_id = Some(checkpoint_id);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('u')), None),
+            Some(EngineCommand::RestoreCheckpoint { checkpoint_id })
+        );
+        // No target in the view (fresh game, save restore): the nil sentinel
+        // is dropped instead of reaching the engine.
+        app.view.undo_checkpoint_id = None;
+        assert_eq!(app.handle_key(key(KeyCode::Char('u')), None), None);
+    }
+
+    #[test]
+    fn n_key_asks_before_resetting_progress() {
+        let mut app = App::new(sample_view(3));
+        assert_eq!(app.view.status.turn, 1);
+        assert_eq!(app.handle_key(key(KeyCode::Char('n')), None), None);
+        assert!(app.new_game_confirm, "the confirm modal intercepts n");
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter), None),
+            Some(EngineCommand::StartNewGame),
+            "only an explicit Enter resets"
+        );
+        assert!(!app.new_game_confirm);
+
+        // Esc (or a repeated n) backs out without touching anything.
+        app.handle_key(key(KeyCode::Char('ㅜ')), None);
+        assert!(app.new_game_confirm);
+        assert_eq!(app.handle_key(key(KeyCode::Esc), None), None);
+        assert!(!app.new_game_confirm);
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn n_key_at_turn_zero_starts_immediately() {
+        let mut app = App::new(sample_view(3));
+        app.view.status.turn = 0;
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('n')), None),
+            Some(EngineCommand::StartNewGame),
+            "nothing to lose before the opening: no modal"
+        );
+        assert!(!app.new_game_confirm);
+    }
+
+    #[test]
+    fn r_key_rerolls_the_in_flight_turn_through_the_app_gate() {
+        // D1 regression: the loading key gate must pass `r`/`ㄱ` through to
+        // map_key, or the advertised [R] 다시 만들기 is a dead key.
+        let mut app = App::new(sample_view(3));
+        app.view.loading = Some(story_model::LoadingState {
+            generation_id: Uuid::nil(),
+            message_ko: "생성 중...".to_string(),
+        });
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Char('r')), Some(Uuid::nil())),
+            Some(EngineCommand::RegenerateCurrentTurn)
+        ));
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Char('ㄱ')), Some(Uuid::nil())),
+            Some(EngineCommand::RegenerateCurrentTurn)
+        ));
+        // The gate still absorbs unrelated keys while loading.
+        assert_eq!(app.handle_key(key(KeyCode::Char('h')), None), None);
+        assert!(app.list_mode.is_none());
+    }
+
+    #[test]
+    fn modal_blocks_mouse_behind_the_new_game_confirm() {
+        // D2 regression: clicks must not drive the story from behind the
+        // confirm modal (footer [U]/[Home]/... live underneath it).
+        let mut app = App::new(sample_view(3));
+        app.handle_key(key(KeyCode::Char('n')), None);
+        assert!(app.new_game_confirm);
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.new_game_confirm, "the modal stays up");
+        assert!(
+            app.take_mouse_command().is_none(),
+            "no engine command leaks from a click behind the modal"
+        );
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn home_new_game_asks_when_progress_exists() {
+        let mut app = App::new(sample_view(3));
+        assert_eq!(app.view.status.turn, 1);
+        app.home_visible = true;
+        app.home_selected = 0;
+        // Stray Enter on the destructive default row opens the confirm.
+        assert_eq!(app.handle_key(key(KeyCode::Enter), None), None);
+        assert!(app.new_game_confirm);
+        assert!(app.new_game_confirm_from_home);
+        assert!(app.home_request.is_none(), "no reset before confirmation");
+        // Esc closes only the modal; the home menu stays for the original
+        // purpose (pack picking, import, ...).
+        assert_eq!(app.handle_key(key(KeyCode::Esc), None), None);
+        assert!(!app.new_game_confirm);
+        assert!(app.home_visible);
+        assert!(app.home_request.is_none());
+
+        // Confirm replays the home arm (no greetings → home_request), the
+        // same flow a deliberate selection would have taken.
+        app.handle_key(key(KeyCode::Enter), None);
+        assert!(app.new_game_confirm);
+        assert_eq!(app.handle_key(key(KeyCode::Enter), None), None);
+        assert_eq!(app.home_request, Some(HomeRequest::StartNew));
+        assert!(!app.new_game_confirm);
+        assert!(!app.home_visible);
+    }
+
+    #[test]
+    fn home_new_game_at_turn_zero_starts_immediately() {
+        let mut app = App::new(sample_view(3));
+        app.view.status.turn = 0;
+        app.home_visible = true;
+        app.home_selected = 0;
+        assert_eq!(app.handle_key(key(KeyCode::Enter), None), None);
+        assert!(!app.new_game_confirm, "nothing to lose before the opening");
+        assert_eq!(app.home_request, Some(HomeRequest::StartNew));
+    }
+
+    #[test]
+    fn home_new_game_confirm_replays_the_greeting_picker() {
+        // With progress and multiple greetings, confirming the home guard
+        // must replay the original arm: picker opens (not a silent start),
+        // the pick gates StartNew, and a cancelled pick re-asks the guard.
+        let mut app = App::new(sample_view(3));
+        app.home_visible = true;
+        app.set_greetings(vec![
+            "기본 오프닝".to_string(),
+            "비 오는 날의 인사".to_string(),
+        ]);
+        app.handle_key(key(KeyCode::Enter), None);
+        assert!(app.new_game_confirm, "progress exists: confirm first");
+        assert!(app.greeting_picker.is_none(), "picker waits for confirm");
+
+        assert_eq!(app.handle_key(key(KeyCode::Enter), None), None);
+        assert!(
+            app.greeting_picker.is_some(),
+            "confirm replays the greeting picker arm"
+        );
+        assert!(app.take_home_request().is_none(), "picker gates the start");
+
+        // Esc cancels the pick; choosing 새 게임 again asks again.
+        app.handle_key(key(KeyCode::Esc), None);
+        assert!(app.greeting_picker.is_none());
+        assert!(app.home_visible);
+        assert_eq!(app.handle_key(key(KeyCode::Enter), None), None);
+        assert!(
+            app.new_game_confirm,
+            "the guard re-arms after a cancelled pick"
+        );
     }
 
     #[test]
@@ -3753,6 +4160,7 @@ mod tests {
     #[test]
     fn greetings_gate_new_game_and_picker_requests_start() {
         let mut app = App::new(sample_view(0));
+        app.view.status.turn = 0;
         app.show_home();
         app.set_greetings(vec![
             "기본 오프닝".to_string(),
@@ -3783,6 +4191,7 @@ mod tests {
     #[test]
     fn greeting_picker_esc_cancels_the_start() {
         let mut app = App::new(sample_view(0));
+        app.view.status.turn = 0;
         app.show_home();
         app.set_greetings(vec!["기본 오프닝".to_string(), "다른 인사".to_string()]);
         app.handle_key(key(KeyCode::Enter), None);
@@ -3801,6 +4210,7 @@ mod tests {
     #[test]
     fn no_greetings_starts_immediately() {
         let mut app = App::new(sample_view(0));
+        app.view.status.turn = 0;
         app.show_home();
         app.handle_key(key(KeyCode::Enter), None);
         assert!(app.greeting_picker.is_none(), "no picker without greetings");

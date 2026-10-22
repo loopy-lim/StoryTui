@@ -87,6 +87,19 @@ wrong story state. The tradeoff: the rule table reads surface cues only
 out of reach, and narration in other languages classifies as neutral. The
 Settings `f` toggle turns sprites off without touching scene images (`i`).
 
+## Manual image protocol forcing can garble unsupported terminals
+
+Scene images follow the terminal capability probed once at startup
+(`Picker::from_query_stdio`), and the Settings `b` cycle can force a protocol
+(`kitty`/`sixel`/`iterm2`/`halfblocks`, persisted in `user-settings.toml`).
+Forcing kitty/sixel/iterm2 on a terminal that does not actually support them
+prints raw graphics escape bytes — the display needs a redraw or restart to
+recover; auto (the default) never does this. Without a detected base picker
+only halfblocks is forceable, since the other protocols need the queried cell
+size. A protocol switch re-encodes every scene image immediately, but
+graphics already painted by the previous protocol may linger until the
+terminal clears them (kitty/sixel images live outside the text grid).
+
 ## Cross-pack runtime evidence is still limited
 
 Two packs are committed: `stories/rainy-reunion` and
@@ -107,7 +120,32 @@ proprietary auth flows, SDKs, or non-OpenAI wire shapes are intentionally
 out of scope. A cloud provider that speaks the OpenAI shape (e.g.
 `openrouter`) will work; one that does not, will not.
 
-## Settings are profile-based
+## Undo is one-key but session-scoped
+
+The story screen's `u` rewinds the most recently committed turn (the AI
+Dungeon "rewind" / SillyTavern "swipe" equivalent): the previous turn's
+narration and choices come back and the autosave slot is rewritten with the
+rewound state, so quitting and resuming never resurrects an undone turn.
+Bounds, all deliberate:
+
+- The checkpoint ring keeps **8 committed turns in memory only** — it is not
+  part of the save envelope, so right after loading a save (or restarting) `u`
+  is unavailable until the next turn commits.
+- There is no redo/history tree (NovelAI-style branching): undo always steps
+  back one turn, and re-committing after an undo pushes a fresh checkpoint —
+  the stale same-turn entry can never be restored into a redo by accident.
+- Undo is refused while a generation is in flight or an error overlay is up;
+  the failed-retry slot is cleared so an old turn cannot replay on top of the
+  rewound state.
+
+## Re-rolls restart the request; alternatives are not cached
+
+`r` while loading re-issues the same turn from the same checkpoint with a
+fresh generation id (the AI Dungeon retry / SillyTavern swipe moment), and
+`r` on an error overlay retries the failed one — but StoryTui does not keep
+a cycle of cached alternatives. Each `r` is a new model call; comparing
+alternatives side-by-side (or swiping through committed variants instead of
+undoing) needs the redo/history cycle.
 
 The current Settings contract is a TOML profile plus CLI and per-save-directory
 user overrides. The in-app model picker reads `/v1/models` and persists the

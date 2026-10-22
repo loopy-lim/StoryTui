@@ -1,6 +1,7 @@
 //! Host-owned provider settings operations: safe UI projection, model
 //! discovery, and persistence of player-selected model overrides.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -303,13 +304,32 @@ async fn refresh_projection(
     );
 }
 
+/// Which stages a resolution or preflight pass had to repair to the active
+/// model. Field names mirror [`StageModels`]; a `true` marks a stage whose
+/// value the pass changed. Only repaired stages may be pinned into the
+/// profile's `stage_models` entry — restored, defaulted, and carried-over
+/// stages stay unrecorded so a later `[[providers]]` default edit keeps
+/// applying.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StageRepairs {
+    pub director: bool,
+    pub choice: bool,
+    pub writer: bool,
+}
+
+impl StageRepairs {
+    pub fn any(self) -> bool {
+        self.director || self.choice || self.writer
+    }
+}
+
 /// Resolve all three stage assignments for a provider switch. Each stage
 /// follows the precedence chain — the profile's saved choice, then the
 /// `[[providers]]` TOML default, then the value in effect (carried over from
 /// the previous profile) — and a desired model the new server does not
 /// advertise is repaired to the active model, the same semantics as the
-/// startup preflight. Returns the resolved assignments and whether any repair
-/// happened, so the caller can decide persistence and log with its own
+/// startup preflight. Returns the resolved assignments and which stages were
+/// repaired, so the caller can pin exactly those and log with its own
 /// context. Pure: no I/O, no provider calls.
 pub fn resolve_stage_assignments(
     saved: Option<&StageModels>,
@@ -317,9 +337,10 @@ pub fn resolve_stage_assignments(
     current: &StageModels,
     advertised: &[String],
     active_model: &str,
-) -> (StageModels, bool) {
-    let mut repaired = false;
-    let mut stage = |saved: Option<String>,
+) -> (StageModels, StageRepairs) {
+    let mut repaired = StageRepairs::default();
+    let mut stage = |flag: &mut bool,
+                     saved: Option<String>,
                      default: Option<String>,
                      carried: Option<String>|
      -> Option<String> {
@@ -330,29 +351,57 @@ pub fn resolve_stage_assignments(
                 .iter()
                 .any(|advertised_model| advertised_model == model)
         {
-            repaired = true;
+            *flag = true;
             return Some(active_model.to_string());
         }
         desired
     };
     let resolved = StageModels {
         director: stage(
+            &mut repaired.director,
             saved.and_then(|s| s.director.clone()),
             profile_default.and_then(|d| d.director.clone()),
             current.director.clone(),
         ),
         choice: stage(
+            &mut repaired.choice,
             saved.and_then(|s| s.choice.clone()),
             profile_default.and_then(|d| d.choice.clone()),
             current.choice.clone(),
         ),
         writer: stage(
+            &mut repaired.writer,
             saved.and_then(|s| s.writer.clone()),
             profile_default.and_then(|d| d.writer.clone()),
             current.writer.clone(),
         ),
     };
     (resolved, repaired)
+}
+
+/// Pin repaired stages into the profile's map entry, creating the entry when
+/// absent. Only the flagged fields are written: stages the pass merely
+/// restored, defaulted, or carried over stay unrecorded, so a later
+/// `[[providers]]` default edit cannot be shadowed by inherited values.
+pub fn record_repaired_stages(
+    stage_models: &mut BTreeMap<String, StageModels>,
+    profile: &str,
+    repairs: StageRepairs,
+    assignments: &StageModels,
+) {
+    if !repairs.any() {
+        return;
+    }
+    let entry = stage_models.entry(profile.to_string()).or_default();
+    if repairs.director {
+        entry.director = assignments.director.clone();
+    }
+    if repairs.choice {
+        entry.choice = assignments.choice.clone();
+    }
+    if repairs.writer {
+        entry.writer = assignments.writer.clone();
+    }
 }
 
 /// Core of a provider switch, shared by the TUI path: re-apply the

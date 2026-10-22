@@ -21,6 +21,7 @@ use story_model::{AppViewModel, Emotion, RiskLevel, TimeSlot};
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::SceneImage;
+use crate::theme::{BORDER_TYPE, Palette, Styles};
 
 use super::keymap::keymap_lines_two_columns;
 use super::model_display_label;
@@ -81,20 +82,26 @@ pub fn render_list(frame: &mut Frame, area: Rect, mode: ListMode, items: &[Strin
         ListMode::ProviderPicker => "프로바이더 선택",
     };
     let rows: Vec<Line> = if items.is_empty() {
-        vec![Line::from("아직 기록이 없습니다.")]
+        vec![Line::from(Span::styled(
+            "아직 기록이 없습니다.",
+            Styles::muted(),
+        ))]
     } else {
-        items.iter().map(|item| Line::from(item.clone())).collect()
+        items
+            .iter()
+            .map(|item| Line::from(Span::styled(item.clone(), Styles::item_normal())))
+            .collect()
     };
     let paragraph = Paragraph::new(rows)
         .scroll((scroll, 0))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(crate::theme::BORDER_TYPE)
-                .border_style(crate::theme::Styles::border_primary())
+                .border_type(BORDER_TYPE)
+                .border_style(Styles::border_primary())
                 .title(Span::styled(
-                    format!(" {} · PgUp/PgDn 스크롤 · Esc 닫기 ", title),
-                    crate::theme::Styles::title(),
+                    format!(" ✦ {} · PgUp/PgDn 스크롤 · Esc 닫기 ✦ ", title),
+                    Styles::title(),
                 )),
         )
         .wrap(Wrap { trim: false });
@@ -146,29 +153,33 @@ pub fn render_model_picker(
     roles: &ModelRoleHints,
 ) {
     let rows: Vec<Line> = if items.is_empty() {
-        vec![Line::from("모델 목록을 불러오지 못했습니다.")]
+        vec![Line::from(Span::styled(
+            "모델 목록을 불러오지 못했습니다.",
+            Styles::muted(),
+        ))]
     } else {
         items
             .iter()
             .enumerate()
             .map(|(index, item)| {
                 let active = index == selected.min(items.len().saturating_sub(1));
-                Line::styled(
+                let badge = roles.badges_for(item);
+                let mut spans = vec![Span::styled(
                     format!(
-                        "{} {}{}",
+                        "{} {}",
                         if active { "▶" } else { " " },
-                        model_display_label(item),
-                        roles.badges_for(item)
+                        model_display_label(item)
                     ),
                     if active {
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD)
-                            .add_modifier(Modifier::REVERSED)
+                        Styles::item_selected()
                     } else {
-                        Style::default().fg(Color::Gray)
+                        Styles::item_normal()
                     },
-                )
+                )];
+                if !badge.is_empty() {
+                    spans.push(Span::styled(badge, Style::default().fg(Palette::ACCENT)));
+                }
+                Line::from(spans)
             })
             .collect()
     };
@@ -177,8 +188,12 @@ pub fn render_model_picker(
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::LightCyan))
-                .title("모델 선택 · ↑↓ 이동 · Enter 기본 · D 기획 · C 선택지 · W 본문 (연속 지정) · R 새로고침 · Esc 닫기"),
+                .border_type(BORDER_TYPE)
+                .border_style(Styles::border_primary())
+                .title(Span::styled(
+                    " ✦ 모델 선택 · ↑↓ 이동 · Enter 기본 · D 기획 · C 선택지 · W 본문 · R 새로고침 · Esc 닫기 ✦ ",
+                    Styles::title(),
+                )),
         )
         .wrap(Wrap { trim: false });
     frame.render_widget(Clear, area);
@@ -194,27 +209,38 @@ pub fn render_provider_picker(
     selected: usize,
 ) {
     let rows: Vec<Line> = if items.is_empty() {
-        vec![Line::from("구성된 프로바이더가 없습니다.")]
+        vec![Line::from(Span::styled(
+            "구성된 프로바이더가 없습니다.",
+            Styles::muted(),
+        ))]
     } else {
         items
             .iter()
             .enumerate()
             .map(|(index, (name, base_url))| {
                 let active = index == selected.min(items.len().saturating_sub(1));
-                Line::styled(
-                    format!(
-                        "{indicator} {name}  ·  {base_url}",
-                        indicator = if active { "▶" } else { " " },
+                Line::from(vec![
+                    Span::styled(
+                        format!(
+                            "{indicator} {name}",
+                            indicator = if active { "▶" } else { " " },
+                        ),
+                        if active {
+                            Styles::item_selected()
+                        } else {
+                            Styles::item_normal()
+                        },
                     ),
-                    if active {
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD)
-                            .add_modifier(Modifier::REVERSED)
-                    } else {
-                        Style::default().fg(Color::Gray)
-                    },
-                )
+                    Span::styled("  ·  ", Styles::muted()),
+                    Span::styled(
+                        base_url.clone(),
+                        if active {
+                            Styles::subtle()
+                        } else {
+                            Styles::muted()
+                        },
+                    ),
+                ])
             })
             .collect()
     };
@@ -223,8 +249,12 @@ pub fn render_provider_picker(
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::LightCyan))
-                .title("프로바이더 선택 · ↑↓ 이동 · Enter 전환 · Esc 닫기"),
+                .border_type(BORDER_TYPE)
+                .border_style(Styles::border_primary())
+                .title(Span::styled(
+                    " ✦ 프로바이더 선택 · ↑↓ 이동 · Enter 전환 · Esc 닫기 ✦ ",
+                    Styles::title(),
+                )),
         )
         .wrap(Wrap { trim: false });
     frame.render_widget(Clear, area);
@@ -258,29 +288,21 @@ pub fn render_story(
 
     // Title rule.
     let title_line = Line::from(vec![
-        Span::styled(
-            view.story_title.clone(),
-            Style::default()
-                .fg(Color::LightCyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" · ", Style::default().fg(Color::DarkGray)),
-        Span::styled(view.chapter.clone(), Style::default().fg(Color::Gray)),
-        Span::styled(" · ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            view.location_display.clone(),
-            Style::default().fg(Color::Gray),
-        ),
-        Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+        Span::styled(view.story_title.clone(), Styles::title()),
+        Span::styled(" · ", Styles::muted()),
+        Span::styled(view.chapter.clone(), Styles::subtle()),
+        Span::styled(" · ", Styles::muted()),
+        Span::styled(view.location_display.clone(), Styles::item_normal()),
+        Span::styled(" · ", Styles::muted()),
         Span::styled(
             time_slot_label(view.time_slot),
-            Style::default().fg(Color::LightCyan),
+            Style::default().fg(Palette::ACCENT),
         ),
     ]);
     let frame_chunks = Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).split(area);
     let title_block = Block::default()
         .borders(Borders::BOTTOM)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Styles::border_muted());
     let title_para = Paragraph::new(title_line)
         .block(title_block)
         .wrap(Wrap { trim: false });
@@ -356,7 +378,7 @@ pub fn render_story(
                 // the same rows the old whole-transcript paragraph did.
                 let paragraph = Paragraph::new(Text::from(lines.as_ref()))
                     .wrap(Wrap { trim: false })
-                    .style(Style::default().fg(Color::Gray))
+                    .style(Styles::item_normal())
                     .scroll((viewport_top.saturating_sub(*start) as u16, 0));
                 let visible_top = (*start).max(viewport_top);
                 let visible_bottom = end.min(viewport_bottom);
@@ -384,9 +406,9 @@ pub fn render_story(
     if needs_scrollbar {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .thumb_symbol("┃")
-            .thumb_style(Style::default().fg(Color::LightCyan))
+            .thumb_style(Styles::border_primary())
             .track_symbol(Some("│"))
-            .track_style(Style::default().fg(Color::DarkGray))
+            .track_style(Styles::border_muted())
             .begin_symbol(None)
             .end_symbol(None);
         // `ScrollbarState::content_length` is the number of reachable scroll
@@ -484,6 +506,7 @@ pub enum StoryFooterAction {
     History,
     Memory,
     Regenerate,
+    Undo,
     Help,
     InputSubmit,
     InputCancel,
@@ -540,6 +563,7 @@ pub fn footer_action_at(
                 "[H]" => Some(StoryFooterAction::History),
                 "[M]" => Some(StoryFooterAction::Memory),
                 "[R]" => Some(StoryFooterAction::Regenerate),
+                "[U]" => Some(StoryFooterAction::Undo),
                 "[?]" => Some(StoryFooterAction::Help),
                 "[Enter]" => Some(StoryFooterAction::InputSubmit),
                 "[Esc]" => Some(StoryFooterAction::InputCancel),
@@ -665,14 +689,12 @@ pub(crate) fn streaming_entry_lines(turn: u32, streaming: &str) -> Vec<Line<'sta
         Line::from(""),
         Line::from(Span::styled(
             "────────────────────────────────────────",
-            Style::default().fg(Color::DarkGray),
+            Styles::muted(),
         )),
         Line::from(""),
         Line::from(Span::styled(
             format!("턴 {} · {}", turn.saturating_add(1), "작성 중"),
-            Style::default()
-                .fg(Color::LightCyan)
-                .add_modifier(Modifier::BOLD),
+            Styles::title(),
         )),
     ];
     lines.extend(markdown_lines(streaming));
@@ -689,15 +711,13 @@ pub(crate) fn story_entry_lines(entry: &StoryStackEntry, first: bool) -> Vec<Lin
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "────────────────────────────────────────",
-            Style::default().fg(Color::DarkGray),
+            Styles::muted(),
         )));
         lines.push(Line::from(""));
     }
     lines.push(Line::from(Span::styled(
         format!("턴 {} · {}", entry.turn, entry.scene_id),
-        Style::default()
-            .fg(Color::LightCyan)
-            .add_modifier(Modifier::BOLD),
+        Styles::title(),
     )));
     // Per-turn metadata: the model and how long the generation took,
     // joined by " · " on one subtle line.
@@ -709,21 +729,18 @@ pub(crate) fn story_entry_lines(entry: &StoryStackEntry, first: bool) -> Vec<Lin
         meta.push(format!("생성 {}", fmt_duration(secs)));
     }
     if !meta.is_empty() {
-        lines.push(Line::from(Span::styled(
-            meta.join(" · "),
-            Style::default().fg(Color::DarkGray),
-        )));
+        lines.push(Line::from(Span::styled(meta.join(" · "), Styles::muted())));
     }
     if let Some(action) = &entry.player_action {
         lines.push(Line::from(Span::styled(
             "당신의 선택",
             Style::default()
-                .fg(Color::LightYellow)
+                .fg(Palette::ACCENT)
                 .add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(Span::styled(
             action.clone(),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(Palette::SELECTED),
         )));
         lines.push(Line::from(""));
     }
@@ -738,14 +755,14 @@ pub(crate) fn markdown_lines(input: &str) -> Vec<Line<'static>> {
             if let Some((speaker, dialogue)) = speaker_dialogue_line(raw) {
                 let speaker_style = if matches!(speaker, "당신" | "플레이어") {
                     Style::default()
-                        .fg(Color::LightCyan)
+                        .fg(Palette::PRIMARY)
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
-                        .fg(Color::LightMagenta)
+                        .fg(Palette::SPEAKER)
                         .add_modifier(Modifier::BOLD)
                 };
-                let dialogue_style = Style::default().fg(Color::LightYellow);
+                let dialogue_style = Style::default().fg(Palette::DIALOGUE);
                 let mut spans = vec![Span::styled(format!("{speaker}: "), speaker_style)];
                 spans.extend(inline_markdown(dialogue, dialogue_style));
                 return Line::from(spans);
@@ -760,7 +777,7 @@ pub(crate) fn markdown_lines(input: &str) -> Vec<Line<'static>> {
                     "",
                     rest,
                     Style::default()
-                        .fg(Color::LightCyan)
+                        .fg(Palette::PRIMARY)
                         .add_modifier(Modifier::BOLD),
                 )
             } else if let Some(rest) = raw.strip_prefix("## ") {
@@ -768,7 +785,7 @@ pub(crate) fn markdown_lines(input: &str) -> Vec<Line<'static>> {
                     "",
                     rest,
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(Palette::ACCENT)
                         .add_modifier(Modifier::BOLD),
                 )
             } else if let Some(rest) = raw.strip_prefix("# ") {
@@ -776,21 +793,21 @@ pub(crate) fn markdown_lines(input: &str) -> Vec<Line<'static>> {
                     "",
                     rest,
                     Style::default()
-                        .fg(Color::LightCyan)
+                        .fg(Palette::PRIMARY)
                         .add_modifier(Modifier::BOLD),
                 )
             } else if let Some(rest) = raw.strip_prefix("- ").or_else(|| raw.strip_prefix("* ")) {
-                ("• ", rest, Style::default().fg(Color::Gray))
+                ("• ", rest, Styles::subtle())
             } else if let Some(rest) = raw.strip_prefix("> ") {
-                ("│ ", rest, Style::default().fg(Color::LightYellow))
+                ("│ ", rest, Style::default().fg(Palette::DIALOGUE))
             } else {
                 (
                     "",
                     raw,
                     if dialogue {
-                        Style::default().fg(Color::LightYellow)
+                        Style::default().fg(Palette::DIALOGUE)
                     } else {
-                        Style::default().fg(Color::Reset)
+                        Styles::item_normal()
                     },
                 )
             };
@@ -843,7 +860,7 @@ fn inline_markdown(input: &str, base: Style) -> Vec<Span<'static>> {
             };
             spans.push(Span::styled(
                 after[..label_end].to_string(),
-                base.fg(Color::LightBlue).add_modifier(Modifier::UNDERLINED),
+                base.fg(Palette::PRIMARY).add_modifier(Modifier::UNDERLINED),
             ));
             rest = &after[label_end + 2 + url_end + 1..];
             continue;
@@ -854,7 +871,7 @@ fn inline_markdown(input: &str, base: Style) -> Vec<Span<'static>> {
         };
         let style = match marker {
             "~~" => base.add_modifier(Modifier::CROSSED_OUT),
-            "`" => base.fg(Color::LightMagenta).add_modifier(Modifier::BOLD),
+            "`" => base.fg(Palette::SPEAKER).add_modifier(Modifier::BOLD),
             "*" | "_" => base.add_modifier(Modifier::ITALIC),
             _ => base.add_modifier(Modifier::BOLD),
         };
@@ -964,22 +981,21 @@ fn render_choice_panel(
                 let m = secs / 60;
                 let s = secs % 60;
                 if m > 0 {
-                    format!("생성 진행 중... ({m}분 {s}초 소요 중) [C] 취소")
+                    format!("생성 진행 중... ({m}분 {s}초 소요 중) [C] 취소 · [R] 다시 만들기")
                 } else {
-                    format!("생성 진행 중... ({s}초 소요 중) [C] 취소")
+                    format!("생성 진행 중... ({s}초 소요 중) [C] 취소 · [R] 다시 만들기")
                 }
             }
-            None => "선택지 생성 대기 중... [C] 취소".to_string(),
+            None => "선택지 생성 대기 중... [C] 취소 · [R] 다시 만들기".to_string(),
         };
         vec![
             Line::from(Span::styled(
                 stage_label.to_string(),
-                Style::default().fg(Color::LightYellow),
+                Style::default()
+                    .fg(Palette::ACCENT)
+                    .add_modifier(Modifier::BOLD),
             )),
-            Line::from(Span::styled(
-                timer_subtext,
-                Style::default().fg(Color::DarkGray),
-            )),
+            Line::from(Span::styled(timer_subtext, Styles::muted())),
         ]
     } else {
         let mut lines = Vec::new();
@@ -998,16 +1014,21 @@ fn render_choice_panel(
             {
                 line.spans.insert(
                     0,
-                    Span::raw(if line_index == 0 && highlight {
-                        "▶ "
-                    } else {
-                        "  "
-                    }),
+                    Span::styled(
+                        if line_index == 0 && highlight {
+                            "▶ "
+                        } else {
+                            "  "
+                        },
+                        if highlight {
+                            Styles::item_selected()
+                        } else {
+                            Styles::item_normal()
+                        },
+                    ),
                 );
                 if highlight {
-                    line.style = Style::default()
-                        .fg(crate::theme::Palette::SELECTED)
-                        .add_modifier(Modifier::BOLD);
+                    line.style = Styles::item_selected();
                 }
                 lines.push(line);
             }
@@ -1040,9 +1061,11 @@ fn active_footer_segments(view: &AppViewModel, input_mode: bool, width: u16) -> 
         return vec![("[N]", " 게임 시작"), ("[?]", " 도움말")];
     }
     let has_choices = !view.choices.is_empty();
+    let has_undo = view.undo_checkpoint_id.is_some();
     // (visible, key, label, tier) — tier 2 shows only at the widest step.
-    let candidates: [(bool, &'static str, &'static str, u8); 9] = [
-        (has_choices, "[R]", " 선택지 다시 만들기", 2),
+    let candidates: [(bool, &'static str, &'static str, u8); 10] = [
+        (has_choices, "[R]", " 다시 만들기", 2),
+        (has_undo, "[U]", " 되돌리기", 1),
         (has_choices, "[I]", " 직접 입력", 0),
         (true, "[H]", " 기록", 2),
         (true, "[M]", " 기억", 2),
@@ -1117,10 +1140,44 @@ fn render_input_panel(frame: &mut Frame, area: Rect, input: &InputBuffer) {
     );
 }
 
+/// Centered confirmation for the one destructive shortcut that had none:
+/// in-game `n` resets the whole playthrough, and `StartNewGame` also clears
+/// the rewind ring, so undo cannot recover it. Mirrors the pack-delete
+/// confirm modal (DANGER border, Enter/Esc).
+pub fn render_new_game_confirm(frame: &mut Frame, area: Rect, turn: u32) {
+    let popup = crate::screens::popup::centered_rect(area, 60, 10);
+    frame.render_widget(Clear, popup);
+
+    let lines = vec![
+        Line::from(Span::styled(
+            format!("턴 {turn}의 진행을 지우고 새로 시작합니다."),
+            Styles::item_normal(),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "이 작업은 되돌릴 수 없습니다.",
+            Style::default().fg(Palette::CAUTION),
+        )),
+        Line::from(""),
+        Line::from(Span::styled("Enter 새 게임 · Esc 취소", Styles::muted())),
+    ];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BORDER_TYPE)
+        .border_style(Styles::border_danger())
+        .title(Span::styled(
+            " ⚠ 새 게임 ",
+            Style::default()
+                .fg(Palette::DANGER)
+                .add_modifier(Modifier::BOLD),
+        ));
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
 fn render_status_panel(frame: &mut Frame, area: Rect, view: &AppViewModel, input_mode: bool) {
     let block = Block::default()
         .borders(Borders::TOP)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Styles::border_muted());
     frame.render_widget(
         Paragraph::new(status_lines(view, area.width, input_mode)).block(block),
         area,
@@ -1157,7 +1214,7 @@ fn choice_lines(
     if let Some(preview) = preview.map(str::trim).filter(|preview| !preview.is_empty()) {
         let preview_lines = wrap_choice_label(preview, "   ↳ ", "     ", width);
         lines.extend(preview_lines.into_iter().map(|mut line| {
-            line.style = Style::default().fg(Color::DarkGray);
+            line.style = Styles::muted();
             line
         }));
     }
@@ -1222,7 +1279,7 @@ fn append_wrapped_word(
 }
 
 fn status_lines(view: &AppViewModel, width: u16, input_mode: bool) -> Vec<Line<'static>> {
-    let values = Line::from(status_values_prefix(view));
+    let values = status_values_line(view);
     if input_mode {
         return vec![values, Line::from(footer_spans(view, true, width))];
     }
@@ -1232,16 +1289,11 @@ fn status_lines(view: &AppViewModel, width: u16, input_mode: bool) -> Vec<Line<'
         vec![
             values,
             Line::from(vec![
-                Span::styled(
-                    "[N]",
-                    Style::default()
-                        .fg(Color::LightCyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(" 게임 시작", Style::default().fg(Color::DarkGray)),
-                Span::styled(FOOTER_SEPARATOR, Style::default().fg(Color::DarkGray)),
-                Span::styled("[?]", Style::default().fg(Color::LightCyan)),
-                Span::styled(" 도움말", Style::default().fg(Color::DarkGray)),
+                Span::styled("[N]", Styles::keycap()),
+                Span::styled(" 게임 시작", Styles::button_label()),
+                Span::styled(FOOTER_SEPARATOR, Styles::button_label()),
+                Span::styled("[?]", Styles::keycap()),
+                Span::styled(" 도움말", Styles::button_label()),
             ]),
         ]
     } else if view.loading.is_none() && view.error.is_none() {
@@ -1251,28 +1303,42 @@ fn status_lines(view: &AppViewModel, width: u16, input_mode: bool) -> Vec<Line<'
     }
 }
 
-fn status_values_prefix(view: &AppViewModel) -> String {
-    let stat = |label: &str, v: Option<i16>| match v {
-        Some(n) => format!("{label}:{n}"),
-        None => format!("{label}:—"),
+fn status_values_line(view: &AppViewModel) -> Line<'static> {
+    let stat = |label: &'static str, v: Option<i16>, color: Color| -> Vec<Span<'static>> {
+        let val = match v {
+            Some(n) => n.to_string(),
+            None => "—".to_string(),
+        };
+        vec![
+            Span::styled(format!("{label}:"), Styles::subtle()),
+            Span::styled(val, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        ]
     };
-    format!(
-        "{}  {}  {}  턴: {}",
-        stat("애정", view.status.affection),
-        stat("신뢰", view.status.trust),
-        stat("긴장", view.status.tension),
-        view.status.turn
-    )
+    let mut spans = Vec::new();
+    spans.extend(stat("애정", view.status.affection, Palette::ACCENT));
+    spans.push(Span::raw("  "));
+    spans.extend(stat("신뢰", view.status.trust, Palette::PRIMARY));
+    spans.push(Span::raw("  "));
+    spans.extend(stat("긴장", view.status.tension, Palette::CAUTION));
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled("턴: ", Styles::subtle()));
+    spans.push(Span::styled(
+        view.status.turn.to_string(),
+        Style::default()
+            .fg(Palette::PROSE)
+            .add_modifier(Modifier::BOLD),
+    ));
+    Line::from(spans)
 }
 
 fn render_error_overlay(frame: &mut Frame, area: Rect, err: &story_model::DomainErrorView) {
     let title = format!("오류: {}", err.title_ko);
     let body = Text::from(vec![
-        Line::from(err.message_ko.clone()),
+        Line::from(Span::styled(err.message_ko.clone(), Styles::item_normal())),
         Line::from(""),
         Line::from(Span::styled(
             "[R] 다시 시도   [Esc] 닫기".to_string(),
-            Style::default().add_modifier(Modifier::DIM),
+            Styles::muted(),
         )),
     ]);
     let w = (err.message_ko.width() as u16 + 4)
@@ -1289,10 +1355,13 @@ fn render_error_overlay(frame: &mut Frame, area: Rect, err: &story_model::Domain
     frame.render_widget(Clear, centered);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Red))
+        .border_type(BORDER_TYPE)
+        .border_style(Styles::border_danger())
         .title(Span::styled(
             title,
-            Style::default().add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Palette::DANGER)
+                .add_modifier(Modifier::BOLD),
         ));
     let para = Paragraph::new(body).block(block).wrap(Wrap { trim: false });
     frame.render_widget(para, centered);
@@ -1302,12 +1371,16 @@ fn render_error_overlay(frame: &mut Frame, area: Rect, err: &story_model::Domain
 /// story screen. The same table the Settings screen renders.
 pub fn render_help_overlay(frame: &mut Frame, area: Rect) {
     let (left, right) = keymap_lines_two_columns();
-    let popup = centered_rect(area, POPUP_WIDTH_WIDE, 20);
+    let popup = centered_rect(area, POPUP_WIDTH_WIDE, 22);
     frame.render_widget(Clear, popup);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::LightCyan))
-        .title("키 안내 · ? 또는 Esc로 닫기");
+        .border_type(BORDER_TYPE)
+        .border_style(Styles::border_primary())
+        .title(Span::styled(
+            " ✦ 키 안내 · ? 또는 Esc로 닫기 ✦ ",
+            Styles::title(),
+        ));
     let body = block.inner(popup);
     let columns =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(body);
@@ -1337,13 +1410,7 @@ fn risk_label(r: RiskLevel) -> &'static str {
 }
 
 fn risk_color(r: RiskLevel) -> Color {
-    match r {
-        RiskLevel::Safe => Color::Green,
-        RiskLevel::Low => Color::Cyan,
-        RiskLevel::Medium => Color::Yellow,
-        RiskLevel::High => Color::LightRed,
-        RiskLevel::Severe => Color::Red,
-    }
+    Styles::risk_color(r)
 }
 
 #[cfg(test)]
@@ -1384,6 +1451,7 @@ mod tests {
             },
             loading: None,
             error: None,
+            undo_checkpoint_id: None,
         }
     }
 
@@ -1448,6 +1516,51 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    #[test]
+    fn help_overlay_shows_every_group_and_row_without_clipping() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| super::render_help_overlay(f, f.area()))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buffer.area.height {
+            // Skip the spacer cell after double-width symbols so Hangul stays
+            // contiguous (same convention as `draw_with`).
+            let mut previous_was_wide = false;
+            for x in 0..buffer.area.width {
+                let symbol = buffer[(x, y)].symbol();
+                if previous_was_wide && symbol == " " {
+                    previous_was_wide = false;
+                    continue;
+                }
+                previous_was_wide = symbol.width() == 2;
+                out.push_str(symbol);
+            }
+            out.push('\n');
+        }
+
+        for fragment in [
+            "게임 화면",
+            "설정 화면에서",
+            // First and last game rows: nothing may clip between them.
+            "이전 선택",
+            "종료",
+            // Middle rows from both groups.
+            "직전 턴 되돌리기",
+            "다시 만들기",
+            "프로바이더 전환",
+            "표정 스프라이트",
+            "2벌식",
+        ] {
+            assert!(
+                out.contains(fragment),
+                "help overlay at 80x24 is missing '{fragment}' (clipped?)"
+            );
+        }
     }
 
     /// A checkerboard forces distinct halfblock glyphs/colors; a uniform
@@ -1712,6 +1825,23 @@ mod tests {
     }
 
     #[test]
+    fn footer_offers_undo_only_when_a_target_exists() {
+        use super::active_footer_segments;
+        let mut view = sample_view();
+        let without = active_footer_segments(&view, false, 200);
+        assert!(
+            !without.iter().any(|(key, _)| *key == "[U]"),
+            "no undo target: the footer must not advertise it"
+        );
+        view.undo_checkpoint_id = Some(story_model::uuid::Uuid::nil());
+        let with = active_footer_segments(&view, false, 200);
+        assert!(
+            with.iter().any(|(key, _)| *key == "[U]"),
+            "undo is advertised as soon as a previous turn exists"
+        );
+    }
+
+    #[test]
     fn input_mode_footer_swaps_to_editor_keys() {
         use super::active_footer_segments;
         let view = sample_view();
@@ -1765,10 +1895,14 @@ mod tests {
             out.push('\n');
         }
         assert!(out.contains("키 안내"), "{out}");
+        // Groups and the alias note replaced the flat per-row alias noise.
+        assert!(out.contains("게임 화면"), "{out}");
+        assert!(out.contains("설정 화면에서"), "{out}");
+        assert!(out.contains("2벌식"), "{out}");
         // Rows that used to be undocumented.
         assert!(out.contains("직접 입력"), "{out}");
-        assert!(out.contains("이전 생성 기록"), "{out}");
-        assert!(out.contains("도움말 오버레이"), "{out}");
+        assert!(out.contains("이전 기록"), "{out}");
+        assert!(out.contains("이 도움말"), "{out}");
     }
 
     #[test]
