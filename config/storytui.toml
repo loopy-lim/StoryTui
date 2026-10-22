@@ -65,3 +65,18 @@ context_budget_tokens = 24576
 # `auto` mode StoryTUI retries once without it only when the server cannot
 # satisfy the contract, then disables the capability for that session.
 structured_output = "auto"
+
+# 추가 프로바이더 프로필: TUI 설정 `e`에서 재시작 없이 전환한다. name은
+# [provider] 및 다른 항목과 중복되면 안 된다. 프로필별 기본 역할 모델도
+# 지정할 수 있고(전환/시작 시 그 프로필의 배정으로 복원), player가 TUI에서
+# 바꾼 값(user-settings의 [stage_models.<name>])이 이 기본값보다 우선한다.
+# 실제 모델 ID와 키는 storytui.local.toml에 둔다.
+#
+# [[providers]]
+# name = "openrouter"
+# base_url = "https://openrouter.ai/api/v1"
+# model = "사용하려는-모델-ID"
+# api_key_env = "MY_COMPATIBLE_KEY"
+# director_model = "기획-단계-기본-모델"
+# choice_model = "선택지-재작성-기본-모델"
+# writer_model = "본문-스트리밍-기본-모델"

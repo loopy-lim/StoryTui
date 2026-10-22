@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -12,8 +13,9 @@ pub struct FileConfig {
     pub provider: ProviderConfig,
     /// Additional named provider profiles (`[[providers]]`). The `[provider]`
     /// table above stays the default; entries here are selectable in the TUI.
+    /// Each entry may also carry per-profile role model defaults.
     #[serde(default)]
-    pub providers: Vec<ProviderConfig>,
+    pub providers: Vec<ProviderProfile>,
     /// Optional model override for the Director (planning & choice generation) step.
     #[serde(default)]
     pub director_model: Option<String>,
@@ -48,6 +50,43 @@ pub struct PlayerProfile {
     pub persona: Option<String>,
 }
 
+/// A `[[providers]]` entry: the adapter config plus optional per-profile role
+/// model defaults. `flatten` keeps the TOML shape of `ProviderConfig`
+/// untouched — the role fields are additive siblings of `base_url` etc.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ProviderProfile {
+    #[serde(flatten)]
+    pub config: ProviderConfig,
+    /// Optional Director (planning & choice generation) model default.
+    #[serde(default)]
+    pub director_model: Option<String>,
+    /// Optional lightweight choice-rewrite model default.
+    #[serde(default)]
+    pub choice_model: Option<String>,
+    /// Optional Writer (narration & prose stream) model default.
+    #[serde(default)]
+    pub writer_model: Option<String>,
+}
+
+/// Role model assignments for one provider profile. Every absent field
+/// inherits the next precedence level: the `[[providers]]` TOML default,
+/// then the file-wide default.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct StageModels {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub director: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub choice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub writer: Option<String>,
+}
+
+impl StageModels {
+    fn is_empty(&self) -> bool {
+        self.director.is_none() && self.choice.is_none() && self.writer.is_none()
+    }
+}
+
 /// Per-user generation preferences stored independently from the project
 /// provider configuration.
 ///
@@ -60,12 +99,21 @@ pub struct UserSettings {
     pub provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Legacy flat stage assignments from before they became per-profile.
+    /// Deserialized for older files; `fold_legacy_stage_models` migrates them
+    /// into [`UserSettings::stage_models`] and these fields are never written
+    /// again.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub director_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub choice_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub writer_model: Option<String>,
+    /// Per-profile role model assignments keyed by provider profile name
+    /// (`[stage_models.<name>]`). The active profile's entry wins over the
+    /// `[[providers]]` TOML defaults and the file-wide defaults.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub stage_models: BTreeMap<String, StageModels>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -91,10 +139,10 @@ pub struct UserSettings {
 }
 
 impl UserSettings {
-    fn apply_to(&self, provider: &mut ProviderConfig) {
-        if let Some(model) = &self.model {
-            provider.model = model.clone();
-        }
+    /// Sampling/context overrides are machine-level tastes: applied at load
+    /// and re-applied on provider switches. `model` is deliberately excluded —
+    /// a switch repairs the model against the new server's advertised list.
+    pub fn apply_sampling_overrides(&self, provider: &mut ProviderConfig) {
         if let Some(max_tokens) = self.max_tokens {
             provider.max_tokens = max_tokens;
         }
@@ -104,6 +152,25 @@ impl UserSettings {
         if let Some(temperature) = self.temperature {
             provider.temperature = temperature;
         }
+    }
+
+    /// Fold the legacy flat stage fields into the active profile's map entry
+    /// (only when the player has not already curated that profile) and clear
+    /// the flat fields so the next save completes the migration.
+    pub fn fold_legacy_stage_models(&mut self, active_profile: &str) {
+        if !self.stage_models.contains_key(active_profile) {
+            let legacy = StageModels {
+                director: self.director_model.clone(),
+                choice: self.choice_model.clone(),
+                writer: self.writer_model.clone(),
+            };
+            if !legacy.is_empty() {
+                self.stage_models.insert(active_profile.to_string(), legacy);
+            }
+        }
+        self.director_model = None;
+        self.choice_model = None;
+        self.writer_model = None;
     }
 }
 
@@ -233,6 +300,10 @@ pub struct RuntimeConfig {
     /// Every configured provider profile (base first), resolved and ready to
     /// be swapped in at runtime by the TUI provider picker.
     pub providers: Vec<ProviderConfig>,
+    /// Per-profile role model defaults from the `[[providers]]` TOML entries,
+    /// keyed by profile name. The user-settings `stage_models` map outranks
+    /// these; both outrank the file-wide defaults.
+    pub stage_defaults: BTreeMap<String, StageModels>,
     /// Base-profile model used as a safe fallback when a persisted user model
     /// is no longer advertised by the local server.
     pub fallback_model: String,
@@ -341,16 +412,17 @@ pub fn provider_roster(config_path: Option<&Path>) -> Result<Vec<ProviderConfig>
         )?);
     }
     let mut roster = vec![base];
-    for mut entry in file.providers {
-        if let Some(secret_path) = entry.api_key_file.clone() {
-            let label = format!("provider '{}'의 api_key_file", entry.name);
-            entry.api_key = Some(read_secret_file(
+    for entry in file.providers {
+        let mut config = entry.config;
+        if let Some(secret_path) = config.api_key_file.clone() {
+            let label = format!("provider '{}'의 api_key_file", config.name);
+            config.api_key = Some(read_secret_file(
                 &secret_path,
                 source_path.as_deref(),
                 &label,
             )?);
         }
-        roster.push(entry);
+        roster.push(config);
     }
     Ok(roster)
 }
@@ -398,22 +470,22 @@ pub fn load(cli: &CliOptions) -> Result<RuntimeConfig, String> {
     // The provider roster: the base `[provider]` first, then `[[providers]]`
     // entries. Names must be unique — the TUI picker and the persisted
     // user preference address profiles by name.
-    let mut providers = std::mem::take(&mut file.providers);
-    for extra in &providers {
-        if extra.name == file.provider.name {
+    let mut extras = std::mem::take(&mut file.providers);
+    for extra in &extras {
+        if extra.config.name == file.provider.name {
             return Err(format!(
                 "provider 이름이 중복됩니다: '{}' — [provider]와 [[providers]] 항목은 서로 다른 name을 가져야 합니다.",
-                extra.name
+                extra.config.name
             ));
         }
     }
     {
         let mut seen = std::collections::BTreeSet::new();
-        for extra in &providers {
-            if !seen.insert(extra.name.as_str()) {
+        for extra in &extras {
+            if !seen.insert(extra.config.name.as_str()) {
                 return Err(format!(
                     "provider 이름이 중복됩니다: '{}' — [[providers]] 항목끼리 name을 구별해 주세요.",
-                    extra.name
+                    extra.config.name
                 ));
             }
         }
@@ -421,22 +493,37 @@ pub fn load(cli: &CliOptions) -> Result<RuntimeConfig, String> {
     // Resolve per-profile key files up front so the TUI can switch to any
     // profile without a restart; env-var credentials stay lazy (resolved per
     // provider construction).
-    for entry in providers.iter_mut() {
-        if let Some(secret_path) = entry.api_key_file.clone() {
-            let label = format!("provider '{}'의 api_key_file", entry.name);
-            entry.api_key = Some(read_secret_file(
+    for entry in extras.iter_mut() {
+        if let Some(secret_path) = entry.config.api_key_file.clone() {
+            let label = format!("provider '{}'의 api_key_file", entry.config.name);
+            entry.config.api_key = Some(read_secret_file(
                 &secret_path,
                 source_path.as_deref(),
                 &label,
             )?);
         }
     }
+    // Per-profile role model defaults, keyed for the precedence chain
+    // (user-settings map first, then these).
+    let mut stage_defaults: BTreeMap<String, StageModels> = BTreeMap::new();
+    let mut providers = Vec::with_capacity(extras.len() + 1);
+    for entry in extras {
+        stage_defaults.insert(
+            entry.config.name.clone(),
+            StageModels {
+                director: entry.director_model,
+                choice: entry.choice_model,
+                writer: entry.writer_model,
+            },
+        );
+        providers.push(entry.config);
+    }
     // The base profile is switchable too — without this, one runtime switch
     // would make the original `[provider]` unreachable until restart.
     providers.insert(0, file.provider.clone());
 
     let fallback_model = file.provider.model.clone();
-    let settings = load_user_settings(&file.save_dir)?;
+    let mut settings = load_user_settings(&file.save_dir)?;
     // A persisted provider choice selects the active profile before model
     // overrides are applied, so models always resolve against the right
     // server's list.
@@ -450,16 +537,30 @@ pub fn load(cli: &CliOptions) -> Result<RuntimeConfig, String> {
             "persisted provider no longer exists; keeping the base profile"
         );
     }
-    settings.apply_to(&mut file.provider);
-    if let Some(dm) = &settings.director_model {
-        file.director_model = Some(dm.clone());
+    if let Some(model) = &settings.model {
+        file.provider.model = model.clone();
     }
-    if let Some(cm) = &settings.choice_model {
-        file.choice_model = Some(cm.clone());
-    }
-    if let Some(wm) = &settings.writer_model {
-        file.writer_model = Some(wm.clone());
-    }
+    settings.apply_sampling_overrides(&mut file.provider);
+    // Stage assignments: the active profile's saved choice first, then the
+    // `[[providers]]` TOML default, then the file-wide default. Legacy flat
+    // user-settings fields fold into the active profile's entry first so an
+    // old file keeps working and migrates on the next save.
+    let active_profile = file.provider.name.clone();
+    settings.fold_legacy_stage_models(&active_profile);
+    let saved = settings.stage_models.get(&active_profile);
+    let default = stage_defaults.get(&active_profile);
+    file.director_model = saved
+        .and_then(|s| s.director.clone())
+        .or_else(|| default.and_then(|d| d.director.clone()))
+        .or(file.director_model.take());
+    file.choice_model = saved
+        .and_then(|s| s.choice.clone())
+        .or_else(|| default.and_then(|d| d.choice.clone()))
+        .or(file.choice_model.take());
+    file.writer_model = saved
+        .and_then(|s| s.writer.clone())
+        .or_else(|| default.and_then(|d| d.writer.clone()))
+        .or(file.writer_model.take());
 
     if let Some(value) = &cli.model {
         file.provider.model = value.clone();
@@ -508,6 +609,7 @@ pub fn load(cli: &CliOptions) -> Result<RuntimeConfig, String> {
     Ok(RuntimeConfig {
         provider: file.provider,
         providers,
+        stage_defaults,
         fallback_model,
         director_model: file.director_model,
         choice_model: file.choice_model,
@@ -529,9 +631,10 @@ mod tests {
     use story_provider::MaxTokensField;
 
     use super::{
-        CliOptions, FileConfig, UserSettings, load, load_user_settings, preferred_config_path,
-        save_user_settings, user_settings_path,
+        CliOptions, FileConfig, StageModels, UserSettings, load, load_user_settings,
+        preferred_config_path, save_user_settings, user_settings_path,
     };
+    use std::collections::BTreeMap;
 
     fn test_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -931,12 +1034,14 @@ mod tests {
                 director_model: None,
                 choice_model: Some("saved-choice-model".to_string()),
                 writer_model: None,
+                stage_models: BTreeMap::new(),
                 max_tokens: Some(300),
                 context_budget_tokens: Some(400),
                 temperature: Some(0.7),
                 tts_enabled: None,
                 images_enabled: None,
                 expressions_enabled: None,
+                image_protocol: None,
                 use_director_writer: None,
             },
         )
@@ -965,14 +1070,22 @@ mod tests {
             provider: None,
             model: Some("qwen-local".to_string()),
             director_model: None,
-            choice_model: Some("qwen-choice".to_string()),
+            choice_model: None,
             writer_model: None,
+            stage_models: BTreeMap::from([(
+                "omlx-local".to_string(),
+                StageModels {
+                    choice: Some("qwen-choice".to_string()),
+                    ..StageModels::default()
+                },
+            )]),
             max_tokens: Some(1_800),
             context_budget_tokens: None,
             temperature: Some(0.2),
             tts_enabled: Some(true),
             images_enabled: Some(false),
             expressions_enabled: Some(false),
+            image_protocol: Some("halfblocks".to_string()),
             use_director_writer: Some(true),
         };
         let path = user_settings_path(&dir);
@@ -988,7 +1101,8 @@ mod tests {
         assert!(text.contains("model = \"qwen-local\""));
         assert!(text.contains("max_tokens = 1800"));
         assert!(text.contains("temperature = 0.2"));
-        assert!(text.contains("choice_model = \"qwen-choice\""));
+        assert!(text.contains("[stage_models.omlx-local]"));
+        assert!(text.contains("choice = \"qwen-choice\""));
         assert!(!text.contains("context_budget_tokens"));
         assert!(!text.contains("base_url"));
         assert_eq!(
@@ -1075,6 +1189,170 @@ mod tests {
         );
         assert_eq!(runtime.provider.api_key_file, None);
         assert_eq!(runtime.provider.api_key, None);
+        fs::remove_dir_all(dir).expect("clean test directory");
+    }
+
+    #[test]
+    fn profile_toml_role_fields_become_stage_defaults_and_seed_active_profile() {
+        let dir = test_dir("profile-stage-defaults");
+        let pack_dir = dir.join("pack");
+        let config_path = dir.join("storytui.toml");
+        fs::create_dir_all(&pack_dir).expect("pack directory");
+        fs::write(
+            &config_path,
+            format!(
+                concat!(
+                    "save_dir = \"{}\"\n",
+                    "[provider]\n",
+                    "name = \"omlx-local\"\n",
+                    "model = \"base-model\"\n",
+                    "[[providers]]\n",
+                    "name = \"openrouter\"\n",
+                    "base_url = \"https://openrouter.ai/api/v1\"\n",
+                    "model = \"or-main\"\n",
+                    "api_key_env = \"OPENROUTER_KEY\"\n",
+                    "director_model = \"or-director\"\n",
+                    "writer_model = \"or-writer\"\n",
+                ),
+                dir.join("saves").display()
+            ),
+        )
+        .expect("config");
+
+        let runtime = load(&CliOptions {
+            provider_config: Some(config_path.clone()),
+            pack: Some(pack_dir.clone()),
+            ..CliOptions::default()
+        })
+        .expect("load config");
+        // Defaults are keyed by profile name regardless of activity.
+        let defaults = runtime.stage_defaults.get("openrouter").expect("defaults");
+        assert_eq!(defaults.director.as_deref(), Some("or-director"));
+        assert_eq!(defaults.writer.as_deref(), Some("or-writer"));
+        assert_eq!(defaults.choice, None);
+
+        // A persisted selection activates the profile; its TOML defaults seed
+        // the runtime stage fields where no saved choice exists.
+        save_user_settings(
+            &runtime.save_dir,
+            &UserSettings {
+                provider: Some("openrouter".to_string()),
+                ..UserSettings::default()
+            },
+        )
+        .expect("save choice");
+        let runtime = load(&CliOptions {
+            provider_config: Some(config_path),
+            pack: Some(pack_dir),
+            ..CliOptions::default()
+        })
+        .expect("load config");
+        assert_eq!(runtime.provider.name, "openrouter");
+        assert_eq!(runtime.director_model.as_deref(), Some("or-director"));
+        assert_eq!(runtime.writer_model.as_deref(), Some("or-writer"));
+        assert_eq!(runtime.choice_model, None);
+        fs::remove_dir_all(dir).expect("clean test directory");
+    }
+
+    #[test]
+    fn user_settings_stage_models_outrank_profile_toml_defaults() {
+        let dir = test_dir("stage-precedence");
+        let pack_dir = dir.join("pack");
+        let config_path = dir.join("storytui.toml");
+        fs::create_dir_all(&pack_dir).expect("pack directory");
+        fs::write(
+            &config_path,
+            format!(
+                concat!(
+                    "save_dir = \"{}\"\n",
+                    "[provider]\n",
+                    "name = \"omlx-local\"\n",
+                    "model = \"base-model\"\n",
+                    "[[providers]]\n",
+                    "name = \"cloud\"\n",
+                    "base_url = \"https://api.groq.com/openai/v1\"\n",
+                    "model = \"cloud-main\"\n",
+                    "director_model = \"toml-director\"\n",
+                    "choice_model = \"toml-choice\"\n",
+                ),
+                dir.join("saves").display()
+            ),
+        )
+        .expect("config");
+        save_user_settings(
+            &dir.join("saves"),
+            &UserSettings {
+                provider: Some("cloud".to_string()),
+                stage_models: BTreeMap::from([(
+                    "cloud".to_string(),
+                    StageModels {
+                        director: Some("saved-director".to_string()),
+                        ..StageModels::default()
+                    },
+                )]),
+                ..UserSettings::default()
+            },
+        )
+        .expect("save settings");
+
+        let runtime = load(&CliOptions {
+            provider_config: Some(config_path),
+            pack: Some(pack_dir),
+            ..CliOptions::default()
+        })
+        .expect("load config");
+
+        // Saved choice wins over the TOML default; a field the saved entry
+        // omits falls through to the TOML default.
+        assert_eq!(runtime.director_model.as_deref(), Some("saved-director"));
+        assert_eq!(runtime.choice_model.as_deref(), Some("toml-choice"));
+        fs::remove_dir_all(dir).expect("clean test directory");
+    }
+
+    #[test]
+    fn legacy_flat_stage_fields_fold_into_the_active_profile() {
+        let dir = test_dir("legacy-stage-fold");
+        let pack_dir = dir.join("pack");
+        let config_path = dir.join("storytui.toml");
+        fs::create_dir_all(&pack_dir).expect("pack directory");
+        fs::write(
+            &config_path,
+            format!(
+                "save_dir = \"{}\"\n[provider]\nname = \"omlx-local\"\nmodel = \"base-model\"\n",
+                dir.join("saves").display()
+            ),
+        )
+        .expect("config");
+        // Old-style flat file: no stage_models map, flat fields only.
+        save_user_settings(
+            &dir.join("saves"),
+            &UserSettings {
+                choice_model: Some("old-choice".to_string()),
+                ..UserSettings::default()
+            },
+        )
+        .expect("save legacy settings");
+
+        let runtime = load(&CliOptions {
+            provider_config: Some(config_path),
+            pack: Some(pack_dir),
+            ..CliOptions::default()
+        })
+        .expect("load config");
+
+        // The flat value seeds the active profile's assignment...
+        assert_eq!(runtime.choice_model.as_deref(), Some("old-choice"));
+        // ...and the same fold the host performs would persist it per profile.
+        let mut migrated = load_user_settings(&runtime.save_dir).expect("reload");
+        migrated.fold_legacy_stage_models(&runtime.provider.name);
+        assert_eq!(
+            migrated
+                .stage_models
+                .get("omlx-local")
+                .and_then(|s| s.choice.as_deref()),
+            Some("old-choice")
+        );
+        assert_eq!(migrated.choice_model, None, "flat fields are cleared");
         fs::remove_dir_all(dir).expect("clean test directory");
     }
 }

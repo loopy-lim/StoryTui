@@ -203,6 +203,7 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
     // engine/resume stamping: every later reader (resume restore, pack swap,
     // new game, saves) reads `config.use_director_writer`.
     let mut user_settings = load_user_settings(&config.save_dir)?;
+    user_settings.fold_legacy_stage_models(&config.provider.name);
     config.use_director_writer = user_settings
         .use_director_writer
         .unwrap_or(config.use_director_writer);
@@ -280,9 +281,13 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
         user_settings.model = Some(provider_config.model.clone());
     }
     if repaired_stage_models {
-        user_settings.director_model = config.director_model.clone();
-        user_settings.choice_model = config.choice_model.clone();
-        user_settings.writer_model = config.writer_model.clone();
+        let entry = user_settings
+            .stage_models
+            .entry(config.provider.name.clone())
+            .or_default();
+        entry.director = config.director_model.clone();
+        entry.choice = config.choice_model.clone();
+        entry.writer = config.writer_model.clone();
     }
     if repaired_main_model || repaired_stage_models {
         save_user_settings(&config.save_dir, &user_settings)?;
@@ -727,6 +732,7 @@ async fn handle_ui_requests(
         settings::apply_model(
             app,
             model,
+            config,
             provider_config,
             provider,
             user_settings,

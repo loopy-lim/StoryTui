@@ -9,7 +9,7 @@ use story_provider::{LlmProvider, OpenAiCompatibleProvider, ProviderConfig};
 use story_tts::{TtsService, TtsStatus};
 use story_tui::App;
 
-use storytui::config::{RuntimeConfig, UserSettings, save_user_settings};
+use storytui::config::{RuntimeConfig, StageModels, UserSettings, save_user_settings};
 use storytui::diagnostic::provider_config_safe_with_models;
 
 #[allow(clippy::too_many_arguments)] // the projection stays explicit at the host boundary
@@ -255,7 +255,7 @@ pub async fn reprobe_if_unconfigured(
                 if let Err(error) = save_user_settings(&config.save_dir, user_settings) {
                     tracing::warn!(%error, "auto-selected model could not be persisted");
                 }
-                refresh_projection(app, provider_config, provider, user_settings, tts).await;
+                refresh_projection(app, provider_config, provider, config, tts).await;
                 refresh_model_list(app, provider, provider_config, false).await;
                 tracing::info!(
                     base_url = %base_url,
@@ -275,12 +275,12 @@ pub async fn reprobe_if_unconfigured(
 }
 
 /// Re-project the Settings screen after a model-stage activation: probe
-/// health, read back the persisted overrides, and refresh the display.
+/// health, read back the session assignments, and refresh the display.
 async fn refresh_projection(
     app: &mut App,
     provider_config: &ProviderConfig,
     provider: &OpenAiCompatibleProvider,
-    user_settings: &UserSettings,
+    config: &RuntimeConfig,
     tts: &TtsService,
 ) {
     let health = provider
@@ -292,9 +292,9 @@ async fn refresh_projection(
         app,
         provider_config,
         health,
-        user_settings.director_model.clone(),
-        user_settings.choice_model.clone(),
-        user_settings.writer_model.clone(),
+        config.director_model.clone(),
+        config.choice_model.clone(),
+        config.writer_model.clone(),
         &tts_status,
         app.images_enabled(),
         app.image_backend_label(),
@@ -303,27 +303,76 @@ async fn refresh_projection(
     );
 }
 
-/// Activate a different configured provider profile at runtime.
-///
-/// Rebuilds the provider (fresh endpoint + credentials), re-probes health,
-/// repairs models that the new server does not advertise (mirroring the
-/// startup repair), persists the choice, and refreshes the picker + settings
-/// projection. The engine state is untouched — a provider swap is transparent
-/// to the story in progress.
-#[allow(clippy::too_many_arguments)] // mirrors the other apply_* activation signatures
-pub async fn apply_provider(
-    app: &mut App,
+/// Resolve all three stage assignments for a provider switch. Each stage
+/// follows the precedence chain — the profile's saved choice, then the
+/// `[[providers]]` TOML default, then the value in effect (carried over from
+/// the previous profile) — and a desired model the new server does not
+/// advertise is repaired to the active model, the same semantics as the
+/// startup preflight. Returns the resolved assignments and whether any repair
+/// happened, so the caller can decide persistence and log with its own
+/// context. Pure: no I/O, no provider calls.
+pub fn resolve_stage_assignments(
+    saved: Option<&StageModels>,
+    profile_default: Option<&StageModels>,
+    current: &StageModels,
+    advertised: &[String],
+    active_model: &str,
+) -> (StageModels, bool) {
+    let mut repaired = false;
+    let mut stage = |saved: Option<String>,
+                     default: Option<String>,
+                     carried: Option<String>|
+     -> Option<String> {
+        let desired = saved.or(default).or(carried);
+        if let Some(model) = &desired
+            && !advertised.is_empty()
+            && !advertised
+                .iter()
+                .any(|advertised_model| advertised_model == model)
+        {
+            repaired = true;
+            return Some(active_model.to_string());
+        }
+        desired
+    };
+    let resolved = StageModels {
+        director: stage(
+            saved.and_then(|s| s.director.clone()),
+            profile_default.and_then(|d| d.director.clone()),
+            current.director.clone(),
+        ),
+        choice: stage(
+            saved.and_then(|s| s.choice.clone()),
+            profile_default.and_then(|d| d.choice.clone()),
+            current.choice.clone(),
+        ),
+        writer: stage(
+            saved.and_then(|s| s.writer.clone()),
+            profile_default.and_then(|d| d.writer.clone()),
+            current.writer.clone(),
+        ),
+    };
+    (resolved, repaired)
+}
+
+/// Core of a provider switch, shared by the TUI path: re-apply the
+/// machine-level sampling overrides, rebuild the provider, restore this
+/// profile's stage assignments (saved → TOML default → carried over, with
+/// stale repair), and persist the choice. Returns the observed health for the
+/// caller to project, or `None` when the profile name is not configured. The
+/// engine state is untouched — a provider swap is transparent to the story in
+/// progress.
+pub async fn switch_provider(
     name: &str,
     providers: &[ProviderConfig],
     provider_config: &mut ProviderConfig,
     provider: &mut Arc<OpenAiCompatibleProvider>,
     user_settings: &mut UserSettings,
     config: &mut RuntimeConfig,
-    tts: &TtsService,
-) -> Result<(), String> {
+) -> Result<Option<ProviderHealth>, String> {
     let Some(selected) = providers.iter().find(|entry| entry.name == name) else {
         tracing::warn!(provider = %name, "requested provider is not configured");
-        return Ok(());
+        return Ok(None);
     };
     tracing::info!(
         from = %provider_config.name,
@@ -332,13 +381,17 @@ pub async fn apply_provider(
         "switching provider"
     );
     // Build before swapping any state: a failed construction (rare — client
-    // build) must leave the old provider fully in charge.
+    // build) must leave the old provider fully in charge. Sampling overrides
+    // are machine-level tastes and travel across switches; `model` does not —
+    // the repair below resolves it against the new server's advertised list.
+    let mut selected = selected.clone();
+    user_settings.apply_sampling_overrides(&mut selected);
     let rebuilt = Arc::new(
         OpenAiCompatibleProvider::new(selected.clone())
             .map_err(|e| format!("프로바이더 '{name}'를 적용하지 못했습니다: {e}"))?,
     );
-    *provider_config = selected.clone();
-    config.provider = selected.clone();
+    *provider_config = selected;
+    config.provider = provider_config.clone();
     *provider = rebuilt;
 
     let health = provider
@@ -363,40 +416,85 @@ pub async fn apply_provider(
             provider_config.model = model;
             config.provider = provider_config.clone();
         }
-        for stage in [
-            &mut config.director_model,
-            &mut config.choice_model,
-            &mut config.writer_model,
-        ] {
-            if let Some(current) = stage.clone()
-                && !advertised.iter().any(|model| model == &current)
-            {
-                tracing::warn!(
-                    stale_model = %current,
-                    provider = %name,
-                    "stage model is not advertised by the new provider; using the active model"
-                );
-                *stage = Some(provider_config.model.clone());
-            }
-        }
     }
 
-    // Persist the provider choice and the (possibly repaired) models.
+    // Restore this profile's stage assignments: its saved choice first, then
+    // its `[[providers]]` TOML default, then the assignments in effect (the
+    // previous profile's), with stale values repaired to the active model.
+    let current = StageModels {
+        director: config.director_model.clone(),
+        choice: config.choice_model.clone(),
+        writer: config.writer_model.clone(),
+    };
+    let (resolved, repaired) = resolve_stage_assignments(
+        user_settings.stage_models.get(name),
+        config.stage_defaults.get(name),
+        &current,
+        &advertised,
+        &provider_config.model,
+    );
+    if repaired {
+        tracing::warn!(
+            provider = %name,
+            director = ?resolved.director,
+            choice = ?resolved.choice,
+            writer = ?resolved.writer,
+            "stage assignments repaired against the new provider's advertised list"
+        );
+    }
+    config.director_model = resolved.director.clone();
+    config.choice_model = resolved.choice.clone();
+    config.writer_model = resolved.writer.clone();
+    // Persist under this profile's name when the player curated it or a
+    // repair fired. Pure carry-over is not recorded: a `[[providers]]`
+    // default added later must not be shadowed by inherited values.
+    if user_settings.stage_models.contains_key(name) || repaired {
+        user_settings
+            .stage_models
+            .insert(name.to_string(), resolved);
+    }
+
+    // Persist the provider choice and the (possibly repaired) active model.
     user_settings.provider = Some(name.to_string());
     user_settings.model = Some(provider_config.model.clone());
-    user_settings.director_model = config.director_model.clone();
-    user_settings.choice_model = config.choice_model.clone();
-    user_settings.writer_model = config.writer_model.clone();
     save_user_settings(&config.save_dir, user_settings)?;
+    Ok(Some(health))
+}
 
+/// Activate a different configured provider profile at runtime: run the
+/// [`switch_provider`] core, then refresh the settings projection, the
+/// provider picker roster, and the model list.
+#[allow(clippy::too_many_arguments)] // mirrors the other apply_* activation signatures
+pub async fn apply_provider(
+    app: &mut App,
+    name: &str,
+    providers: &[ProviderConfig],
+    provider_config: &mut ProviderConfig,
+    provider: &mut Arc<OpenAiCompatibleProvider>,
+    user_settings: &mut UserSettings,
+    config: &mut RuntimeConfig,
+    tts: &TtsService,
+) -> Result<(), String> {
+    let Some(health) = switch_provider(
+        name,
+        providers,
+        provider_config,
+        provider,
+        user_settings,
+        config,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
     let tts_status = tts.status().await;
     refresh_view(
         app,
         provider_config,
         health,
-        user_settings.director_model.clone(),
-        user_settings.choice_model.clone(),
-        user_settings.writer_model.clone(),
+        config.director_model.clone(),
+        config.choice_model.clone(),
+        config.writer_model.clone(),
         &tts_status,
         app.images_enabled(),
         app.image_backend_label(),
@@ -414,9 +512,11 @@ pub async fn apply_provider(
 
 /// Persist and activate a newly selected model. This creates a fresh provider
 /// so later generation requests cannot retain the prior model configuration.
+#[allow(clippy::too_many_arguments)] // mirrors the other apply_* activation signatures
 pub async fn apply_model(
     app: &mut App,
     model: String,
+    config: &RuntimeConfig,
     provider_config: &mut ProviderConfig,
     provider: &mut Arc<OpenAiCompatibleProvider>,
     user_settings: &mut UserSettings,
@@ -430,11 +530,12 @@ pub async fn apply_model(
         OpenAiCompatibleProvider::new(provider_config.clone())
             .map_err(|e| format!("선택한 모델을 적용하지 못했습니다: {e}"))?,
     );
-    refresh_projection(app, provider_config, provider, user_settings, tts).await;
+    refresh_projection(app, provider_config, provider, config, tts).await;
     Ok(())
 }
 
-/// Persist and activate a newly selected Director model.
+/// Persist and activate a newly selected Director model, recorded under the
+/// active profile so a later switch restores it.
 pub async fn apply_director_model(
     app: &mut App,
     model: String,
@@ -445,13 +546,18 @@ pub async fn apply_director_model(
     tts: &TtsService,
 ) -> Result<(), String> {
     config.director_model = Some(model.clone());
-    user_settings.director_model = Some(model);
+    user_settings
+        .stage_models
+        .entry(config.provider.name.clone())
+        .or_default()
+        .director = Some(model);
     save_user_settings(&config.save_dir, user_settings)?;
-    refresh_projection(app, provider_config, provider, user_settings, tts).await;
+    refresh_projection(app, provider_config, provider, config, tts).await;
     Ok(())
 }
 
-/// Persist and activate the lightweight choice-rewrite model.
+/// Persist and activate the lightweight choice-rewrite model, recorded under
+/// the active profile so a later switch restores it.
 pub async fn apply_choice_model(
     app: &mut App,
     model: String,
@@ -462,13 +568,18 @@ pub async fn apply_choice_model(
     tts: &TtsService,
 ) -> Result<(), String> {
     config.choice_model = Some(model.clone());
-    user_settings.choice_model = Some(model);
+    user_settings
+        .stage_models
+        .entry(config.provider.name.clone())
+        .or_default()
+        .choice = Some(model);
     save_user_settings(&config.save_dir, user_settings)?;
-    refresh_projection(app, provider_config, provider, user_settings, tts).await;
+    refresh_projection(app, provider_config, provider, config, tts).await;
     Ok(())
 }
 
-/// Persist and activate a newly selected Writer model.
+/// Persist and activate a newly selected Writer model, recorded under the
+/// active profile so a later switch restores it.
 pub async fn apply_writer_model(
     app: &mut App,
     model: String,
@@ -479,9 +590,13 @@ pub async fn apply_writer_model(
     tts: &TtsService,
 ) -> Result<(), String> {
     config.writer_model = Some(model.clone());
-    user_settings.writer_model = Some(model);
+    user_settings
+        .stage_models
+        .entry(config.provider.name.clone())
+        .or_default()
+        .writer = Some(model);
     save_user_settings(&config.save_dir, user_settings)?;
-    refresh_projection(app, provider_config, provider, user_settings, tts).await;
+    refresh_projection(app, provider_config, provider, config, tts).await;
     Ok(())
 }
 
@@ -489,7 +604,15 @@ pub async fn apply_writer_model(
 mod tests {
     use super::{
         DiscoveryOutcome, filter_chat_models, pick_auto_model, probe_candidates,
-        reconcile_active_model, server_down_home_status, unconfigured_home_status,
+        reconcile_active_model, resolve_stage_assignments, server_down_home_status,
+        switch_provider, unconfigured_home_status,
+    };
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use story_provider::{OpenAiCompatibleProvider, ProviderConfig};
+    use story_tts::TtsConfig;
+    use storytui::config::{
+        PlayerProfile, RuntimeConfig, StageModels, UserSettings, load_user_settings,
     };
 
     #[test]
@@ -581,5 +704,216 @@ mod tests {
         let (line, attention) = server_down_home_status();
         assert!(!attention);
         assert!(line.contains("연결할 수 없어요"));
+    }
+
+    #[test]
+    fn resolve_restores_saved_assignments_over_carried_ones() {
+        let saved = StageModels {
+            director: Some("b-dir".to_string()),
+            writer: Some("b-wri".to_string()),
+            ..StageModels::default()
+        };
+        let current = StageModels {
+            director: Some("a-dir".to_string()),
+            choice: Some("a-cho".to_string()),
+            writer: Some("a-wri".to_string()),
+        };
+        let advertised = vec![
+            "b-dir".to_string(),
+            "a-cho".to_string(),
+            "b-wri".to_string(),
+        ];
+        let (resolved, repaired) =
+            resolve_stage_assignments(Some(&saved), None, &current, &advertised, "fallback");
+        // The profile's own choice wins.
+        assert_eq!(resolved.director.as_deref(), Some("b-dir"));
+        // A field the saved entry omits inherits the carried-over value.
+        assert_eq!(resolved.choice.as_deref(), Some("a-cho"));
+        assert_eq!(resolved.writer.as_deref(), Some("b-wri"));
+        assert!(!repaired);
+    }
+
+    #[test]
+    fn resolve_falls_back_to_profile_defaults_then_repairs_stale() {
+        let default = StageModels {
+            director: Some("d-dir".to_string()),
+            ..StageModels::default()
+        };
+        let current = StageModels {
+            director: Some("a-dir".to_string()),
+            choice: Some("a-cho".to_string()),
+            writer: Some("stale".to_string()),
+        };
+        let advertised = vec![
+            "d-dir".to_string(),
+            "a-cho".to_string(),
+            "fallback".to_string(),
+        ];
+        let (resolved, repaired) =
+            resolve_stage_assignments(None, Some(&default), &current, &advertised, "fallback");
+        // TOML default outranks the carried-over assignment.
+        assert_eq!(resolved.director.as_deref(), Some("d-dir"));
+        assert_eq!(resolved.choice.as_deref(), Some("a-cho"));
+        // A carried-over model the new server does not advertise is repaired.
+        assert_eq!(resolved.writer.as_deref(), Some("fallback"));
+        assert!(repaired);
+    }
+
+    #[test]
+    fn resolve_keeps_everything_when_nothing_is_advertised() {
+        // list_models failed (empty advertised): restore as saved, no repair —
+        // a down server must not rewrite the profile's assignments.
+        let saved = StageModels {
+            director: Some("gone".to_string()),
+            ..StageModels::default()
+        };
+        let (resolved, repaired) =
+            resolve_stage_assignments(Some(&saved), None, &StageModels::default(), &[], "fallback");
+        assert_eq!(resolved.director.as_deref(), Some("gone"));
+        assert!(!repaired);
+    }
+
+    fn switch_test_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "storytui-switch-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create test directory");
+        dir
+    }
+
+    /// A loopback URL whose port is closed: connect is refused instantly, so
+    /// health probing and model listing fail without waiting on timeouts.
+    fn dead_profile(name: &str, model: &str) -> ProviderConfig {
+        ProviderConfig {
+            name: name.to_string(),
+            model: model.to_string(),
+            base_url: "http://127.0.0.1:1".to_string(),
+            connect_timeout_ms: 200,
+            request_timeout_ms: 500,
+            max_retries: 0,
+            ..ProviderConfig::default()
+        }
+    }
+
+    fn runtime_for(save_dir: PathBuf, providers: Vec<ProviderConfig>) -> RuntimeConfig {
+        let active = providers[0].clone();
+        RuntimeConfig {
+            provider: active,
+            providers,
+            stage_defaults: Default::default(),
+            fallback_model: String::new(),
+            director_model: None,
+            choice_model: None,
+            writer_model: None,
+            tts: TtsConfig::default(),
+            save_dir,
+            player: PlayerProfile::default(),
+            use_director_writer: false,
+            pack_dir: PathBuf::from("."),
+            source_path: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn switch_restores_saved_stage_assignments_without_a_server() {
+        let save_dir = switch_test_dir("restore");
+        let profile_a = dead_profile("a", "a-main");
+        let profile_b = dead_profile("b", "b-main");
+        let mut config = runtime_for(save_dir.clone(), vec![profile_a.clone(), profile_b.clone()]);
+        config.director_model = Some("a-dir".to_string());
+        config.choice_model = Some("a-cho".to_string());
+        config.writer_model = Some("a-wri".to_string());
+
+        let mut provider_config = profile_a;
+        let mut provider =
+            Arc::new(OpenAiCompatibleProvider::new(provider_config.clone()).expect("provider"));
+        let mut user_settings = UserSettings::default();
+        user_settings.stage_models.insert(
+            "b".to_string(),
+            StageModels {
+                director: Some("b-dir".to_string()),
+                writer: Some("b-wri".to_string()),
+                ..StageModels::default()
+            },
+        );
+
+        // Clone the roster: the call also needs `config` mutably.
+        let roster = config.providers.clone();
+        let health = switch_provider(
+            "b",
+            &roster,
+            &mut provider_config,
+            &mut provider,
+            &mut user_settings,
+            &mut config,
+        )
+        .await
+        .expect("switch")
+        .expect("profile exists");
+
+        assert_eq!(health, story_model::ProviderHealth::Unavailable);
+        // The saved profile assignment replaced the carried-over one...
+        assert_eq!(config.director_model.as_deref(), Some("b-dir"));
+        assert_eq!(config.writer_model.as_deref(), Some("b-wri"));
+        // ...while a field it omits keeps the carried-over value.
+        assert_eq!(config.choice_model.as_deref(), Some("a-cho"));
+        // The choice is persisted under the profile name with the effective
+        // assignments (saved values plus the inherited field).
+        assert_eq!(user_settings.provider.as_deref(), Some("b"));
+        let persisted = load_user_settings(&save_dir).expect("reload");
+        let entry = persisted.stage_models.get("b").expect("persisted entry");
+        assert_eq!(entry.director.as_deref(), Some("b-dir"));
+        assert_eq!(entry.choice.as_deref(), Some("a-cho"));
+        assert_eq!(entry.writer.as_deref(), Some("b-wri"));
+        std::fs::remove_dir_all(save_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn switch_without_saved_entries_carries_over_and_keeps_sampling() {
+        let save_dir = switch_test_dir("carryover");
+        let profile_a = dead_profile("a", "a-main");
+        let profile_c = dead_profile("c", "c-main");
+        let mut config = runtime_for(save_dir.clone(), vec![profile_a.clone(), profile_c.clone()]);
+        config.director_model = Some("kept-dir".to_string());
+
+        let mut provider_config = profile_a;
+        let mut provider =
+            Arc::new(OpenAiCompatibleProvider::new(provider_config.clone()).expect("provider"));
+        let mut user_settings = UserSettings {
+            // Machine-level sampling taste: profile c itself carries the
+            // defaults.
+            temperature: Some(0.4),
+            max_tokens: Some(777),
+            ..UserSettings::default()
+        };
+
+        // Clone the roster: the call also needs `config` mutably.
+        let roster = config.providers.clone();
+        switch_provider(
+            "c",
+            &roster,
+            &mut provider_config,
+            &mut provider,
+            &mut user_settings,
+            &mut config,
+        )
+        .await
+        .expect("switch")
+        .expect("profile exists");
+
+        // Carry-over without repair is kept but deliberately not recorded, so
+        // a [[providers]] default added later cannot be shadowed by it.
+        assert_eq!(config.director_model.as_deref(), Some("kept-dir"));
+        assert!(!user_settings.stage_models.contains_key("c"));
+        // Sampling overrides survive the switch even though the profile has
+        // its own defaults.
+        assert_eq!(provider_config.temperature, 0.4);
+        assert_eq!(provider_config.max_tokens, 777);
+        std::fs::remove_dir_all(save_dir).ok();
     }
 }

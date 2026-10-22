@@ -111,9 +111,14 @@ out of scope. A cloud provider that speaks the OpenAI shape (e.g.
 
 The current Settings contract is a TOML profile plus CLI and per-save-directory
 user overrides. The in-app model picker reads `/v1/models` and persists the
-main, Director, and Writer selections to `saves/user-settings.toml`; if a
-persisted model disappears, startup selects the checked-in fallback (or the
-first advertised model) and repairs the user setting. Provider URL,
-authentication, sampling, timeouts, retry budget, context budget, and save
-directory still come from the base profile or CLI. Editing those values in the
-TUI remains a future UX improvement.
+main selection to `saves/user-settings.toml`; Director/Choice/Writer
+assignments are per provider profile — keyed by profile name in
+`[stage_models.<name>]`, restored when the profile is switched to, with
+`[[providers]]` entries able to carry per-profile defaults (precedence:
+user-settings profile entry, then the profile default, then the file-wide
+default). Old flat `director_model`/`choice_model`/`writer_model` user
+settings are folded into the active profile on load. If a persisted model
+disappears, startup and switches repair it to an advertised model. Provider
+URL, authentication, sampling, timeouts, retry budget, context budget, and
+save directory still come from the base profile or CLI. Editing those values
+in the TUI remains a future UX improvement.
