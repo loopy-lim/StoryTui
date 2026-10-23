@@ -95,3 +95,30 @@
 - **G4 사용성·디자인**: N/A — 렌더 코드·화면 흐름 무변경(설정 화면은 기존 공급자 블록을 그대로 사용). 관찰되는 값 변화는 AC-1 배선 테스트와 무변경 스냅샷으로 검증.
 - **G5 완료 판정**: PASS (self, completion 모드) — AC-1 전환 복원(V-1 배선+순수함수), AC-2 프로필 귀속 영속(형식 직렬화+시작 재시딩 테스트, apply_*_model 쓰기 3줄은 직접 테스트 없음 — 잔여 한계 기록), AC-3 우선순위(outrank 테스트), AC-4 샘플링 유지(배선 테스트), AC-5 게이트 5종·auth 동결. 실단말 육안 확인(두 프로필 오가기)은 터미널 앱 특성상 사용자 실행.
 - 커밋은 사용자 요청 시에만.
+
+## 후속 처리 (2026-10-23, P3 2건 마무리)
+
+G3 리뷰가 분리한 P3 후속 2건을 "수리(repair)된 필드만 영속" 규칙으로 통일해 해소했다.
+
+- **F-1 해소**: 시작 수리가 스테이지별 수리 여부를 `StageRepairs`로 보고하고,
+  수리된 필드만 `record_repaired_stages`로 `stage_models[profile]` 항목에 핀한다.
+  수리하지 않은 스테이지는 기록되지 않아(항목이 없으면 None 유지) 이후
+  `[[providers]]` 기본값 편집이 적용된다. host.rs의 루프는 스테이지별 플래그만
+  남기고 영속은 같은 헬퍼에 위임한다.
+- **F-2 해소**: `switch_provider` 영속의 `contains_key || repaired` 전체 insert를
+  같은 헬퍼 호출로 교체. saved 엔트리가 있어도 복원·기본·계승 필드는 재기록되지
+  않고 수리 필드만 반영된다. 기존 테스트가 단언하던 "계승 필드도 기록"은 설계
+  메모의 미기록 의도와 충돌했으므로 단언을 반전했다(계승 choice는 None 유지).
+- **가정 로그**: "필드별 변경분" = 수리가 발생한 스테이지로 정의. resolve의
+  per-field 변경은 수리뿐이고(복원은 동일값), 계승·기본값 미기록은 본 계획 설계
+  메모의 의도다. saved 엔트리와의 diff 비교 대안은 계승 필드를 다시 기록하게
+  돼 기각. `contains_key` 절 제거 근거: 존재하는 엔트리의 필드는 수리 없이는
+  절대 바뀌지 않아 재기록이 필요한 순간은 수리뿐이다.
+- **잔여 한계**: host.rs 시작 경로의 헬퍼 호출 8줄 배선은 직접 테스트가 없다
+  (run() 통합 경로 특성 — 기존 AC-2 잔여 한계와 동일). 헬퍼 자체는 단위 테스트로
+  고정.
+
+| ID | 방법·정의 근거 | cwd·환경 | 기대 결과 | 실제 결과·증거 | 판정 |
+|---|---|---|---|---|---|
+| V-3 | `cargo test -p storytui` — 신규 `record_repaired_stages_pins_only_flagged_fields`(기존 엔트리 부분 갱신·신규 엔트리 최소 생성·무수리 무기록), resolve 테스트 3건의 스테이지별 플래그 단언 갱신, `switch_restores_saved…`의 계승 필드 미기록 단언 반영 | repo root | 신규+기존 전부 통과 | 6 스위트 전부 ok — lib 23 + bin 37 + 통합 15 포함 (2026-10-23) | PASS |
+| V-4 | 게이트 5종 — `cargo test --workspace` + `cargo clippy --workspace -- -D warnings` + `cargo fmt --check` + `./scripts/check-core-deps.sh` + `./scripts/check-public-config.sh` | repo root | 회귀 0 | workspace 63 스위트 전부 ok, clippy 경고 0, fmt 정렬, 스크립트 2종 양호. 1차 clippy에서 클로저 `mut` unused-mut 1건 지적 → 제거 후 재통과 (2026-10-23) | PASS |

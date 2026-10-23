@@ -339,10 +339,10 @@ pub fn resolve_stage_assignments(
     active_model: &str,
 ) -> (StageModels, StageRepairs) {
     let mut repaired = StageRepairs::default();
-    let mut stage = |flag: &mut bool,
-                     saved: Option<String>,
-                     default: Option<String>,
-                     carried: Option<String>|
+    let stage = |flag: &mut bool,
+                 saved: Option<String>,
+                 default: Option<String>,
+                 carried: Option<String>|
      -> Option<String> {
         let desired = saved.or(default).or(carried);
         if let Some(model) = &desired
@@ -475,14 +475,14 @@ pub async fn switch_provider(
         choice: config.choice_model.clone(),
         writer: config.writer_model.clone(),
     };
-    let (resolved, repaired) = resolve_stage_assignments(
+    let (resolved, repairs) = resolve_stage_assignments(
         user_settings.stage_models.get(name),
         config.stage_defaults.get(name),
         &current,
         &advertised,
         &provider_config.model,
     );
-    if repaired {
+    if repairs.any() {
         tracing::warn!(
             provider = %name,
             director = ?resolved.director,
@@ -494,14 +494,11 @@ pub async fn switch_provider(
     config.director_model = resolved.director.clone();
     config.choice_model = resolved.choice.clone();
     config.writer_model = resolved.writer.clone();
-    // Persist under this profile's name when the player curated it or a
-    // repair fired. Pure carry-over is not recorded: a `[[providers]]`
-    // default added later must not be shadowed by inherited values.
-    if user_settings.stage_models.contains_key(name) || repaired {
-        user_settings
-            .stage_models
-            .insert(name.to_string(), resolved);
-    }
+    // Pin only the fields this switch settled: a repaired stage is recorded
+    // under the profile's name, while restored, defaulted, and carried-over
+    // fields stay unrecorded so a `[[providers]]` default added later cannot
+    // be shadowed by inherited values.
+    record_repaired_stages(&mut user_settings.stage_models, name, repairs, &resolved);
 
     // Persist the provider choice and the (possibly repaired) active model.
     user_settings.provider = Some(name.to_string());
@@ -652,10 +649,11 @@ pub async fn apply_writer_model(
 #[cfg(test)]
 mod tests {
     use super::{
-        DiscoveryOutcome, filter_chat_models, pick_auto_model, probe_candidates,
-        reconcile_active_model, resolve_stage_assignments, server_down_home_status,
-        switch_provider, unconfigured_home_status,
+        DiscoveryOutcome, StageRepairs, filter_chat_models, pick_auto_model, probe_candidates,
+        reconcile_active_model, record_repaired_stages, resolve_stage_assignments,
+        server_down_home_status, switch_provider, unconfigured_home_status,
     };
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::Arc;
     use story_provider::{OpenAiCompatibleProvider, ProviderConfig};
@@ -779,7 +777,7 @@ mod tests {
         // A field the saved entry omits inherits the carried-over value.
         assert_eq!(resolved.choice.as_deref(), Some("a-cho"));
         assert_eq!(resolved.writer.as_deref(), Some("b-wri"));
-        assert!(!repaired);
+        assert!(!repaired.any());
     }
 
     #[test]
@@ -803,9 +801,16 @@ mod tests {
         // TOML default outranks the carried-over assignment.
         assert_eq!(resolved.director.as_deref(), Some("d-dir"));
         assert_eq!(resolved.choice.as_deref(), Some("a-cho"));
-        // A carried-over model the new server does not advertise is repaired.
+        // A carried-over model the new server does not advertise is repaired —
+        // and only that stage is reported, so the caller can pin just it.
         assert_eq!(resolved.writer.as_deref(), Some("fallback"));
-        assert!(repaired);
+        assert_eq!(
+            repaired,
+            StageRepairs {
+                writer: true,
+                ..StageRepairs::default()
+            }
+        );
     }
 
     #[test]
@@ -819,7 +824,64 @@ mod tests {
         let (resolved, repaired) =
             resolve_stage_assignments(Some(&saved), None, &StageModels::default(), &[], "fallback");
         assert_eq!(resolved.director.as_deref(), Some("gone"));
-        assert!(!repaired);
+        assert!(!repaired.any());
+    }
+
+    #[test]
+    fn record_repaired_stages_pins_only_flagged_fields() {
+        let assignments = StageModels {
+            director: Some("b-dir".to_string()),
+            choice: Some("carried".to_string()),
+            writer: Some("active".to_string()),
+        };
+        let mut stage_models = BTreeMap::new();
+        // An entry that already curates two fields: only the flagged stage is
+        // overwritten, the carried-over choice stays unrecorded.
+        stage_models.insert(
+            "b".to_string(),
+            StageModels {
+                director: Some("b-dir".to_string()),
+                writer: Some("b-wri".to_string()),
+                ..StageModels::default()
+            },
+        );
+        record_repaired_stages(
+            &mut stage_models,
+            "b",
+            StageRepairs {
+                writer: true,
+                ..StageRepairs::default()
+            },
+            &assignments,
+        );
+        let entry = stage_models.get("b").expect("existing entry");
+        assert_eq!(entry.director.as_deref(), Some("b-dir"));
+        assert_eq!(entry.choice, None);
+        assert_eq!(entry.writer.as_deref(), Some("active"));
+
+        // A profile without an entry gets one holding just the repaired field.
+        record_repaired_stages(
+            &mut stage_models,
+            "c",
+            StageRepairs {
+                choice: true,
+                ..StageRepairs::default()
+            },
+            &assignments,
+        );
+        let entry = stage_models.get("c").expect("new entry");
+        assert_eq!(entry.director, None);
+        assert_eq!(entry.choice.as_deref(), Some("carried"));
+        assert_eq!(entry.writer, None);
+
+        // Nothing repaired: nothing is recorded at all.
+        record_repaired_stages(
+            &mut stage_models,
+            "d",
+            StageRepairs::default(),
+            &assignments,
+        );
+        assert!(!stage_models.contains_key("d"));
     }
 
     fn switch_test_dir(label: &str) -> PathBuf {
@@ -911,13 +973,14 @@ mod tests {
         assert_eq!(config.writer_model.as_deref(), Some("b-wri"));
         // ...while a field it omits keeps the carried-over value.
         assert_eq!(config.choice_model.as_deref(), Some("a-cho"));
-        // The choice is persisted under the profile name with the effective
-        // assignments (saved values plus the inherited field).
+        // The switch is persisted under the profile name, but only its own
+        // fields: nothing was repaired here, so the inherited choice stays
+        // unrecorded and a later [[providers]] default for it keeps applying.
         assert_eq!(user_settings.provider.as_deref(), Some("b"));
         let persisted = load_user_settings(&save_dir).expect("reload");
         let entry = persisted.stage_models.get("b").expect("persisted entry");
         assert_eq!(entry.director.as_deref(), Some("b-dir"));
-        assert_eq!(entry.choice.as_deref(), Some("a-cho"));
+        assert_eq!(entry.choice, None);
         assert_eq!(entry.writer.as_deref(), Some("b-wri"));
         std::fs::remove_dir_all(save_dir).ok();
     }

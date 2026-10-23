@@ -21,7 +21,9 @@ use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio_util::sync::CancellationToken;
 
 use story_tts::TtsService;
-use storytui::config::{RuntimeConfig, UserSettings, load_user_settings, save_user_settings};
+use storytui::config::{
+    RuntimeConfig, StageModels, UserSettings, load_user_settings, save_user_settings,
+};
 
 mod diagnostics;
 mod images;
@@ -102,7 +104,9 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
     apply_player_profile(&mut pack, &config.player);
     let mut provider_config = config.provider.clone();
     let mut repaired_main_model = false;
-    let mut repaired_stage_models = false;
+    // Which stages the preflight repairs — only those are pinned to the
+    // profile below, so untouched stages keep inheriting their defaults.
+    let mut repaired_stages = settings::StageRepairs::default();
     // First-run auto-setup: with no model selected yet (a fresh clone — the
     // checked-in template intentionally carries no model id), find a local
     // OpenAI-compatible server and adopt it for this session. The model is
@@ -149,11 +153,7 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                         .map_err(|e| format!("대체 provider를 만들지 못했습니다: {e}"))?,
                 );
             }
-            for stage_model in [
-                &mut config.director_model,
-                &mut config.choice_model,
-                &mut config.writer_model,
-            ] {
+            let repair_stage = |repaired: &mut bool, stage_model: &mut Option<String>| {
                 if let Some(current) = stage_model.clone()
                     && !advertised.iter().any(|model| model == &current)
                 {
@@ -163,9 +163,12 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                         "stage model is not advertised; using the active model"
                     );
                     *stage_model = Some(provider_config.model.clone());
-                    repaired_stage_models = true;
+                    *repaired = true;
                 }
-            }
+            };
+            repair_stage(&mut repaired_stages.director, &mut config.director_model);
+            repair_stage(&mut repaired_stages.choice, &mut config.choice_model);
+            repair_stage(&mut repaired_stages.writer, &mut config.writer_model);
         }
         Ok(_) => tracing::warn!("provider advertised an empty model list"),
         Err(error) => tracing::warn!(%error, "provider model preflight failed"),
@@ -288,16 +291,22 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
     if repaired_main_model {
         user_settings.model = Some(provider_config.model.clone());
     }
-    if repaired_stage_models {
-        let entry = user_settings
-            .stage_models
-            .entry(config.provider.name.clone())
-            .or_default();
-        entry.director = config.director_model.clone();
-        entry.choice = config.choice_model.clone();
-        entry.writer = config.writer_model.clone();
+    // Pin only the stages the preflight repaired: a stage this run merely
+    // kept inheriting stays unrecorded, so later `[[providers]]` default
+    // edits keep applying.
+    if repaired_stages.any() {
+        settings::record_repaired_stages(
+            &mut user_settings.stage_models,
+            &config.provider.name,
+            repaired_stages,
+            &StageModels {
+                director: config.director_model.clone(),
+                choice: config.choice_model.clone(),
+                writer: config.writer_model.clone(),
+            },
+        );
     }
-    if repaired_main_model || repaired_stage_models {
+    if repaired_main_model || repaired_stages.any() {
         save_user_settings(&config.save_dir, &user_settings)?;
     }
     let (tx, mut rx) = unbounded_channel();
