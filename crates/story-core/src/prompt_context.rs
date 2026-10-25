@@ -77,14 +77,183 @@ pub fn build_prompt_with_choice(
 ) -> PromptBundle {
     let system = build_system(pack, player_action);
     let user = build_user(pack, state, recent, player_action, player_choice);
+    bundle_from(system, user)
+}
 
+/// Hash `system` + `user` into a [`PromptBundle`].
+fn bundle_from(system: String, user: String) -> PromptBundle {
     let mut hasher = Sha256::new();
     hasher.update(system.as_bytes());
     hasher.update(b"\n\n---\n\n");
     hasher.update(user.as_bytes());
     let hash = hex_lower(hasher.finalize().as_slice());
-
     PromptBundle { system, user, hash }
+}
+
+// ---------------------------------------------------------------------------
+// side-generation prompts (continue / suggest)
+// ---------------------------------------------------------------------------
+
+/// Fixed Korean instruction for continuation requests: keep writing the
+/// previous narration, do not open a new turn. The engine accepts only the
+/// `narration` field of the JSON draft.
+const CONTINUE_SYSTEM_INSTRUCTION: &str = "\
+# Continue narration (engine-owned)\n\
+이전 내레이션을 그대로 이어서 같은 장면의 뒷부분을 계속 쓴다. 새로운 턴을 시작하지 않고 \
+오프닝으로 되돌아가지 않는다. 이전 내레이션의 문장을 베끼지 않는다. 응답은 기존 JSON \
+계약(narration, choices, state_patch, summary)을 유지하되, 엔진은 narration만 수용하고 \
+나머지 필드는 버린다.\n";
+
+/// Fixed Korean instruction for suggested-action requests: one Korean
+/// sentence describing a suggested PLAYER action. The suggestion is an
+/// example only — the player decides (sovereignty). The engine accepts only
+/// the `narration` field.
+const SUGGEST_SYSTEM_INSTRUCTION: &str = "\
+# Suggest action (engine-owned)\n\
+플레이어가 다음에 취할 행동 한 문장(한국어)만 제안한다. 이 제안은 예시일 뿐이며 \
+플레이어가 따를 의무가 없다(플레이어 주권). 감정, 대사, 접촉, 용서, 고백, 결단을 \
+플레이어 대신 확정하는 표현을 쓰지 않는다. 응답 JSON의 narration 필드에 그 한 문장만 \
+넣고, choices/state_patch/summary는 형식 유지용 복사본이면 충분하다(엔진이 버린다).\n";
+
+/// Assemble a deterministic prompt for
+/// [`crate::engine_cmd::EngineCommand::ContinueNarration`]: the standard
+/// turn context plus the fixed continuation instruction and the previous
+/// narration (with the committed choices/patch echoed so the model can fill
+/// the JSON contract it will not be judged on). Pure function of its inputs.
+pub fn build_continue_prompt(
+    pack: &StoryPack,
+    state: &GameState,
+    recent: &[HistoryEntry],
+) -> PromptBundle {
+    let base = build_prompt(pack, state, recent, None);
+    let mut system = base.system;
+    system.push('\n');
+    system.push_str(CONTINUE_SYSTEM_INSTRUCTION);
+
+    let mut user = base.user;
+    user.push_str("\n\n# Continue target (engine-owned)\n");
+    user.push_str(
+        "이전 내레이션을 그대로 이어서 두 문단 이내로 계속한다. 아래 텍스트를 반복하지 않는다.\n",
+    );
+    if let Some(entry) = recent.last() {
+        user.push_str(&format!(
+            "\n## turn {} narration (이전 내레이션 — 이 바로 뒤에서 계속)\n",
+            entry.turn
+        ));
+        user.push_str(&entry.narration);
+        user.push('\n');
+        user.push_str(
+            "\n응답 형식 유지를 위해 아래 현재 값을 그대로 복사한다(엔진은 narration만 수용한다).\n",
+        );
+        user.push_str(&format!(
+            "choices: {}\n",
+            serde_json::to_string(&entry.choices).unwrap_or_else(|_| "[]".to_string())
+        ));
+        user.push_str(&format!(
+            "state_patch: {}\n",
+            serde_json::to_string(&entry.applied_patch).unwrap_or_else(|_| "{}".to_string())
+        ));
+    }
+    bundle_from(system, user)
+}
+
+/// Assemble a deterministic prompt for
+/// [`crate::engine_cmd::EngineCommand::SuggestAction`]: the standard turn
+/// context plus the fixed one-sentence player-action suggestion instruction
+/// with its player-sovereignty clause. Pure function of its inputs.
+pub fn build_suggest_prompt(
+    pack: &StoryPack,
+    state: &GameState,
+    recent: &[HistoryEntry],
+) -> PromptBundle {
+    let base = build_prompt(pack, state, recent, None);
+    let mut system = base.system;
+    system.push('\n');
+    system.push_str(SUGGEST_SYSTEM_INSTRUCTION);
+
+    let mut user = base.user;
+    user.push_str("\n\n# Suggested player action (engine-owned)\n");
+    user.push_str(
+        "플레이어가 다음에 취할 행동 한 문장(한국어)을 narration 필드에 제안한다. \
+         질문이 아닌 행동형 문장으로, 플레이어가 지금 실행할 동사로 끝낸다.\n",
+    );
+    bundle_from(system, user)
+}
+
+/// Fixed Korean instruction for group-scene requests: two or more cast
+/// members talk to each other, every spoken line uses the system prompt's
+/// speaker-clarity line format, the player's own words and feelings are
+/// never decided for them, and the JSON draft shape is kept only so the
+/// provider's recovery parser works — the engine accepts narration alone and
+/// discards the format-preserving copies.
+const GROUP_SCENE_SYSTEM_INSTRUCTION: &str = "\
+# Group scene (engine-owned)\n\
+두 명 이상의 등장인물이 이어서 서로 대화하는 장면 한 비트를 쓴다. 각 발화 줄은 \
+시스템 프롬프트의 화자 명확성 규칙 그대로 `이름: \"대사\"` 한 줄 형식으로 쓰고, \
+이미 확립된 캐릭터 이름 밖의 새 화자를 만들지 않는다. 플레이어의 대사·감정·행동을 \
+대신 정하지 않는다. 응답은 기존 JSON 계약(narration, choices, state_patch, \
+summary)을 유지하되 choices/state_patch/summary는 형식 유지용 복사본이면 충분하고 \
+엔진은 narration만 수용해 나머지는 버린다.\n";
+
+/// Assemble a deterministic prompt for
+/// [`crate::engine_cmd::EngineCommand::GroupScene`]: the standard turn
+/// context plus the fixed group-conversation instruction, the cast list, and
+/// the previous narration the scene bit continues from. Pure function of its
+/// inputs.
+pub fn build_group_scene_prompt(
+    pack: &StoryPack,
+    state: &GameState,
+    recent: &[HistoryEntry],
+) -> PromptBundle {
+    let base = build_prompt(pack, state, recent, None);
+    let mut system = base.system;
+    system.push('\n');
+    system.push_str(GROUP_SCENE_SYSTEM_INSTRUCTION);
+
+    let mut user = base.user;
+    user.push_str("\n\n# Group scene (engine-owned)\n");
+    user.push_str(
+        "아래 장면에서 두 명 이상의 등장인물이 이어서 대화한다. 각 발화 줄은 \
+         `이름: \"대사\"` 한 줄 형식을 유지한다.\n",
+    );
+    // Deterministic cast list: state key order joined with pack display
+    // names (state-only characters keep their id).
+    let cast = state
+        .characters
+        .keys()
+        .map(|id| {
+            pack.characters
+                .get(id)
+                .map(|character| character.name.as_str())
+                .unwrap_or(id.0.as_str())
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    if cast.is_empty() {
+        user.push_str("대화 가능한 인물: 없음\n");
+    } else {
+        user.push_str(&format!("대화 가능한 인물: {cast}\n"));
+    }
+    if let Some(entry) = recent.last() {
+        user.push_str(&format!(
+            "\n## turn {} narration (이전 내레이션 — 이 장면에 이어서 대화)\n",
+            entry.turn
+        ));
+        user.push_str(&entry.narration);
+        user.push('\n');
+        user.push_str(
+            "\n응답 형식 유지를 위해 아래 현재 값을 그대로 복사한다(엔진은 narration만 수용한다).\n",
+        );
+        user.push_str(&format!(
+            "choices: {}\n",
+            serde_json::to_string(&entry.choices).unwrap_or_else(|_| "[]".to_string())
+        ));
+        user.push_str(&format!(
+            "state_patch: {}\n",
+            serde_json::to_string(&entry.applied_patch).unwrap_or_else(|_| "{}".to_string())
+        ));
+    }
+    bundle_from(system, user)
 }
 
 // ---------------------------------------------------------------------------
@@ -355,6 +524,14 @@ fn build_user(
         ));
         if let Some(t) = &pa.target {
             s.push_str(&format!("target: {}\n", t.0));
+            // Targeted free input (`@캐릭터 내용`) — pin the addressee so the
+            // reply is mandatory and other cast members react around it.
+            // Present only when a target exists, so plain free-action
+            // prompts stay byte-identical.
+            s.push_str(&format!(
+                "{}은 플레이어가 직접 말 건 캐릭터 — 응답 필수, 타 인물 반응 자연 연결\n",
+                t.0
+            ));
         }
         if let Some(c) = pa.confidence {
             s.push_str(&format!("confidence: {c:.2}\n"));
@@ -1000,5 +1177,230 @@ mod tests {
         assert!(bundle.user.contains("cost="));
         assert!(bundle.user.contains("immediate_consequence="));
         assert!(bundle.user.contains("편지를 직접 묻는다"));
+    }
+
+    // --- side-generation prompts (continue / suggest) ------------------------
+
+    fn committed_entry() -> HistoryEntry {
+        HistoryEntry {
+            id: story_model::uuid::Uuid::nil(),
+            turn: 3,
+            scene_id: "s".to_string(),
+            created_at: story_model::chrono::Utc::now(),
+            narration: "유나가 창밖의 빗소리를 들으며 조용히 말했다.".to_string(),
+            player_action: None,
+            choices: vec![Choice {
+                id: "choice-0".to_string(),
+                label: "자리를 파악한다".to_string(),
+                intent: String::new(),
+                tone: None,
+                target: None,
+                risk: story_model::RiskLevel::Low,
+                hidden_requirements: vec![],
+                preview: None,
+            }],
+            applied_patch: story_model::StatePatch::default(),
+            generation_id: story_model::uuid::Uuid::nil(),
+        }
+    }
+
+    #[test]
+    fn continue_prompt_carries_the_korean_instruction_and_previous_narration() {
+        let (pack, state) = minimal_fixture();
+        let recent = [committed_entry()];
+
+        let bundle = build_continue_prompt(&pack, &state, &recent);
+
+        assert!(
+            bundle
+                .system
+                .contains("# Continue narration (engine-owned)")
+        );
+        assert!(bundle.system.contains("이전 내레이션을 그대로 이어서"));
+        assert!(bundle.user.contains("# Continue target (engine-owned)"));
+        assert!(bundle.user.contains("이전 내레이션 — 이 바로 뒤에서 계속"));
+        assert!(bundle.user.contains(&recent[0].narration));
+        assert!(
+            !bundle.user.contains("# Suggest action"),
+            "the suggest instruction must not leak into the continue prompt"
+        );
+    }
+
+    #[test]
+    fn suggest_prompt_carries_the_suggestion_instruction_and_sovereignty() {
+        let (pack, state) = minimal_fixture();
+
+        let bundle = build_suggest_prompt(&pack, &state, &[]);
+
+        assert!(bundle.system.contains("# Suggest action (engine-owned)"));
+        assert!(
+            bundle
+                .system
+                .contains("플레이어가 다음에 취할 행동 한 문장(한국어)만 제안")
+        );
+        assert!(
+            bundle.system.contains("플레이어 주권"),
+            "the suggestion must carry the player-sovereignty context"
+        );
+        assert!(
+            bundle
+                .user
+                .contains("# Suggested player action (engine-owned)")
+        );
+        assert!(
+            !bundle.system.contains("# Continue narration"),
+            "the continue instruction must not leak into the suggest prompt"
+        );
+    }
+
+    #[test]
+    fn side_generation_prompts_are_deterministic_and_distinct() {
+        let (pack, state) = minimal_fixture();
+        let recent = [committed_entry()];
+
+        let continue_a = build_continue_prompt(&pack, &state, &recent);
+        let continue_b = build_continue_prompt(&pack, &state, &recent);
+        assert_eq!(continue_a.hash, continue_b.hash, "same inputs, same hash");
+
+        let suggest_a = build_suggest_prompt(&pack, &state, &recent);
+        let suggest_b = build_suggest_prompt(&pack, &state, &recent);
+        assert_eq!(suggest_a.hash, suggest_b.hash);
+
+        let scene_a = build_group_scene_prompt(&pack, &state, &recent);
+        let scene_b = build_group_scene_prompt(&pack, &state, &recent);
+        assert_eq!(scene_a.hash, scene_b.hash);
+
+        let plain = build_prompt(&pack, &state, &recent, None);
+        assert_ne!(continue_a.hash, plain.hash);
+        assert_ne!(suggest_a.hash, plain.hash);
+        assert_ne!(scene_a.hash, plain.hash);
+        assert_ne!(continue_a.hash, suggest_a.hash);
+        assert_ne!(continue_a.hash, scene_a.hash);
+        assert_ne!(suggest_a.hash, scene_a.hash);
+    }
+
+    // --- group-scene prompt (SideGenerationKind::Scene) ----------------------
+
+    fn named_character(id: &str, name: &str) -> story_model::CharacterDef {
+        story_model::CharacterDef {
+            id: story_model::CharacterId(id.to_string()),
+            name: name.to_string(),
+            age: None,
+            pronouns: None,
+            description_md: None,
+            dialogue_examples: Vec::new(),
+            personality: vec![],
+            appearance: vec![],
+            values: vec![],
+            likes: vec![],
+            dislikes: vec![],
+            secrets: vec![],
+            initial_player_relationship: RelationshipStage::Acquaintance,
+            speech_style: String::new(),
+            honorific_rule: String::new(),
+            frequent_phrases: vec![],
+            avoid_phrases: vec![],
+            known_facts: vec![],
+            unknown_facts: vec![],
+            current_goal: String::new(),
+            long_term_desire: String::new(),
+        }
+    }
+
+    #[test]
+    fn group_scene_prompt_carries_the_korean_instruction_and_line_format() {
+        let (pack, state) = minimal_fixture();
+        let recent = [committed_entry()];
+
+        let bundle = build_group_scene_prompt(&pack, &state, &recent);
+
+        assert!(bundle.system.contains("# Group scene (engine-owned)"));
+        assert!(bundle.system.contains("두 명 이상의 등장인물"));
+        assert!(bundle.system.contains("`이름: \"대사\"`"));
+        assert!(
+            bundle
+                .system
+                .contains("플레이어의 대사·감정·행동을 대신 정하지 않는다"),
+            "the scene must carry the player-sovereignty clause"
+        );
+        assert!(
+            bundle
+                .system
+                .contains("choices/state_patch/summary는 형식 유지용 복사본"),
+            "the format-preserving copy contract is stated"
+        );
+        assert!(bundle.user.contains("# Group scene (engine-owned)"));
+        assert!(bundle.user.contains("`이름: \"대사\"`"));
+        assert!(bundle.user.contains(&recent[0].narration));
+        assert!(
+            !bundle.system.contains("# Continue narration"),
+            "the continue instruction must not leak into the scene prompt"
+        );
+        assert!(
+            !bundle.system.contains("# Suggest action"),
+            "the suggest instruction must not leak into the scene prompt"
+        );
+    }
+
+    #[test]
+    fn group_scene_user_block_lists_the_pack_cast_by_name() {
+        let (mut pack, mut state) = minimal_fixture();
+        pack.characters.insert(
+            story_model::CharacterId("c-1".to_string()),
+            named_character("c-1", "한유나"),
+        );
+        let extra_id = story_model::CharacterId("c-2".to_string());
+        pack.characters
+            .insert(extra_id.clone(), named_character("c-2", "나무"));
+        state.characters.insert(
+            extra_id,
+            CharacterState {
+                affection: 0,
+                trust: 0,
+                tension: 0,
+                relationship_stage: RelationshipStage::Stranger,
+                current_emotion: Emotion::Neutral,
+                known_facts: BTreeSet::new(),
+                address_form_overrides: BTreeMap::new(),
+            },
+        );
+
+        let bundle = build_group_scene_prompt(&pack, &state, &[]);
+
+        assert!(
+            bundle.user.contains("대화 가능한 인물: 한유나, 나무"),
+            "the cast line joins pack display names in state key order: {:?}",
+            bundle.user
+        );
+    }
+
+    #[test]
+    fn free_action_with_target_gains_the_response_directive_line() {
+        let (pack, state) = minimal_fixture();
+        let targeted = ParsedAction {
+            action_type: story_model::ActionType::Dialogue,
+            target: Some(story_model::CharacterId("c-1".to_string())),
+            intent: None,
+            tone: None,
+            content: "안녕".to_string(),
+            original_text: "@c-1 안녕".to_string(),
+            confidence: Some(1.0),
+        };
+
+        let with = build_prompt(&pack, &state, &[], Some(&targeted));
+        let without = build_prompt(&pack, &state, &[], None);
+        let again = build_prompt(&pack, &state, &[], Some(&targeted));
+
+        assert!(
+            with.user
+                .contains("c-1은 플레이어가 직접 말 건 캐릭터 — 응답 필수, 타 인물 반응 자연 연결"),
+            "the targeted directive line rides the free-action block: {:?}",
+            with.user
+        );
+        assert!(
+            !without.user.contains("플레이어가 직접 말 건"),
+            "plain free actions keep their prompt byte-shape (no directive line)"
+        );
+        assert_eq!(with.hash, again.hash, "the directive line is deterministic");
     }
 }

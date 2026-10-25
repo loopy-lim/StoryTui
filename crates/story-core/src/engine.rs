@@ -20,6 +20,8 @@
 //!   `generation_id` that does not match) is silently discarded: the returned
 //!   [`Transition`] is identity (state unchanged, no effects).
 
+use std::collections::BTreeMap;
+
 use sha2::Digest;
 use story_model::chrono::Utc;
 use story_model::uuid::Uuid;
@@ -27,7 +29,7 @@ use story_model::{
     ActionType, AppViewModel, CharacterId, CharacterState, ChoiceRef, DirectorPlan,
     DirectorRequest, DomainErrorView, Emotion, GameState, GeneratedTurnDraft, HistoryEntry,
     LoadingState, PackMetadata, ParsedAction, SavePayload, Screen, StateChangeLog, StatePatch,
-    StoryPack, StoryRules, TurnRequest, TurnSummary, WriterFinish, WriterRequest,
+    StoryPack, StoryRules, TruncationStatus, TurnRequest, TurnSummary, WriterFinish, WriterRequest,
 };
 
 use crate::director::{ValidatedPlan, validate_plan};
@@ -43,6 +45,14 @@ use crate::writer::{WriterResult, finalize_writer_output};
 const OPENING_CHOICE_ID: &str = "__opening__";
 /// Sentinel `player_choice_id` for a free-text action (no prepared choice).
 const FREE_ACTION_CHOICE_ID: &str = "__free_action__";
+/// Sentinel `player_choice_id` for a narration continuation (no new turn).
+const CONTINUE_CHOICE_ID: &str = "__continue__";
+/// Sentinel `player_choice_id` for a suggested-action request (commits
+/// nothing).
+const SUGGEST_CHOICE_ID: &str = "__suggest__";
+/// Sentinel `player_choice_id` for a group-scene side generation (attaches to
+/// the last committed turn, like a continuation).
+const GROUP_SCENE_CHOICE_ID: &str = "__group_scene__";
 /// Maximum number of committed-state checkpoints retained for
 /// [`EngineCommand::RestoreCheckpoint`].
 const CHECKPOINT_RING: usize = 8;
@@ -52,6 +62,10 @@ pub const AUTOSAVE_SLOT: &str = "autosave";
 /// payload. Larger histories are truncated to the most recent entries so
 /// saves stay compact.
 const AUDIT_TAIL_CAP: usize = 1024;
+/// Maximum number of stored narrations per turn in the variant cycling UI
+/// (both the undo-seeded [`EngineState::variant_pool`] and the committed
+/// turn's [`EngineState::current_variants`] list).
+pub const VARIANT_CAP: usize = 8;
 
 /// Validate + atomically apply a generated patch for one turn (W3 primitive).
 ///
@@ -116,6 +130,46 @@ pub struct EngineState {
     /// stays the default until a real 20-turn A/B gate proves the 2-stage path
     /// is at least as good. The flag is never flipped by the engine itself.
     pub use_director_writer: bool,
+    /// Session lorebook override installed by
+    /// [`EngineCommand::SetLorebookEntries`]. When `Some`, every subsequent
+    /// prompt builds and matches against these entries instead of
+    /// `pack.lorebook.entries` (book-level settings still come from the
+    /// pack). Cleared by a fresh [`EngineCommand::StartNewGame`]. Session
+    /// state only — deliberately not part of the save payload (the host
+    /// persists lore edits to `lorebook.toml` when that file exists).
+    pub lorebook_override: Option<Vec<story_model::LorebookEntry>>,
+    /// One-sentence suggested player action from the latest
+    /// [`EngineCommand::SuggestAction`] completion, waiting for the host to
+    /// collect it via [`EngineState::take_suggested_action`]. Transient
+    /// session memory: never persisted, never applied to game state.
+    pub suggested_action: Option<String>,
+    /// Session-only variant pool: narrations discarded by an undo, keyed by
+    /// the undone turn number. [`EngineCommand::RestoreCheckpoint`] seeds
+    /// it; the next commit of the same turn consumes it into
+    /// `current_variants`. Per-turn cap [`VARIANT_CAP`], never serialized
+    /// into saves — a restart drops pending variants by design.
+    pub variant_pool: BTreeMap<u32, Vec<String>>,
+    /// Variant list for the LAST committed turn when the pool held entries
+    /// for it: `(turn, current index, [accepted narration, ...variants])`.
+    /// [`EngineCommand::CycleTurnVariant`] rotates the displayed narration
+    /// through this list; the index tracks the shown entry so the view badge
+    /// and wraparound stay exact. Session memory only.
+    pub current_variants: Option<(u32, usize, Vec<String>)>,
+    /// Truncation status of the displayed turn's prose (AC-8: at most one
+    /// defensive re-call per turn). Set at Writer accept time from
+    /// `finish_reason == "length"`: [`TruncationStatus::Auto`] when this turn
+    /// has not spent its narration repair, [`TruncationStatus::ManualOnly`]
+    /// when it has. Cleared on the next regular turn request/commit; a
+    /// continue/scene accept that appends prose demotes `Auto` to
+    /// `ManualOnly` (the one auto-continue was spent). Session memory only —
+    /// never persisted.
+    pub truncation: TruncationStatus,
+    /// `true` when the last side-generation accept (continue / suggest /
+    /// group scene) found an empty narration and applied nothing. The host
+    /// may re-dispatch the same side command once and/or toast — the engine
+    /// never re-dispatches on its own. A non-empty side accept, a regular
+    /// turn request/commit, or a rewind clears it. Session memory only.
+    pub empty_side_result: bool,
 }
 
 /// A committed-state snapshot the player can rewind to via
@@ -166,6 +220,19 @@ pub struct PendingGeneration {
     /// choices, patch, and summary; the Writer variant retains only the
     /// rejected prose because its Director plan is already authoritative.
     pub narration_repair: Option<NarrationRepair>,
+    /// `Some` only for the side-generation family
+    /// ([`SideGenerationKind::Continue`] / [`SideGenerationKind::Suggest`] /
+    /// [`SideGenerationKind::Scene`]). Side generations force the
+    /// single-pass request path and are accepted narration-only
+    /// ([`Self::choice_refresh`] and quality repair stay unused for them).
+    pub side_kind: Option<SideGenerationKind>,
+    /// Request-time lorebook activation batch for `requested_at_turn + 1`,
+    /// recorded by the same scan that built the prompt. Accept re-applies it
+    /// onto the committed state (the checkpoint predates the recording, so
+    /// without the carry the batch was dropped and sticky/cooldown timers
+    /// silently reset every turn); cancel and failure paths drop it, so a
+    /// turn that never committed never feeds the timers.
+    pub lorebook_activations: Vec<story_model::LorebookActivation>,
 }
 
 /// State retained while a rejected narration is rewritten once.
@@ -177,6 +244,27 @@ pub enum NarrationRepair {
     Writer {
         rejected_narration: String,
     },
+}
+
+/// Purpose discriminator for the side-generation family
+/// ([`EngineCommand::ContinueNarration`] / [`EngineCommand::SuggestAction`] /
+/// [`EngineCommand::GroupScene`]). All ride the single-pass
+/// [`EngineEffect::RequestGeneration`] machinery (never the 2-stage
+/// Director→Writer path) and are accepted narration-only; the kind decides
+/// what the accepted narration does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SideGenerationKind {
+    /// Append the accepted narration to the last committed turn's narration.
+    /// No new turn, no checkpoint push; choices and state stay as-is.
+    Continue,
+    /// Store the accepted narration (one suggested player action sentence)
+    /// on the engine state for the host to collect. Game state untouched.
+    Suggest,
+    /// Append a cast group-conversation scene bit to the last committed
+    /// turn's narration. Shares the continue accept path exactly: choices
+    /// and the state patch are discarded, so a scene never moves the
+    /// relationship meters.
+    Scene,
 }
 
 /// The result of [`reduce`]: a new state, the effects the host should perform,
@@ -219,21 +307,41 @@ impl EngineState {
             audit_tail: Vec::new(),
             autosave_on_accept: true,
             use_director_writer: false,
+            lorebook_override: None,
+            suggested_action: None,
+            variant_pool: BTreeMap::new(),
+            current_variants: None,
+            truncation: TruncationStatus::None,
+            empty_side_result: false,
         }
+    }
+
+    /// Collect the pending suggested player action, if any. Reading clears
+    /// it: the next suggestion must overwrite the buffer, not stack onto a
+    /// stale one.
+    pub fn take_suggested_action(&mut self) -> Option<String> {
+        self.suggested_action.take()
     }
 
     /// Assemble the pure-data [`SavePayload`] snapshot of this engine state.
     ///
     /// Mirrors `game.memories` / `game.history` into the payload's top-level
-    /// mirrors (forward-compat with the W9 memory selector) and includes the
-    /// bounded `audit_tail`. **Pure**: no FS, no UI, no HTTP — the host wraps
-    /// this in a `SaveEnvelope` and hands it to `SaveStore::save`.
+    /// mirrors (forward-compat with the W9 memory selector), includes the
+    /// bounded `audit_tail`, and serializes the undo ring into
+    /// `SavePayload::undo_stack` so a resumed game can `u` right after load.
+    /// **Pure**: no FS, no UI, no HTTP — the host wraps this in a
+    /// `SaveEnvelope` and hands it to `SaveStore::save`.
     pub fn snapshot_payload(&self) -> SavePayload {
         SavePayload {
             memories: self.game.memories.clone(),
             history: self.game.history.clone(),
             audit_tail: self.audit_tail.clone(),
             stable_state: self.game.clone(),
+            undo_stack: self
+                .checkpoints
+                .iter()
+                .map(|checkpoint| checkpoint.game.clone())
+                .collect(),
         }
     }
 
@@ -242,21 +350,38 @@ impl EngineState {
     /// Pending provider work is intentionally never persisted, so a resumed
     /// game always opens at a committed turn. The payload's top-level history
     /// and memories are the portable mirrors used on disk and become the
-    /// authoritative display history after restore.
+    /// authoritative display history after restore. The payload's undo ring
+    /// (when present — old saves have none) rebuilds the in-memory rewind
+    /// ring with fresh checkpoint ids; the 8-entry bound is re-enforced here
+    /// so hand-edited saves cannot grow it.
     pub fn from_snapshot_payload(pack: &StoryPack, payload: SavePayload) -> Self {
         let mut game = payload.stable_state;
         game.memories = payload.memories;
         game.history = payload.history;
+        let ring_start = payload.undo_stack.len().saturating_sub(CHECKPOINT_RING);
+        let checkpoints = payload.undo_stack[ring_start..]
+            .iter()
+            .map(|snapshot| Checkpoint {
+                id: Uuid::new_v4(),
+                game: snapshot.clone(),
+            })
+            .collect();
         Self {
             game,
             pack_metadata: pack.metadata.clone(),
             pending: None,
             retry_pending: None,
             lineage: Vec::new(),
-            checkpoints: Vec::new(),
+            checkpoints,
             audit_tail: payload.audit_tail,
             autosave_on_accept: true,
             use_director_writer: false,
+            lorebook_override: None,
+            suggested_action: None,
+            variant_pool: BTreeMap::new(),
+            current_variants: None,
+            truncation: TruncationStatus::None,
+            empty_side_result: false,
         }
     }
 }
@@ -275,6 +400,16 @@ pub fn reduce(
     cmd: EngineCommand,
     pack: &StoryPack,
 ) -> Result<Transition, CoreError> {
+    // Lorebook hot-replace: a session override installed by SetLorebookEntries
+    // applies to every prompt build and activation ledger write. StartNewGame
+    // is excluded because it clears the override while rebuilding state, so
+    // the opening must match against pack canon.
+    let effective_pack = if matches!(cmd, EngineCommand::StartNewGame) {
+        std::borrow::Cow::Borrowed(pack)
+    } else {
+        override_lorebook(pack, state)
+    };
+    let pack = &*effective_pack;
     let mut transition = match cmd {
         EngineCommand::StartNewGame => reduce_start_new_game(state, pack),
         EngineCommand::SubmitChoice { choice_id } => {
@@ -314,6 +449,15 @@ pub fn reduce(
         EngineCommand::FallbackToSinglePass { generation_id } => {
             Ok(reduce_fallback_to_single_pass(state, pack, generation_id))
         }
+        EngineCommand::ContinueNarration => Ok(reduce_continue_narration(state, pack)),
+        EngineCommand::SuggestAction => Ok(reduce_suggest_action(state, pack)),
+        EngineCommand::GroupScene => Ok(reduce_group_scene(state, pack)),
+        EngineCommand::SetLorebookEntries { entries } => {
+            Ok(reduce_set_lorebook_entries(state, entries))
+        }
+        EngineCommand::CycleTurnVariant { delta } => {
+            Ok(reduce_cycle_turn_variant(state, pack, delta))
+        }
         EngineCommand::DismissError => Ok(reduce_dismiss_error(state, pack)),
         EngineCommand::Quit => Ok(Transition::identity(clone_state(state))),
     }?;
@@ -321,10 +465,28 @@ pub fn reduce(
     Ok(transition)
 }
 
+/// Borrow `pack` with the session lorebook entries replaced by
+/// [`EngineState::lorebook_override`] when one is installed. Book-level
+/// settings (scan depth, budget, recursion switch) stay with the pack.
+fn override_lorebook<'a>(
+    pack: &'a StoryPack,
+    state: &EngineState,
+) -> std::borrow::Cow<'a, StoryPack> {
+    match &state.lorebook_override {
+        None => std::borrow::Cow::Borrowed(pack),
+        Some(entries) => {
+            let mut patched = pack.clone();
+            patched.lorebook.entries = entries.clone();
+            std::borrow::Cow::Owned(patched)
+        }
+    }
+}
+
 /// Record this turn's lorebook activations on the game state so sticky and
 /// cooldown timers can be evaluated deterministically on later turns. Runs
-/// only for genuine turn-start requests — choice-refresh repairs and the
-/// Writer stage of an already-recorded turn are skipped.
+/// only for genuine turn-start requests — choice-refresh repairs, the Writer
+/// stage of an already-recorded turn, and side generations (continue/suggest
+/// never open a turn) are skipped.
 fn record_lorebook_activations(pack: &StoryPack, transition: &mut Transition) {
     if pack.lorebook.is_empty() {
         return;
@@ -338,7 +500,7 @@ fn record_lorebook_activations(pack: &StoryPack, transition: &mut Transition) {
         .state
         .pending
         .as_ref()
-        .is_some_and(|pending| pending.choice_refresh);
+        .is_some_and(|pending| pending.choice_refresh || pending.side_kind.is_some());
     if !starts_turn {
         return;
     }
@@ -358,32 +520,35 @@ fn record_lorebook_activations(pack: &StoryPack, transition: &mut Transition) {
         None,
     );
     // Every entry visible this turn (constants included) lands in the ledger.
-    let mut ids: Vec<String> = selected
+    let mut batch: Vec<story_model::LorebookActivation> = selected
         .stable_before
         .iter()
         .chain(selected.stable_after.iter())
         .chain(selected.triggered.iter())
-        .map(|entry| entry.id.clone())
+        .map(|entry| story_model::LorebookActivation {
+            turn: upcoming,
+            entry_id: entry.id.clone(),
+        })
         .collect();
-    if ids.is_empty() {
+    if batch.is_empty() {
         return;
     }
-    ids.sort();
+    batch.sort_by(|a, b| a.entry_id.cmp(&b.entry_id));
     let game = &mut transition.state.game;
     // One batch per turn: a re-request of the same turn replaces its entries.
     game.lorebook_activations
         .retain(|record| record.turn != upcoming);
-    for entry_id in ids {
-        game.lorebook_activations
-            .push(story_model::LorebookActivation {
-                turn: upcoming,
-                entry_id,
-            });
-    }
+    game.lorebook_activations.extend(batch.iter().cloned());
     game.lorebook_activations.sort_by_key(|record| record.turn);
     if game.lorebook_activations.len() > story_model::LOREBOOK_LEDGER_CAP {
         let excess = game.lorebook_activations.len() - story_model::LOREBOOK_LEDGER_CAP;
         game.lorebook_activations.drain(0..excess);
+    }
+    // The batch rides the pending generation so the accept path can re-apply
+    // it: the committed game is rebuilt from the pre-recording checkpoint
+    // (see `apply_lorebook_delta`).
+    if let Some(pending) = transition.state.pending.as_mut() {
+        pending.lorebook_activations = batch;
     }
 }
 
@@ -402,6 +567,8 @@ fn reduce_start_new_game(state: &EngineState, pack: &StoryPack) -> Result<Transi
         choice_refresh_attempt: 0,
         choice_refresh_rejected: Vec::new(),
         narration_repair: None,
+        side_kind: None,
+        lorebook_activations: Vec::new(),
     };
     let mut next = clone_state(state);
     next.game = game;
@@ -412,6 +579,17 @@ fn reduce_start_new_game(state: &EngineState, pack: &StoryPack) -> Result<Transi
     // A fresh game must not offer undos into the previous playthrough, even
     // in-memory: clear the rewind ring.
     next.checkpoints = Vec::new();
+    // Pack canon again: a session lorebook edit belongs to the session that
+    // made it, and a stale suggestion must not survive a restart.
+    next.lorebook_override = None;
+    next.suggested_action = None;
+    // Variants belong to the session that generated them: a fresh game starts
+    // with no cycling candidates.
+    next.variant_pool = BTreeMap::new();
+    next.current_variants = None;
+    // A fresh game retires any per-turn badges from the previous session.
+    next.truncation = TruncationStatus::None;
+    next.empty_side_result = false;
 
     let loading_view = build_view(&next, pack, Some(&pending), None);
     let effects = if state.use_director_writer {
@@ -478,6 +656,8 @@ fn reduce_submit_choice(
         choice_refresh_attempt: 0,
         choice_refresh_rejected: Vec::new(),
         narration_repair: None,
+        side_kind: None,
+        lorebook_activations: Vec::new(),
     };
     let request = build_turn_request(
         generation_id,
@@ -491,6 +671,11 @@ fn reduce_submit_choice(
     next.pending = Some(pending.clone());
     next.retry_pending = None;
     next.lineage = vec![generation_id];
+    // A new regular turn retires the previous turn's truncation badge and any
+    // stale side-result flag: the displayed prose they described is about to
+    // be replaced.
+    next.truncation = TruncationStatus::None;
+    next.empty_side_result = false;
 
     let loading_view = build_view(&next, pack, Some(&pending), None);
     let effects = vec![
@@ -534,6 +719,8 @@ fn reduce_submit_free_action(
         choice_refresh_attempt: 0,
         choice_refresh_rejected: Vec::new(),
         narration_repair: None,
+        side_kind: None,
+        lorebook_activations: Vec::new(),
     };
     let request = build_turn_request(generation_id, pack, &state.game, Some(&action), None);
 
@@ -541,6 +728,10 @@ fn reduce_submit_free_action(
     next.pending = Some(pending.clone());
     next.retry_pending = None;
     next.lineage = vec![generation_id];
+    // Same discipline as SubmitChoice: a new regular turn retires the stale
+    // per-turn badges.
+    next.truncation = TruncationStatus::None;
+    next.empty_side_result = false;
 
     let loading_view = build_view(&next, pack, Some(&pending), None);
     let effects = vec![
@@ -580,6 +771,8 @@ fn reduce_regenerate(state: &EngineState, pack: &StoryPack) -> Transition {
         choice_refresh_attempt: if pending.choice_refresh { 1 } else { 0 },
         choice_refresh_rejected: pending.choice_refresh_rejected.clone(),
         narration_repair: None,
+        side_kind: pending.side_kind,
+        lorebook_activations: pending.lorebook_activations.clone(),
     };
     let selected_choice = pending.checkpoint.history.last().and_then(|entry| {
         entry
@@ -593,7 +786,14 @@ fn reduce_regenerate(state: &EngineState, pack: &StoryPack) -> Transition {
     next.lineage.push(generation_id);
 
     let loading_view = build_view(&next, pack, Some(&new_pending), None);
-    let request_effect = if pending.choice_refresh {
+    let request_effect = if let Some(kind) = pending.side_kind {
+        // A side generation regenerates as the same side generation — never
+        // as a full turn request.
+        EngineEffect::RequestGeneration {
+            generation_id,
+            request: build_side_request(generation_id, pack, &pending.checkpoint, kind),
+        }
+    } else if pending.choice_refresh {
         EngineEffect::RequestGeneration {
             generation_id,
             request: build_choice_refresh_request(
@@ -655,12 +855,32 @@ fn reduce_restore_checkpoint(
         return Transition::identity(clone_state(state));
     };
     let mut next = clone_state(state);
+    // Variant pool seeding: the narration being discarded becomes a cycling
+    // candidate when the player re-commits this turn. Only a genuine rewind
+    // (strictly older target) removes a turn; same-turn restores (choice
+    // refreshes) seed nothing.
+    if cp.game.turn < next.game.turn
+        && let Some(entry) = next.game.history.last()
+    {
+        let pool = next.variant_pool.entry(next.game.turn).or_default();
+        pool.push(entry.narration.clone());
+        if pool.len() > VARIANT_CAP {
+            let excess = pool.len() - VARIANT_CAP;
+            pool.drain(0..excess);
+        }
+    }
+    next.current_variants = None;
     next.game = cp.game;
     next.pending = None;
     // A failed retry anchored to the pre-rewind state must not replay an old
     // turn on top of the rewound game.
     next.retry_pending = None;
     next.lineage = Vec::new();
+    // The rewind replaces the displayed turn: the truncation badge and the
+    // side-result flag described the discarded prose and must not drive the
+    // host on the rewound state.
+    next.truncation = TruncationStatus::None;
+    next.empty_side_result = false;
     let view = build_view(&next, pack, None, None);
     let mut effects = vec![EngineEffect::PublishView(Box::new(view))];
     // Keep the autosave slot on the rewound state so quitting and resuming
@@ -694,6 +914,12 @@ fn reduce_accept(
 
     if pending.choice_refresh {
         return Ok(reduce_accept_choice_refresh(state, pack, pending, draft));
+    }
+    // Side generations (continue/suggest) accept ONLY the narration field.
+    // They bypass the quality gates, the patch, and the checkpoint push: the
+    // committed turn was already valid when it was accepted.
+    if let Some(kind) = pending.side_kind {
+        return Ok(reduce_accept_side(state, pack, draft.narration, kind));
     }
 
     // A narration repair has no authority over choices/state/summary. Keep
@@ -918,6 +1144,8 @@ fn begin_choice_refresh(
         choice_refresh_attempt: 1,
         choice_refresh_rejected: Vec::new(),
         narration_repair: None,
+        side_kind: None,
+        lorebook_activations: Vec::new(),
     };
     let request = build_choice_refresh_request(generation_id, pack, &state.game, Some(report), &[]);
     let mut next = clone_state(state);
@@ -1135,6 +1363,12 @@ fn reduce_fallback_to_single_pass(
     if pending.generation_id != generation_id {
         return Transition::identity(clone_state(state));
     }
+    // Side generations never emit a Director request, so a fallback for one
+    // would be out of order; a full-turn rewrite would also corrupt their
+    // narration-only accept contract.
+    if pending.side_kind.is_some() {
+        return Transition::identity(clone_state(state));
+    }
     // Reuse the same generation_id so AcceptGeneration completes this turn.
     let request = build_turn_request(
         generation_id,
@@ -1168,6 +1402,286 @@ fn reduce_dismiss_error(state: &EngineState, pack: &StoryPack) -> Transition {
         state: next,
         effects: vec![EngineEffect::PublishView(Box::new(view))],
         audit: Vec::new(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// side-generation family (continue / suggest) + lorebook hot-replace
+// ---------------------------------------------------------------------------
+
+/// Shared gate for the side-generation family: ignored while a generation is
+/// in flight or an error overlay is up (`retry_pending` is the engine-side
+/// marker of an undmissed error), exactly like the other player commands.
+fn side_generation_blocked(state: &EngineState) -> bool {
+    state.pending.is_some() || state.retry_pending.is_some()
+}
+
+/// Handle [`EngineCommand::ContinueNarration`]: request a continuation of the
+/// last committed turn's narration. No new turn, no checkpoint push. A
+/// continuation needs a committed turn to extend — with empty history
+/// (opening not yet accepted) the command is a no-op.
+fn reduce_continue_narration(state: &EngineState, pack: &StoryPack) -> Transition {
+    if side_generation_blocked(state) || state.game.history.last().is_none() {
+        return Transition::identity(clone_state(state));
+    }
+    begin_side_generation(state, pack, SideGenerationKind::Continue)
+}
+
+/// Handle [`EngineCommand::SuggestAction`]: request a one-sentence suggested
+/// player action. Commits nothing; the response is stored for
+/// [`EngineState::take_suggested_action`].
+fn reduce_suggest_action(state: &EngineState, pack: &StoryPack) -> Transition {
+    if side_generation_blocked(state) {
+        return Transition::identity(clone_state(state));
+    }
+    begin_side_generation(state, pack, SideGenerationKind::Suggest)
+}
+
+/// Handle [`EngineCommand::GroupScene`]: request a cast group-conversation
+/// scene bit attached to the last committed turn's narration. Like a
+/// continuation it needs a committed turn to attach to — with empty history
+/// (opening not yet accepted) the command is a no-op.
+fn reduce_group_scene(state: &EngineState, pack: &StoryPack) -> Transition {
+    if side_generation_blocked(state) || state.game.history.last().is_none() {
+        return Transition::identity(clone_state(state));
+    }
+    begin_side_generation(state, pack, SideGenerationKind::Scene)
+}
+
+fn begin_side_generation(
+    state: &EngineState,
+    pack: &StoryPack,
+    kind: SideGenerationKind,
+) -> Transition {
+    let generation_id = Uuid::new_v4();
+    // The checkpoint IS the committed state, so cancel/failure restore it
+    // byte-identically (same contract as a choice-only refresh).
+    let pending = PendingGeneration {
+        generation_id,
+        checkpoint: state.game.clone(),
+        player_choice_id: match kind {
+            SideGenerationKind::Continue => CONTINUE_CHOICE_ID.to_string(),
+            SideGenerationKind::Suggest => SUGGEST_CHOICE_ID.to_string(),
+            SideGenerationKind::Scene => GROUP_SCENE_CHOICE_ID.to_string(),
+        },
+        requested_at_turn: state.game.turn,
+        player_action: None,
+        validated_plan: None,
+        choice_refresh: false,
+        choice_refresh_attempt: 0,
+        choice_refresh_rejected: Vec::new(),
+        narration_repair: None,
+        side_kind: Some(kind),
+        lorebook_activations: Vec::new(),
+    };
+    let request = build_side_request(generation_id, pack, &state.game, kind);
+    let mut next = clone_state(state);
+    next.pending = Some(pending.clone());
+    next.retry_pending = None;
+    next.lineage = vec![generation_id];
+    let loading_view = build_view(&next, pack, Some(&pending), None);
+    Transition {
+        state: next,
+        effects: vec![
+            EngineEffect::RequestGeneration {
+                generation_id,
+                request,
+            },
+            EngineEffect::PublishView(Box::new(loading_view)),
+        ],
+        audit: Vec::new(),
+    }
+}
+
+/// Accept a completed side generation. ONLY `narration` is consumed:
+///
+/// - Continue and Scene append it to the last committed turn's narration
+///   (choices, state patch, turn counter, recent arc untouched), bump
+///   `revision`, and refresh the current-turn checkpoint in the rewind ring
+///   so the ring and the committed state never diverge. The autosave effect
+///   fires like a normal accepted turn, so the extended prose is persisted.
+///   A scene never changes relationship state — the draft's patch is
+///   discarded by construction.
+/// - Suggest stores the sentence for [`EngineState::take_suggested_action`];
+///   game state is not touched at all.
+fn reduce_accept_side(
+    state: &EngineState,
+    pack: &StoryPack,
+    narration: String,
+    kind: SideGenerationKind,
+) -> Transition {
+    let mut next = clone_state(state);
+    next.pending = None;
+    next.retry_pending = None;
+    next.lineage.clear();
+    let continuation = narration.trim().to_string();
+    // An empty side result is no longer silently swallowed: state and turn
+    // stay untouched and the flag tells the host to re-dispatch the same side
+    // command once (and/or toast). The retry judgment stays host-driven — the
+    // engine never re-dispatches on its own.
+    next.empty_side_result = continuation.is_empty();
+    let mut effects = Vec::new();
+    match kind {
+        SideGenerationKind::Continue | SideGenerationKind::Scene => {
+            if let Some(entry) = next.game.history.last_mut()
+                && !continuation.is_empty()
+            {
+                entry.narration.push_str("\n\n");
+                entry.narration.push_str(&continuation);
+            }
+            next.game.revision = next.game.revision.saturating_add(1);
+            let extended = next.game.clone();
+            // Keep the variant list aligned: the slot holding the displayed
+            // narration now holds the extended prose, so cycling away and
+            // back cannot silently revert a committed, autosaved extension.
+            if let Some((turn, index, variants)) = &mut next.current_variants
+                && *turn == extended.turn
+                && let Some(displayed) = variants.get_mut(*index)
+            {
+                *displayed = extended
+                    .history
+                    .last()
+                    .map(|entry| entry.narration.clone())
+                    .unwrap_or_default();
+            }
+            // AC-8: the appended prose consumed the one auto-continue this
+            // truncated turn allowed. Keep the badge visible (ManualOnly) so
+            // the host cannot fire a second automatic continuation, while the
+            // player still can continue by hand. An empty accept leaves the
+            // status as-is — nothing was appended, the budget is unspent.
+            if !continuation.is_empty() && next.truncation == TruncationStatus::Auto {
+                next.truncation = TruncationStatus::ManualOnly;
+            }
+            // Same-identity upsert: no new rewind target, but the ring's
+            // current-turn snapshot sees the extended narration.
+            upsert_current_checkpoint(&mut next.checkpoints, &extended);
+            let view = build_view(&next, pack, None, None);
+            effects.push(EngineEffect::PublishView(Box::new(view)));
+            if next.autosave_on_accept {
+                effects.push(EngineEffect::PersistStableState {
+                    slot_id: AUTOSAVE_SLOT.to_string(),
+                    description: Some(format!("턴 {} (이어쓰기)", next.game.turn)),
+                });
+            }
+        }
+        SideGenerationKind::Suggest => {
+            // One sentence, ready to drop into the host's input buffer.
+            next.suggested_action = (!continuation.is_empty()).then_some(continuation);
+            let view = build_view(&next, pack, None, None);
+            effects.push(EngineEffect::PublishView(Box::new(view)));
+        }
+    }
+    Transition {
+        state: next,
+        effects,
+        audit: Vec::new(),
+    }
+}
+
+/// Handle [`EngineCommand::SetLorebookEntries`]: install the session
+/// override so the next turn matches against the new entries. The view does
+/// not change, and nothing is written to the pack. Ignored while a
+/// generation is in flight — the in-flight prompt already locked in the old
+/// entries, and swapping mid-generation would desync the activation ledger.
+fn reduce_set_lorebook_entries(
+    state: &EngineState,
+    entries: Vec<story_model::LorebookEntry>,
+) -> Transition {
+    if state.pending.is_some() {
+        return Transition::identity(clone_state(state));
+    }
+    let mut next = clone_state(state);
+    next.lorebook_override = Some(entries);
+    Transition::identity(next)
+}
+
+/// Handle [`EngineCommand::CycleTurnVariant`]: rotate the last committed
+/// turn's narration through its variant list (wrapping). Post-commit only —
+/// identity while a generation is in flight or an error overlay is up, when
+/// no variant list exists for the current turn, or when it holds a single
+/// narration. Rotation mirrors the continue-accept discipline: revision
+/// bump, current-turn ring snapshot upsert, and the autosave effect so the
+/// shown variant is persisted.
+fn reduce_cycle_turn_variant(state: &EngineState, pack: &StoryPack, delta: i32) -> Transition {
+    if side_generation_blocked(state) {
+        return Transition::identity(clone_state(state));
+    }
+    let Some((turn, index, variants)) = state.current_variants.as_ref() else {
+        return Transition::identity(clone_state(state));
+    };
+    if *turn != state.game.turn || variants.len() <= 1 {
+        return Transition::identity(clone_state(state));
+    }
+    let next_index =
+        ((*index as i64) + i64::from(delta)).rem_euclid(variants.len() as i64) as usize;
+    let mut next = clone_state(state);
+    if let Some(entry) = next.game.history.last_mut() {
+        entry.narration = variants[next_index].clone();
+    }
+    next.game.revision = next.game.revision.saturating_add(1);
+    next.current_variants = Some((*turn, next_index, variants.clone()));
+    let cycled = next.game.clone();
+    upsert_current_checkpoint(&mut next.checkpoints, &cycled);
+    let view = build_view(&next, pack, None, None);
+    let mut effects = vec![EngineEffect::PublishView(Box::new(view))];
+    if next.autosave_on_accept {
+        effects.push(EngineEffect::PersistStableState {
+            slot_id: AUTOSAVE_SLOT.to_string(),
+            description: Some(format!("턴 {} (변형)", next.game.turn)),
+        });
+    }
+    Transition {
+        state: next,
+        effects,
+        audit: Vec::new(),
+    }
+}
+
+/// Build the [`TurnRequest`] for a side generation. Single-pass only by
+/// design — the 2-stage Director→Writer path is never combined with
+/// continue/suggest — and shaped like a normal turn draft so the provider's
+/// recovery parser keeps working; the engine discards everything but
+/// `narration` on accept.
+fn build_side_request(
+    generation_id: Uuid,
+    pack: &StoryPack,
+    game: &GameState,
+    kind: SideGenerationKind,
+) -> TurnRequest {
+    let bundle = match kind {
+        SideGenerationKind::Continue => {
+            crate::prompt_context::build_continue_prompt(pack, game, &game.history)
+        }
+        SideGenerationKind::Suggest => {
+            crate::prompt_context::build_suggest_prompt(pack, game, &game.history)
+        }
+        SideGenerationKind::Scene => {
+            crate::prompt_context::build_group_scene_prompt(pack, game, &game.history)
+        }
+    };
+    let messages = vec![
+        story_model::ChatMessage {
+            role: "system".to_string(),
+            content: bundle.system,
+        },
+        story_model::ChatMessage {
+            role: "user".to_string(),
+            content: bundle.user,
+        },
+    ];
+    TurnRequest {
+        generation_id,
+        messages,
+        model: "mock".to_string(),
+        temperature: 0.8,
+        top_p: 0.95,
+        top_k: 40,
+        max_tokens: 2048,
+        json_schema: Some(generated_turn_json_schema(
+            pack.default_choice_count() as usize,
+            &pack.rules,
+            !pack.characters.is_empty(),
+        )),
     }
 }
 
@@ -1213,6 +1727,8 @@ fn reduce_submit_choice_director(
         choice_refresh_attempt: 0,
         choice_refresh_rejected: Vec::new(),
         narration_repair: None,
+        side_kind: None,
+        lorebook_activations: Vec::new(),
     };
     let request = build_director_request(generation_id, pack, &state.game, None, selected_choice);
 
@@ -1220,6 +1736,10 @@ fn reduce_submit_choice_director(
     next.pending = Some(pending.clone());
     next.retry_pending = None;
     next.lineage = vec![generation_id];
+    // A new regular turn retires the previous turn's truncation badge and any
+    // stale side-result flag (same as the single-pass SubmitChoice).
+    next.truncation = TruncationStatus::None;
+    next.empty_side_result = false;
 
     let loading_view = build_view(&next, pack, Some(&pending), None);
     let effects = vec![
@@ -1261,12 +1781,18 @@ fn reduce_submit_free_action_director(
         choice_refresh_attempt: 0,
         choice_refresh_rejected: Vec::new(),
         narration_repair: None,
+        side_kind: None,
+        lorebook_activations: Vec::new(),
     };
     let request = build_director_request(generation_id, pack, &state.game, Some(&action), None);
 
     let mut next = clone_state(state);
     next.pending = Some(pending.clone());
     next.lineage = vec![generation_id];
+    // Same discipline as SubmitChoice: a new regular turn retires the stale
+    // per-turn badges.
+    next.truncation = TruncationStatus::None;
+    next.empty_side_result = false;
 
     let loading_view = build_view(&next, pack, Some(&pending), None);
     let effects = vec![
@@ -1426,7 +1952,16 @@ fn reduce_accept_writer_finish(
             &quality,
         ));
     }
-    let (next, audit) = assemble_accepted_2stage_turn(state, pack, pending, validated, writer);
+    let (mut next, audit) = assemble_accepted_2stage_turn(state, pack, pending, validated, writer);
+    // AC-5/AC-8: a "length" finish means the output token cap cut the prose
+    // mid-sentence. Whether the host may auto-continue depends on the
+    // per-turn defensive budget: a turn that already ran its narration repair
+    // is manual-only. "stop"/unreported finishes leave no truncation state.
+    next.truncation = match finish.finish_reason.as_deref() {
+        Some("length") if pending.narration_repair.is_some() => TruncationStatus::ManualOnly,
+        Some("length") => TruncationStatus::Auto,
+        _ => TruncationStatus::None,
+    };
     let view = build_view(&next, pack, None, None);
     let mut effects = vec![EngineEffect::PublishView(Box::new(view))];
     if next.autosave_on_accept {
@@ -1612,10 +2147,12 @@ fn assemble_accepted_2stage_turn(
     crate::narrative::advance_after_accept(&mut game, pack, selected_choice.as_ref());
     crate::narrative::mark_recalled(&mut game, pack);
     game.stable_generation_id = Some(pending.generation_id);
+    apply_lorebook_delta(&mut game, pending);
 
     let mut checkpoints = state.checkpoints.clone();
     upsert_current_checkpoint(&mut checkpoints, &game);
 
+    let current_variants = current_variants_for(&state.variant_pool, &game);
     let audit = validated.dry_run.change_log.clone();
     let next = EngineState {
         game,
@@ -1627,6 +2164,15 @@ fn assemble_accepted_2stage_turn(
         audit_tail: extend_audit_tail(&state.audit_tail, &audit),
         autosave_on_accept: state.autosave_on_accept,
         use_director_writer: state.use_director_writer,
+        lorebook_override: state.lorebook_override.clone(),
+        suggested_action: state.suggested_action.clone(),
+        variant_pool: state.variant_pool.clone(),
+        current_variants,
+        // The truncation caller (reduce_accept_writer_finish) overrides this
+        // for a "length" finish; a committed turn always retires the stale
+        // side-result flag.
+        truncation: TruncationStatus::None,
+        empty_side_result: false,
     };
     // The writer lint pass is non-fatal; the offending text has already been
     // stripped. Surfacing it through the engine is future work (a tracing
@@ -1715,12 +2261,14 @@ fn assemble_accepted_turn(
     crate::narrative::advance_after_accept(&mut game, pack, selected_choice.as_ref());
     crate::narrative::mark_recalled(&mut game, pack);
     game.stable_generation_id = Some(draft.generation_id);
+    apply_lorebook_delta(&mut game, pending);
 
     // Push the just-committed state onto the checkpoint ring (cap keeps the
     // most recent CHECKPOINT_RING entries).
     let mut checkpoints = state.checkpoints.clone();
     upsert_current_checkpoint(&mut checkpoints, &game);
 
+    let current_variants = current_variants_for(&state.variant_pool, &game);
     let next = EngineState {
         game,
         pack_metadata: state.pack_metadata.clone(),
@@ -1731,8 +2279,62 @@ fn assemble_accepted_turn(
         audit_tail: extend_audit_tail(&state.audit_tail, &result.change_log),
         autosave_on_accept: state.autosave_on_accept,
         use_director_writer: state.use_director_writer,
+        lorebook_override: state.lorebook_override.clone(),
+        suggested_action: state.suggested_action.clone(),
+        variant_pool: state.variant_pool.clone(),
+        current_variants,
+        // Regular single-pass commit: no finish_reason exists on this path
+        // (the provider consumes length repairs internally), so any previous
+        // truncation badge retires with the displayed turn it described.
+        truncation: TruncationStatus::None,
+        empty_side_result: false,
     };
     (next, result.change_log)
+}
+
+/// Re-apply the request-time lorebook activation batch onto the accepted
+/// turn's game state. Activations are recorded when the prompt is built, but
+/// accept rebuilds the game from `pending.checkpoint`, which predates the
+/// recording — without this merge every accept silently dropped the batch
+/// and reset sticky/cooldown timers (F-3). Cancel/failure never call this,
+/// so a turn that never committed keeps the timers clean.
+fn apply_lorebook_delta(game: &mut GameState, pending: &PendingGeneration) {
+    if pending.lorebook_activations.is_empty() {
+        return;
+    }
+    let upcoming = pending.requested_at_turn + 1;
+    // One batch per turn: re-applying replaces that turn's records only.
+    game.lorebook_activations
+        .retain(|record| record.turn != upcoming);
+    game.lorebook_activations
+        .extend(pending.lorebook_activations.iter().cloned());
+    game.lorebook_activations.sort_by_key(|record| record.turn);
+    if game.lorebook_activations.len() > story_model::LOREBOOK_LEDGER_CAP {
+        let excess = game.lorebook_activations.len() - story_model::LOREBOOK_LEDGER_CAP;
+        game.lorebook_activations.drain(0..excess);
+    }
+}
+
+/// Build the cycle holder for the just-committed turn: the accepted
+/// narration first, then this turn's undone narrations from the session
+/// variant pool (deduped, capped). `None` while there is nothing to cycle.
+fn current_variants_for(
+    pool: &BTreeMap<u32, Vec<String>>,
+    game: &GameState,
+) -> Option<(u32, usize, Vec<String>)> {
+    let seeded = pool.get(&game.turn)?;
+    let accepted = game.history.last()?.narration.clone();
+    let mut variants = vec![accepted];
+    for narration in seeded {
+        if variants.iter().any(|existing| existing == narration) {
+            continue;
+        }
+        variants.push(narration.clone());
+        if variants.len() == VARIANT_CAP {
+            break;
+        }
+    }
+    (variants.len() > 1).then_some((game.turn, 0, variants))
 }
 
 fn apply_resolved_ending(
@@ -2000,6 +2602,39 @@ pub fn build_view(
         .find(|checkpoint| checkpoint.game.turn < game.turn)
         .map(|checkpoint| checkpoint.id);
 
+    // Variant badge: shown only while the displayed narration is one of
+    // several for this turn (see CycleTurnVariant); undo and a plain new
+    // turn reset it to `None`. While loading the badge simply sits under
+    // the loading overlay — no dedicated reset.
+    let variant_label = match &state.current_variants {
+        Some((turn, index, variants)) if *turn == game.turn && variants.len() > 1 => {
+            Some(format!("변형 {}/{}", index + 1, variants.len()))
+        }
+        _ => None,
+    };
+
+    // Cast roster: live character state joined with the pack's display names,
+    // iterated in `game.characters` key order (deterministic). A character
+    // the pack no longer declares keeps its id as the display name instead of
+    // disappearing from the roster.
+    let cast = game
+        .characters
+        .iter()
+        .map(|(id, live)| story_model::CharacterStatusView {
+            id: id.clone(),
+            name: pack
+                .characters
+                .get(id)
+                .map(|character| character.name.clone())
+                .unwrap_or_else(|| id.0.clone()),
+            relationship_stage: live.relationship_stage,
+            current_emotion: live.current_emotion,
+            affection: live.affection,
+            trust: live.trust,
+            tension: live.tension,
+        })
+        .collect();
+
     AppViewModel {
         screen: Screen::Story,
         story_title: pack.metadata.title.clone(),
@@ -2018,6 +2653,10 @@ pub fn build_view(
         loading: loading_state,
         error,
         undo_checkpoint_id,
+        variant_label,
+        cast,
+        truncation: state.truncation,
+        empty_side_result: state.empty_side_result,
     }
 }
 
@@ -2555,6 +3194,12 @@ fn clone_state(state: &EngineState) -> EngineState {
         audit_tail: state.audit_tail.clone(),
         autosave_on_accept: state.autosave_on_accept,
         use_director_writer: state.use_director_writer,
+        lorebook_override: state.lorebook_override.clone(),
+        suggested_action: state.suggested_action.clone(),
+        variant_pool: state.variant_pool.clone(),
+        current_variants: state.current_variants.clone(),
+        truncation: state.truncation,
+        empty_side_result: state.empty_side_result,
     }
 }
 

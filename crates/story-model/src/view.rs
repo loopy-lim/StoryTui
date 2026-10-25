@@ -17,7 +17,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::uuid::Uuid;
-use crate::{RiskLevel, TimeSlot};
+use crate::{CharacterId, Emotion, RelationshipStage, RiskLevel, TimeSlot};
 
 /// The complete view the engine publishes for one render. All display strings
 /// are pre-resolved (Korean allowed); the TUI only lays them out.
@@ -48,6 +48,77 @@ pub struct AppViewModel {
     /// nothing to undo (fresh game, save restore, or mid-generation).
     #[serde(default)]
     pub undo_checkpoint_id: Option<Uuid>,
+    /// Variant-cycle badge for the displayed narration, e.g. `"변형 2/3"`.
+    /// `Some` only while the last committed turn has more than one stored
+    /// variant; `None` otherwise (plain turns, loading, after undo).
+    #[serde(default)]
+    pub variant_label: Option<String>,
+    /// Live status of every cast member (id-key order): the `p` roster
+    /// overlay's rows and the free-input `@mention` target pool. Absent in
+    /// views serialized before the cast roster shipped; `serde(default)`
+    /// keeps those loadable, exactly like `variant_label`.
+    #[serde(default)]
+    pub cast: Vec<CharacterStatusView>,
+    /// Truncation state of the displayed turn's prose, derived from the
+    /// Writer stream's `finish_reason == "length"` (max_tokens cut). The host
+    /// decides the reaction: `Auto` allows ONE automatic `ContinueNarration`,
+    /// `ManualOnly` forbids it (the per-turn defensive re-call budget was
+    /// spent). Cleared on the next regular turn request/commit.
+    #[serde(default)]
+    pub truncation: TruncationStatus,
+    /// `true` when the last side-generation (continue / suggested action /
+    /// group scene) came back empty and therefore applied nothing. The host
+    /// may re-dispatch the same side command once and/or toast; the engine
+    /// never re-dispatches by itself. A non-empty side accept, a regular
+    /// turn request/commit, or a rewind clears it.
+    #[serde(default)]
+    pub empty_side_result: bool,
+}
+
+/// Truncation state of the currently displayed turn's prose (AC-8: at most
+/// one defensive re-call per turn).
+///
+/// The engine derives it from the Writer stream's `finish_reason`; `"length"`
+/// means the output token cap cut the prose mid-sentence. Pure
+/// dispatch/display data — the engine never auto-continues on its own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TruncationStatus {
+    /// No reported truncation for the displayed turn (single-pass turns,
+    /// `"stop"`, unreported finish, or already retired).
+    #[default]
+    None,
+    /// The displayed prose was cut mid-sentence and this turn has NOT spent
+    /// its defensive re-call (no narration repair ran): the host may
+    /// auto-continue once.
+    Auto,
+    /// The displayed prose was cut, but this turn already spent its
+    /// defensive re-call (a narration repair ran, or an auto-continue
+    /// already appended): the host must NOT auto-continue — manual only.
+    ManualOnly,
+}
+
+/// One cast member's live status, joined from `pack.characters` (display
+/// name) and `game.characters` (mutable state). Pure display data — the TUI
+/// formats it and matches `@mentions` against it; the engine stays
+/// authoritative for the underlying `CharacterState`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CharacterStatusView {
+    /// Pack-stable character id (echoed as the free-action `target`).
+    pub id: CharacterId,
+    /// Pack display name (falls back to the id string for state-only
+    /// characters a pack no longer declares).
+    pub name: String,
+    /// Current relationship stage bucket (unchanged by scene side-generations).
+    pub relationship_stage: RelationshipStage,
+    /// Current dominant emotion.
+    pub current_emotion: Emotion,
+    /// Affection score (same domain as `CharacterState.affection`).
+    pub affection: i16,
+    /// Trust score.
+    pub trust: i16,
+    /// Tension score.
+    pub tension: i16,
 }
 
 /// Top-level screen identifier. Only [`Screen::Story`] is rendered in the W5
@@ -160,10 +231,26 @@ mod tests {
                 recoverable: true,
             }),
             undo_checkpoint_id: Some(Uuid::nil()),
+            variant_label: None,
+            cast: vec![CharacterStatusView {
+                id: CharacterId("c-1".to_string()),
+                name: "유나".to_string(),
+                relationship_stage: crate::RelationshipStage::Acquaintance,
+                current_emotion: Emotion::Neutral,
+                affection: 3,
+                trust: 1,
+                tension: 8,
+            }],
+            truncation: TruncationStatus::Auto,
+            empty_side_result: false,
         };
         let json = serde_json::to_string(&view).expect("serialize");
         let back: AppViewModel = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, view);
+        assert!(
+            json.contains("\"truncation\":\"auto\""),
+            "TruncationStatus serializes snake_case: {json}"
+        );
     }
 
     #[test]
@@ -184,6 +271,13 @@ mod tests {
         }"#;
         let back: AppViewModel = serde_json::from_str(json).expect("deserialize legacy view");
         assert_eq!(back.undo_checkpoint_id, None);
+        assert_eq!(back.variant_label, None);
+        assert!(
+            back.cast.is_empty(),
+            "views serialized before the cast roster shipped deserialize to an empty cast"
+        );
+        assert_eq!(back.truncation, TruncationStatus::None);
+        assert!(!back.empty_side_result);
     }
 
     #[test]
@@ -214,6 +308,10 @@ mod tests {
             loading: None,
             error: None,
             undo_checkpoint_id: None,
+            variant_label: None,
+            cast: Vec::new(),
+            truncation: TruncationStatus::None,
+            empty_side_result: false,
         };
         let json = serde_json::to_string(&view).unwrap();
         let back: AppViewModel = serde_json::from_str(&json).unwrap();

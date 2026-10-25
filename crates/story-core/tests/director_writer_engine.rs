@@ -15,13 +15,13 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use story_core::engine::{EngineState, NarrationRepair, reduce};
+use story_core::engine::{EngineState, NarrationRepair, Transition, reduce};
 use story_core::engine_cmd::{EngineCommand, EngineEffect};
 use story_model::{
     CharacterDef, CharacterId, Choice, DirectorPlan, GeneratedTurnDraft, LocationDef, LocationId,
     PackContentPolicy, PackInitialState, PackMetadata, PackRating, PromptFragments,
-    RelationshipStage, RiskLevel, StatePatch, StoryPack, StoryRules, TimeSlot, TurnSummary,
-    WriterFinish,
+    RelationshipStage, RiskLevel, StatePatch, StoryPack, StoryRules, TimeSlot, TruncationStatus,
+    TurnSummary, WriterFinish,
 };
 
 const NAMU: &str = "c-namu";
@@ -653,6 +653,7 @@ fn accept_writer_finish_commits_plan_patch_and_writer_narration() {
                 generation_id: gid,
                 full_text: "나무가 조용히 고개를 끄덕인다.".to_string(),
                 usage: None,
+                finish_reason: None,
             }),
         },
         &pack,
@@ -719,6 +720,7 @@ fn accept_writer_finish_strips_embedded_patch_in_narration() {
                 generation_id: gid,
                 full_text: smuggled,
                 usage: None,
+                finish_reason: None,
             }),
         },
         &pack,
@@ -781,6 +783,7 @@ fn writer_repetition_gets_one_narration_only_rewrite_before_commit() {
                 generation_id: director_id,
                 full_text: "비가 그쳤다.".to_string(),
                 usage: None,
+                finish_reason: None,
             }),
         },
         &pack,
@@ -825,6 +828,7 @@ fn writer_repetition_gets_one_narration_only_rewrite_before_commit() {
                     "나무는 접어 둔 초대장을 테이블 위에 펴고, 오늘 전시회에 동행할지 묻는다."
                         .to_string(),
                 usage: None,
+                finish_reason: None,
             }),
         },
         &pack,
@@ -835,6 +839,364 @@ fn writer_repetition_gets_one_narration_only_rewrite_before_commit() {
         completed.state.game.history.last().unwrap().narration,
         "나무는 접어 둔 초대장을 테이블 위에 펴고, 오늘 전시회에 동행할지 묻는다."
     );
+}
+
+// ---------------------------------------------------------------------------
+// T-4: empty Writer narration + finish_reason truncation state (AC-5/6/8)
+// ---------------------------------------------------------------------------
+
+/// A narration-only draft for side-generation accepts. choices / patch /
+/// summary are deliberately junk: the engine must discard them.
+fn side_draft(generation_id: uuid::Uuid, narration: &str) -> GeneratedTurnDraft {
+    GeneratedTurnDraft {
+        generation_id,
+        narration: narration.to_string(),
+        choices: Vec::new(),
+        proposed_patch: StatePatch::default(),
+        summary: TurnSummary {
+            facts: vec![],
+            unresolved: vec![],
+            relationship_changes: vec![],
+            knowledge_changes: vec![],
+            interpretation: None,
+            address_form_changes: vec![],
+            important_player_actions: vec![],
+            source_history_ids: vec![],
+        },
+        usage: None,
+    }
+}
+
+fn published_view(t: &Transition) -> story_model::AppViewModel {
+    t.effects
+        .iter()
+        .find_map(|effect| match effect {
+            EngineEffect::PublishView(view) => Some((**view).clone()),
+            _ => None,
+        })
+        .expect("a PublishView was emitted")
+}
+
+/// A Director plan for the turn AFTER `valid_plan` was committed: none of its
+/// choices repeat the action the player just picked (next-0), which would
+/// trip the deterministic `RepeatsSelected` gate.
+fn followup_plan() -> DirectorPlan {
+    let mut plan = valid_plan();
+    plan.choices = vec![
+        choice("third-0", "고백의 뒷이야기를 묻는다", RiskLevel::High),
+        choice("third-1", "멈춘 손목시계의 시각을 확인한다", RiskLevel::Low),
+        choice("third-2", "함께 플랫폼으로 이동한다", RiskLevel::Medium),
+    ];
+    plan
+}
+
+/// Drive prime → SubmitChoice → AcceptDirectorPlan so a Writer request is
+/// pending. Returns the waiting state, the pack, and the writer generation id.
+fn writer_pending() -> (EngineState, StoryPack, uuid::Uuid) {
+    let (state, pack) = prime_then_enable_director();
+    let submitted = reduce(
+        &state,
+        EngineCommand::SubmitChoice {
+            choice_id: "choice-0".to_string(),
+        },
+        &pack,
+    )
+    .expect("submit");
+    let director_id = submitted.state.pending.as_ref().unwrap().generation_id;
+    let planned = reduce(
+        &submitted.state,
+        EngineCommand::AcceptDirectorPlan {
+            generation_id: director_id,
+            plan: Box::new(valid_plan()),
+        },
+        &pack,
+    )
+    .expect("plan");
+    let writer_id = planned
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            EngineEffect::RequestWriter { generation_id, .. } => Some(*generation_id),
+            _ => None,
+        })
+        .expect("RequestWriter");
+    (planned.state, pack, writer_id)
+}
+
+#[test]
+fn writer_empty_narration_gets_one_repair_then_the_quality_overlay() {
+    let (state, pack, writer_id) = writer_pending();
+
+    let repairing = reduce(
+        &state,
+        EngineCommand::AcceptWriterFinish {
+            finish: Box::new(WriterFinish {
+                generation_id: writer_id,
+                full_text: "   \n".to_string(),
+                usage: None,
+                finish_reason: Some("stop".to_string()),
+            }),
+        },
+        &pack,
+    )
+    .expect("empty writer narration starts the bounded repair");
+    assert_eq!(
+        repairing.state.game.turn, state.game.turn,
+        "nothing is committed"
+    );
+    assert!(matches!(
+        repairing
+            .state
+            .pending
+            .as_ref()
+            .and_then(|pending| pending.narration_repair.as_ref()),
+        Some(NarrationRepair::Writer { .. })
+    ));
+    let (repair_id, repair_request) = repairing
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            EngineEffect::RequestWriter {
+                generation_id,
+                request,
+            } => Some((*generation_id, request)),
+            _ => None,
+        })
+        .expect("one writer repair request");
+    assert_ne!(repair_id, writer_id);
+    assert!(
+        repair_request
+            .messages
+            .last()
+            .unwrap()
+            .content
+            .contains("본문이 비어 있다"),
+        "the repair prompt must carry the Empty instruction"
+    );
+
+    // The repair also comes back empty → bounded failure: checkpoint
+    // restored, retry offered, no second automatic repair.
+    let failed = reduce(
+        &repairing.state,
+        EngineCommand::AcceptWriterFinish {
+            finish: Box::new(WriterFinish {
+                generation_id: repair_id,
+                full_text: String::new(),
+                usage: None,
+                finish_reason: None,
+            }),
+        },
+        &pack,
+    )
+    .expect("bounded repair failure");
+    assert_eq!(failed.state.game.turn, state.game.turn);
+    assert!(failed.state.pending.is_none());
+    assert!(failed.state.retry_pending.is_some());
+    assert!(failed.effects.iter().any(|effect| matches!(
+        effect,
+        EngineEffect::ShowRecoverableError(error)
+            if error.code == "narration_quality_failed"
+    )));
+    assert!(
+        !failed
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, EngineEffect::RequestWriter { .. })),
+        "the repair is attempted exactly once"
+    );
+}
+
+#[test]
+fn writer_length_finish_marks_auto_and_the_next_turn_clears_it() {
+    let (state, pack, writer_id) = writer_pending();
+    let accepted = reduce(
+        &state,
+        EngineCommand::AcceptWriterFinish {
+            finish: Box::new(WriterFinish {
+                generation_id: writer_id,
+                full_text: "나무가 창밖으로 시선을 옮기고, 접어 둔 초대장을 천천히 펼친다."
+                    .to_string(),
+                usage: None,
+                finish_reason: Some("length".to_string()),
+            }),
+        },
+        &pack,
+    )
+    .expect("accept truncated writer finish");
+    assert_eq!(accepted.state.game.turn, state.game.turn + 1);
+    assert_eq!(accepted.state.truncation, TruncationStatus::Auto);
+    assert_eq!(published_view(&accepted).truncation, TruncationStatus::Auto);
+
+    // The next regular turn retires the badge: the pending start clears it
+    // and a "stop" finish keeps it cleared through the commit.
+    let submitted = reduce(
+        &accepted.state,
+        EngineCommand::SubmitChoice {
+            choice_id: "next-0".to_string(),
+        },
+        &pack,
+    )
+    .expect("submit next turn");
+    assert_eq!(
+        submitted.state.truncation,
+        TruncationStatus::None,
+        "a new regular turn pending clears the badge"
+    );
+    let director_id = submitted.state.pending.as_ref().unwrap().generation_id;
+    let planned = reduce(
+        &submitted.state,
+        EngineCommand::AcceptDirectorPlan {
+            generation_id: director_id,
+            plan: Box::new(followup_plan()),
+        },
+        &pack,
+    )
+    .expect("plan next turn");
+    let committed = reduce(
+        &planned.state,
+        EngineCommand::AcceptWriterFinish {
+            finish: Box::new(WriterFinish {
+                generation_id: director_id,
+                full_text: "나무는 조용히 자리에서 일어난다.".to_string(),
+                usage: None,
+                finish_reason: Some("stop".to_string()),
+            }),
+        },
+        &pack,
+    )
+    .expect("commit next turn");
+    assert_eq!(committed.state.truncation, TruncationStatus::None);
+    assert_eq!(
+        published_view(&committed).truncation,
+        TruncationStatus::None
+    );
+}
+
+#[test]
+fn writer_length_finish_after_a_spent_repair_is_manual_only() {
+    let (state, pack, writer_id) = writer_pending();
+    // The primed opening narration is exactly "비가 그쳤다." → the quality
+    // gate fires and spends this turn's defensive re-call.
+    let repairing = reduce(
+        &state,
+        EngineCommand::AcceptWriterFinish {
+            finish: Box::new(WriterFinish {
+                generation_id: writer_id,
+                full_text: "비가 그쳤다.".to_string(),
+                usage: None,
+                finish_reason: Some("length".to_string()),
+            }),
+        },
+        &pack,
+    )
+    .expect("repetition repair");
+    assert!(matches!(
+        repairing
+            .state
+            .pending
+            .as_ref()
+            .and_then(|pending| pending.narration_repair.as_ref()),
+        Some(NarrationRepair::Writer { .. })
+    ));
+    let repair_id = repairing
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            EngineEffect::RequestWriter { generation_id, .. } => Some(*generation_id),
+            _ => None,
+        })
+        .expect("repair request");
+    let committed = reduce(
+        &repairing.state,
+        EngineCommand::AcceptWriterFinish {
+            finish: Box::new(WriterFinish {
+                generation_id: repair_id,
+                full_text: "나무는 접어 둔 초대장을 펼치다가 말을 잇지 못한다.".to_string(),
+                usage: None,
+                finish_reason: Some("length".to_string()),
+            }),
+        },
+        &pack,
+    )
+    .expect("accept the repaired narration");
+    assert_eq!(committed.state.game.turn, state.game.turn + 1);
+    assert_eq!(
+        committed.state.truncation,
+        TruncationStatus::ManualOnly,
+        "the repair already spent the per-turn defensive budget (AC-8)"
+    );
+    assert_eq!(
+        published_view(&committed).truncation,
+        TruncationStatus::ManualOnly
+    );
+}
+
+#[test]
+fn writer_stop_or_unreported_finish_leaves_no_truncation() {
+    for finish_reason in [Some("stop".to_string()), None] {
+        let (state, pack, writer_id) = writer_pending();
+        let committed = reduce(
+            &state,
+            EngineCommand::AcceptWriterFinish {
+                finish: Box::new(WriterFinish {
+                    generation_id: writer_id,
+                    full_text: "나무가 조용히 고개를 끄덕인다.".to_string(),
+                    usage: None,
+                    finish_reason,
+                }),
+            },
+            &pack,
+        )
+        .expect("accept writer finish");
+        assert_eq!(committed.state.game.turn, state.game.turn + 1);
+        assert_eq!(committed.state.truncation, TruncationStatus::None);
+        assert_eq!(
+            published_view(&committed).truncation,
+            TruncationStatus::None
+        );
+    }
+}
+
+#[test]
+fn continue_accept_demotes_auto_truncation_to_manual_only() {
+    let (state, pack, writer_id) = writer_pending();
+    let accepted = reduce(
+        &state,
+        EngineCommand::AcceptWriterFinish {
+            finish: Box::new(WriterFinish {
+                generation_id: writer_id,
+                full_text: "나무가 말을 고르다 절반에서 멈춘다.".to_string(),
+                usage: None,
+                finish_reason: Some("length".to_string()),
+            }),
+        },
+        &pack,
+    )
+    .expect("accept truncated writer finish");
+    assert_eq!(accepted.state.truncation, TruncationStatus::Auto);
+
+    let requested =
+        reduce(&accepted.state, EngineCommand::ContinueNarration, &pack).expect("continue");
+    assert_eq!(
+        requested.state.truncation,
+        TruncationStatus::Auto,
+        "the badge survives the continue cycle so the host can still act"
+    );
+    let continue_id = requested.state.pending.as_ref().unwrap().generation_id;
+    let continued = reduce(
+        &requested.state,
+        EngineCommand::AcceptGeneration {
+            draft: Box::new(side_draft(continue_id, "이어서 나무는 문을 나선다.")),
+        },
+        &pack,
+    )
+    .expect("accept continuation");
+    assert_eq!(
+        continued.state.truncation,
+        TruncationStatus::ManualOnly,
+        "the one auto-continue was spent; a second must not fire (AC-8)"
+    );
+    assert!(!continued.state.empty_side_result);
 }
 
 #[test]
@@ -916,6 +1278,7 @@ fn mismatched_writer_finish_generation_id_is_discarded() {
                 generation_id: other,
                 full_text: "ignored".to_string(),
                 usage: None,
+                finish_reason: None,
             }),
         },
         &pack,
