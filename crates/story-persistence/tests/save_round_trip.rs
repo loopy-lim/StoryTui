@@ -159,6 +159,7 @@ fn payload_for(i: u32) -> SavePayload {
         stable_state: state,
         memories,
         history,
+        undo_stack: Vec::new(),
         audit_tail: make_audit(i),
     }
 }

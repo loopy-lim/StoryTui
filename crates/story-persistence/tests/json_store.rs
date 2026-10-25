@@ -62,6 +62,7 @@ fn payload(turn: u32) -> SavePayload {
         stable_state: game,
         memories,
         history,
+        undo_stack: Vec::new(),
         audit_tail: Vec::new(),
     }
 }
