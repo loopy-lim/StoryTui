@@ -187,10 +187,15 @@ pub enum WriterEvent {
         text: String,
     },
     /// Stream terminated normally. `usage` is the provider's accounting when
-    /// reported.
+    /// reported. `finish_reason` is the server-reported termination reason of
+    /// the last stream chunk (`"stop"`, `"length"`, ...) when it sent one —
+    /// `"length"` means the output token cap cut the prose mid-sentence.
     Done {
         /// Optional final token usage.
         usage: Option<TokenUsage>,
+        /// Optional server-reported termination reason from the final chunk.
+        #[serde(default)]
+        finish_reason: Option<String>,
     },
     /// Recoverable mid-stream error surfaced to the host (the stream may
     /// continue after this).
@@ -212,6 +217,12 @@ pub struct WriterFinish {
     pub full_text: String,
     /// Provider-reported token usage, if any.
     pub usage: Option<TokenUsage>,
+    /// Server-reported termination reason from the stream's final chunk
+    /// (`"stop"`, `"length"`, ...) when it sent one. `None` when the stream
+    /// carried no finish_reason at all — structural metadata only; the engine
+    /// decides what (if anything) to do about a `"length"` cut.
+    #[serde(default)]
+    pub finish_reason: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -375,6 +386,7 @@ mod tests {
                 completion_tokens: 2,
                 total_tokens: 3,
             }),
+            finish_reason: Some("stop".to_string()),
         };
         let json = serde_json::to_string(&done).expect("serialize");
         assert!(
@@ -402,10 +414,17 @@ mod tests {
             generation_id: uuid::Uuid::nil(),
             full_text: "비가 그쳤다.".to_string(),
             usage: None,
+            finish_reason: Some("length".to_string()),
         };
         let json = serde_json::to_string(&finish).expect("serialize");
         let back: WriterFinish = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(finish, back);
+        // Older payloads without the field stay deserializable (serde default).
+        let legacy: WriterFinish = serde_json::from_str(
+            r#"{"generation_id":"00000000-0000-0000-0000-000000000000","full_text":"옛 형식","usage":null}"#,
+        )
+        .expect("legacy payload");
+        assert_eq!(legacy.finish_reason, None);
     }
 
     #[test]

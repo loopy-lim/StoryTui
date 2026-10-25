@@ -356,16 +356,18 @@ impl OpenAiCompatibleProvider {
     }
 
     /// One full pass through the transient-retry loop. Returns the parsed draft
+    /// plus the server-reported `finish_reason` (when the envelope carried one)
     /// on success, or an error. `suppress_rf` is set on the Auto-fallback pass
     /// so `response_format` is omitted even though the capability flag is
-    /// already disabled for the session.
+    /// already disabled for the session. The `finish_reason` lets the caller
+    /// detect an output-cap cut (`"length"`) behind an otherwise valid turn.
     async fn do_generate(
         &self,
         request: &TurnRequest,
         suppress_rf: bool,
         cancel: &CancellationToken,
         temperature_override: Option<f32>,
-    ) -> Result<GeneratedTurnDraft, ProviderError> {
+    ) -> Result<(GeneratedTurnDraft, Option<String>), ProviderError> {
         // The engine owns prompt construction, while the runtime provider
         // owns sampling.  Do not let MVP placeholder values embedded in a
         // TurnRequest silently override the operator's TOML profile.
@@ -501,7 +503,7 @@ impl OpenAiCompatibleProvider {
                 &self.config.model,
                 usage.clone(),
             );
-            let finish_reason = parsed.finish_reason().unwrap_or("missing").to_string();
+            let finish_reason = parsed.finish_reason().map(str::to_string);
             let parsed_content = if is_choice_only_request(request) {
                 crate::recovery::parse_generated_choices(&content, request.generation_id)
             } else {
@@ -515,14 +517,14 @@ impl OpenAiCompatibleProvider {
                     if draft.usage.is_none() {
                         draft.usage = usage;
                     }
-                    Ok(draft)
+                    Ok((draft, finish_reason))
                 }
                 Err(e) => {
                     tracing::warn!(
                         target: "story_provider::openai_compatible",
                         generation_id = %request.generation_id,
                         model = %self.config.model,
-                        finish_reason,
+                        finish_reason = finish_reason.as_deref().unwrap_or("missing"),
                         assistant_content_chars = content.chars().count(),
                         error = %e,
                         "assistant content rejected by game response contract"
@@ -825,9 +827,18 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
         cancel: CancellationToken,
     ) -> Result<GeneratedTurnDraft, ProviderError> {
         match self.do_generate(&request, false, &cancel, None).await {
-            Ok(draft)
-                if self.config.min_narration_chars > 0
-                    && narration_char_count(&draft) < self.config.min_narration_chars =>
+            // A valid scene still gets ONE best-effort length repair when
+            // either trigger fires: the configured short-narration floor, or
+            // the server reporting `finish_reason: "length"` — the output
+            // token cap cut the prose (or even the JSON) mid-generation while
+            // the contract parse still succeeded. One repair per call, ever:
+            // the expansion below calls `do_generate` directly, so a repaired
+            // answer that is itself truncated never recurses back into this
+            // match.
+            Ok((draft, finish_reason))
+                if (self.config.min_narration_chars > 0
+                    && narration_char_count(&draft) < self.config.min_narration_chars)
+                    || finish_reason.as_deref() == Some("length") =>
             {
                 let first_len = narration_char_count(&draft);
                 tracing::info!(
@@ -836,7 +847,8 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
                     model = %self.config.model,
                     first_narration_chars = first_len,
                     min_narration_chars = self.config.min_narration_chars,
-                    "short valid scene; requesting one best-effort expansion"
+                    finish_reason = finish_reason.as_deref().unwrap_or("missing"),
+                    "truncated or short valid scene; requesting one best-effort expansion"
                 );
                 let retry =
                     length_repair_request(&request, &draft, self.config.min_narration_chars);
@@ -844,8 +856,10 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
                     .do_generate(&retry, false, &cancel, Some(self.config.temperature))
                     .await
                 {
-                    Ok(expanded) if narration_char_count(&expanded) >= first_len => Ok(expanded),
-                    Ok(_) => Ok(draft),
+                    Ok((expanded, _)) if narration_char_count(&expanded) >= first_len => {
+                        Ok(expanded)
+                    }
+                    Ok((_, _)) => Ok(draft),
                     Err(error) => {
                         tracing::warn!(
                             target: "story_provider::openai_compatible",
@@ -857,7 +871,7 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
                     }
                 }
             }
-            Ok(draft) => Ok(draft),
+            Ok((draft, _finish_reason)) => Ok(draft),
             // A schema-rejecting server (e.g. OpenAI strict mode refusing the
             // game contract's dynamic-map schemas) answers the constrained
             // request with HTTP 400. Under `auto`, treat the first 400 as a
@@ -875,7 +889,9 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
                     "structured-output schema rejected (HTTP 400); retrying without response_format"
                 );
                 self.disable_structured();
-                self.do_generate(&request, true, &cancel, None).await
+                self.do_generate(&request, true, &cancel, None)
+                    .await
+                    .map(|(draft, _finish_reason)| draft)
             }
             // Auto-fallback is only for a server that ignored or could not
             // produce the JSON envelope at all. A `schema:`/`validation:`
@@ -893,7 +909,9 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
                     "structured-output parse failure; retrying without response_format"
                 );
                 self.disable_structured();
-                self.do_generate(&request, true, &cancel, Some(0.2)).await
+                self.do_generate(&request, true, &cancel, Some(0.2))
+                    .await
+                    .map(|(draft, _finish_reason)| draft)
             }
             // Keep constrained decoding for a contract-level retry. The
             // bounded retry runs at the deterministic lower temperature and
@@ -908,7 +926,9 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
                     error = %detail,
                     "structured-output contract failure; retrying with response_format"
                 );
-                self.do_generate(&request, false, &cancel, Some(0.2)).await
+                self.do_generate(&request, false, &cancel, Some(0.2))
+                    .await
+                    .map(|(draft, _finish_reason)| draft)
             }
             Err(ProviderError::InvalidGeneration(_))
                 if self.config.structured_output == StructuredOutputMode::On =>
@@ -916,7 +936,9 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
                 // Free-form JSON is still stochastic on local Qwen/MLX
                 // servers. Retry once at a deterministic temperature before
                 // surfacing a player-facing format error.
-                self.do_generate(&request, true, &cancel, Some(0.2)).await
+                self.do_generate(&request, true, &cancel, Some(0.2))
+                    .await
+                    .map(|(draft, _finish_reason)| draft)
             }
             // NOTE: duplicate choice labels are deduplicated inside
             // [`parse_generated_turn`] (via `sanitize_choices`) rather than
@@ -1046,6 +1068,12 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
                         "director plan parse failed"
                     );
                     if attempt + 1 < max_attempts {
+                        // Same diversification policy as the game-contract
+                        // retries in `generate_turn`: a retry after a parse
+                        // failure drops to the deterministic lower temperature
+                        // instead of resending the identical body. The first
+                        // attempt keeps the profile's own temperature.
+                        body.temperature = 0.2;
                         Self::sleep_or_cancel(attempt, &cancel).await?;
                         continue;
                     }
@@ -1113,6 +1141,10 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
         let mut parser = SseParser::new();
         let mut full_text = String::new();
         let mut usage: Option<TokenUsage> = None;
+        // The server-reported termination reason rides the final chunk before
+        // `[DONE]` ("stop" / "length" / ...). The last chunk that carries one
+        // wins; a stream with no finish_reason stays `None`.
+        let mut finish_reason: Option<String> = None;
         let mut saw_done = false;
 
         loop {
@@ -1147,6 +1179,9 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
                                             if let Some(u) = parsed.usage {
                                                 usage = Some(u);
                                             }
+                                            if parsed.finish_reason.is_some() {
+                                                finish_reason = parsed.finish_reason;
+                                            }
                                         }
                                         // Unknown payloads (keep-alive comments,
                                         // unparseable deltas) are ignored.
@@ -1178,6 +1213,7 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
         // Best-effort final notification; a dropped receiver is not an error.
         let _ = sink.try_send(WriterEvent::Done {
             usage: usage.clone(),
+            finish_reason: finish_reason.clone(),
         });
 
         log_token_usage("writer", generation_id, model_name, usage.clone());
@@ -1185,6 +1221,7 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
             generation_id,
             full_text,
             usage,
+            finish_reason,
         })
     }
 }
@@ -1193,17 +1230,20 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
 // OpenAI streaming-delta payload parsing
 // ---------------------------------------------------------------------------
 
-/// Decoded payload from one OpenAI streaming chunk: the delta text (if any) and
-/// the optional per-chunk / final usage. `None` if the payload is unparseable
-/// or carries neither (e.g. a keep-alive chunk).
+/// Decoded payload from one OpenAI streaming chunk: the delta text (if any),
+/// the optional per-chunk / final usage, and the optional `finish_reason`.
+/// `None` if the payload is unparseable or carries none of those (e.g. a
+/// keep-alive chunk).
 struct ParsedDelta {
     text: Option<String>,
     usage: Option<TokenUsage>,
+    finish_reason: Option<String>,
 }
 
 /// Serde-tolerant decoder for one OpenAI streaming `data:` payload. Unknown
 /// fields are ignored; missing `choices` / `delta` / `content` default to
-/// empty.
+/// empty. The final chunk before `[DONE]` typically carries
+/// `finish_reason` (`"stop"` / `"length"`) with an empty delta.
 fn parse_stream_delta(payload: &str) -> Option<ParsedDelta> {
     #[derive(serde::Deserialize)]
     #[allow(dead_code)]
@@ -1218,6 +1258,8 @@ fn parse_stream_delta(payload: &str) -> Option<ParsedDelta> {
     struct StreamChoice {
         #[serde(default)]
         delta: Option<StreamDelta>,
+        #[serde(default)]
+        finish_reason: Option<String>,
     }
     #[derive(serde::Deserialize)]
     #[allow(dead_code)]
@@ -1249,13 +1291,17 @@ fn parse_stream_delta(payload: &str) -> Option<ParsedDelta> {
     }
 
     let parsed: StreamChunk = serde_json::from_str(payload).ok()?;
-    let text = parsed
-        .choices
-        .first()
+    let choice = parsed.choices.first();
+    let text = choice
         .and_then(|c| c.delta.as_ref())
         .and_then(|d| d.content.clone());
     let usage = parsed.usage.and_then(|u| u.to_token_usage());
-    Some(ParsedDelta { text, usage })
+    let finish_reason = choice.and_then(|c| c.finish_reason.clone());
+    Some(ParsedDelta {
+        text,
+        usage,
+        finish_reason,
+    })
 }
 
 #[cfg(test)]
@@ -1324,6 +1370,30 @@ mod tests {
         let bounded = bound_context(&request, 50);
         assert!(bounded.messages[1].content.chars().count() <= 48);
         assert!(bounded.messages[1].content.contains("중략"));
+    }
+
+    #[test]
+    fn parse_stream_delta_extracts_text_usage_and_finish_reason() {
+        // A plain text delta: no finish_reason, no usage.
+        let delta = parse_stream_delta(r#"{"choices":[{"delta":{"content":"비가"}}]}"#)
+            .expect("text delta");
+        assert_eq!(delta.text.as_deref(), Some("비가"));
+        assert_eq!(delta.usage, None);
+        assert_eq!(delta.finish_reason, None);
+
+        // The final chunk before [DONE]: empty delta + the termination reason
+        // (and optionally the usage block).
+        let final_chunk = parse_stream_delta(
+            r#"{"choices":[{"delta":{},"finish_reason":"length"}],"usage":{"prompt_tokens":9,"completion_tokens":88}}"#,
+        )
+        .expect("final chunk");
+        assert_eq!(final_chunk.text, None);
+        assert_eq!(final_chunk.finish_reason.as_deref(), Some("length"));
+        let usage = final_chunk.usage.expect("usage");
+        assert_eq!(usage.completion_tokens, 88);
+
+        // A keep-alive / unparseable payload still yields None overall.
+        assert!(parse_stream_delta("not json").is_none());
     }
 
     #[test]

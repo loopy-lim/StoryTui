@@ -339,3 +339,145 @@ async fn write_stream_without_done_is_protocol_error() {
         "expected Protocol(no [DONE]), got {err:?}"
     );
 }
+
+// --- finish_reason propagation ---------------------------------------------
+
+#[tokio::test]
+async fn write_stream_propagates_final_chunk_finish_reason() {
+    // The final chunk before [DONE] carries the empty delta plus the
+    // server-reported termination reason. `"length"` is the max_tokens cut
+    // signal the engine will consume in a follow-up task.
+    let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"비가\"}}]}\n\n\
+               data: {\"choices\":[{\"delta\":{\"content\":\" 그쳤다\"}}]}\n\n\
+               data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n\
+               data: [DONE]\n\n"
+        .as_bytes()
+        .to_vec();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(sse_response(sse))
+        .mount(&server)
+        .await;
+
+    let provider = OpenAiCompatibleProvider::new(cfg_for(&server)).expect("provider");
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<WriterEvent>(16);
+    let finish = provider
+        .write_stream(writer_request(), tx, CancellationToken::new())
+        .await
+        .expect("ok");
+
+    assert_eq!(finish.full_text, "비가 그쳤다");
+    assert_eq!(
+        finish.finish_reason.as_deref(),
+        Some("length"),
+        "the final chunk's finish_reason must ride the finish"
+    );
+
+    // The stream-completion event carries the same structural metadata.
+    let mut done_finish = None;
+    while let Some(ev) = rx.recv().await {
+        if let WriterEvent::Done { finish_reason, .. } = ev {
+            done_finish = finish_reason;
+            break;
+        }
+    }
+    assert_eq!(
+        done_finish.as_deref(),
+        Some("length"),
+        "WriterEvent::Done must carry the final finish_reason"
+    );
+}
+
+#[tokio::test]
+async fn write_stream_without_finish_reason_yields_none() {
+    // A server that never sends finish_reason must still complete cleanly,
+    // with `None` propagated (not an error, not an empty string).
+    let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"완결\"}}]}\n\n\
+               data: [DONE]\n\n"
+        .as_bytes()
+        .to_vec();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(sse_response(sse))
+        .mount(&server)
+        .await;
+
+    let provider = OpenAiCompatibleProvider::new(cfg_for(&server)).expect("provider");
+    let (tx, _rx) = tokio::sync::mpsc::channel::<WriterEvent>(16);
+    let finish = provider
+        .write_stream(writer_request(), tx, CancellationToken::new())
+        .await
+        .expect("ok");
+    assert_eq!(finish.full_text, "완결");
+    assert_eq!(finish.finish_reason, None);
+}
+
+// --- director parse-failure retry temperature --------------------------------
+
+#[tokio::test]
+async fn director_retry_after_parse_failure_drops_temperature() {
+    let server = MockServer::start().await;
+    // Request 1: the model rambled prose instead of a plan (finish "stop").
+    // Request 2: the retried plan arrives.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(envelope("not a plan at all")))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(envelope(VALID_PLAN)))
+        .mount(&server)
+        .await;
+
+    let provider = OpenAiCompatibleProvider::new(cfg_for(&server)).expect("provider");
+    let plan = provider
+        .direct(director_request(), CancellationToken::new())
+        .await
+        .expect("retry succeeds");
+    assert_eq!(plan.scene_goal, "비가 그친 카페에서 재회");
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert_eq!(requests.len(), 2, "one bounded parse-failure retry");
+    let temperatures: Vec<f64> = requests
+        .iter()
+        .map(|request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).expect("json");
+            body["temperature"].as_f64().expect("temperature field")
+        })
+        .collect();
+    assert_eq!(
+        temperatures,
+        vec![0.7, 0.2],
+        "first attempt keeps the profile temperature; the parse-failure retry drops to 0.2 — got {temperatures:?}"
+    );
+}
+
+#[tokio::test]
+async fn director_single_successful_attempt_keeps_profile_temperature() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(envelope(VALID_PLAN)))
+        .mount(&server)
+        .await;
+
+    let provider = OpenAiCompatibleProvider::new(cfg_for(&server)).expect("provider");
+    provider
+        .direct(director_request(), CancellationToken::new())
+        .await
+        .expect("ok");
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert_eq!(requests.len(), 1);
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("json");
+    assert_eq!(
+        body["temperature"].as_f64(),
+        Some(0.7),
+        "the first attempt must keep the request's own temperature: {body}"
+    );
+}

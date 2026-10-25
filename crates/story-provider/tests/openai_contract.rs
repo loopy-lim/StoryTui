@@ -41,12 +41,18 @@ const VALID_TURN: &str = r#"{
 /// envelope. Extra top-level keys (`id`, `model`, ...) verify the response is
 /// serde-tolerant.
 fn envelope(content: &str) -> serde_json::Value {
+    envelope_with_finish(content, "stop")
+}
+
+/// Same envelope with an explicit `finish_reason` — `"length"` reproduces a
+/// max_tokens cut behind an otherwise valid 200 response.
+fn envelope_with_finish(content: &str, finish_reason: &str) -> serde_json::Value {
     serde_json::json!({
         "id": "chatcmpl-x",
         "object": "chat.completion",
         "model": "test",
         "choices": [
-            {"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}
+            {"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": finish_reason}
         ],
         "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
     })
@@ -196,6 +202,98 @@ async fn short_valid_scene_gets_one_best_effort_expansion_without_becoming_an_er
                 .as_str()
                 .is_some_and(|text| text.contains("최소 100자"))),
         "the retry must explicitly request the configured target length"
+    );
+}
+
+// --- finish_reason "length" → one automatic length repair -------------------
+
+#[tokio::test]
+async fn length_finish_reason_triggers_exactly_one_repair() {
+    let server = MockServer::start().await;
+    // Request 1: valid game JSON but the token cap cut the generation
+    // (`finish_reason: "length"`); `min_narration_chars` stays 0 so the
+    // finish_reason alone must fire the repair. Request 2: the repair
+    // answer (again valid, finish "stop").
+    let cut = envelope_with_finish(VALID_TURN, "length");
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(cut))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(envelope_with_finish(VALID_TURN, "stop")),
+        )
+        .mount(&server)
+        .await;
+
+    let provider = OpenAiCompatibleProvider::new(cfg_for(&server)).expect("provider");
+    let draft = provider
+        .generate_turn(turn_request(), CancellationToken::new())
+        .await
+        .expect("a truncated-but-valid scene is repaired, not failed");
+    assert_eq!(draft.narration, "비가 그쳤다.");
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert_eq!(
+        requests.len(),
+        2,
+        "exactly one length-repair request may be added, got {n}",
+        n = requests.len()
+    );
+    // The repair re-anchors on the model's own first answer (assistant turn)
+    // plus an explicit expansion instruction (user turn).
+    let first: serde_json::Value =
+        serde_json::from_slice(&requests[0].body).expect("first JSON body");
+    let retry: serde_json::Value =
+        serde_json::from_slice(&requests[1].body).expect("retry JSON body");
+    let first_messages = first["messages"].as_array().expect("messages").len();
+    let retry_messages = retry["messages"].as_array().expect("messages").len();
+    assert_eq!(
+        retry_messages,
+        first_messages + 2,
+        "repair must append the assistant anchor and the expansion instruction"
+    );
+    assert!(
+        retry["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .any(|message| message["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("narration"))),
+        "the repair instruction must target the narration body"
+    );
+    // A repaired answer that is itself truncated never recurses: the same
+    // "length"-first mock pair was exhausted, so a third request would fail
+    // or loop — 2 total requests already prove the one-shot cap.
+}
+
+#[tokio::test]
+async fn stop_finish_reason_keeps_single_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(envelope(VALID_TURN)))
+        .mount(&server)
+        .await;
+
+    let provider = OpenAiCompatibleProvider::new(cfg_for(&server)).expect("provider");
+    let draft = provider
+        .generate_turn(turn_request(), CancellationToken::new())
+        .await
+        .expect("ok");
+    assert_eq!(draft.narration, "비가 그쳤다.");
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert_eq!(
+        requests.len(),
+        1,
+        "finish_reason \"stop\" must not trigger a repair — got {n}",
+        n = requests.len()
     );
 }
 
