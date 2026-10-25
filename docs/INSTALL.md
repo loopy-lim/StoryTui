@@ -6,9 +6,11 @@ server, but any OpenAI-compatible endpoint works). This document lists the
 prerequisites, how to build, and how to run.
 
 > **Status:** W0–W11 host loop is wired. The binary loads a provider profile
-> and Story Pack, starts the opening generation, renders the TUI, handles
-> provider results/errors, and autosaves committed turns. Live-model quality,
-> clean-machine, 100-turn, and release checks remain open; see
+> and Story Pack, opens the start menu (or, with an autosave present, resumes
+> the last session straight into the story), handles provider
+> results/errors — one automatic retry before the manual overlay — and
+> autosaves committed turns. Live-model quality, clean-machine, 100-turn, and
+> release checks remain open; see
 > [RELEASE-RUNTIME-GATE.md](./RELEASE-RUNTIME-GATE.md).
 
 ## Prerequisites
@@ -16,7 +18,7 @@ prerequisites, how to build, and how to run.
 | Component | Version | Notes |
 |---|---|---|
 | macOS | 15+ | Apple Silicon recommended (MLX). The Settings screen targets 80×24 minimum. |
-| Rust toolchain | 1.88+ (project tracks 1.97.1 in `rust-toolchain.toml`) | `rustup show` auto-installs the pinned toolchain. |
+| Rust toolchain | 1.88+ (workspace `rust-version`; `rust-toolchain.toml` tracks the `stable` channel) | `rustup show` installs what the project needs. |
 | Python | 3.11+ | Only if you intend to run the reference MLX server. |
 | MLX server | any OpenAI-compatible endpoint | Checked-in OMLX profile uses `http://127.0.0.1:8000`. |
 
@@ -28,16 +30,18 @@ cargo build --workspace              # debug
 cargo build --workspace --release    # optimized (LTO = "thin")
 ```
 
-The workspace builds six crates:
+The workspace builds seven crates:
 
 | Crate | Builds |
 |---|---|
 | `story-model` | Pure data + serde. |
 | `story-core` | Reducer, validator, prompt context, redaction (`redact`). Depends only on `story-model + thiserror + sha2`. |
+| `story-import` | Character-card compiler (PNG chara/ccv3 · JSON · charx · CAI → pack). |
 | `story-provider` | `MockProvider` + `OpenAiCompatibleProvider`. Owns `reqwest`. |
 | `story-persistence` | Pack loader, atomic save, migration. |
-| `story-tui` | `ratatui` screens (story, save/load, settings, keymap). |
-| `storytui` (app) | Binary + `diagnostic` and `bench` library surfaces. |
+| `story-tts` | TTS backends (say / OpenAI-compatible). |
+| `story-tui` | `ratatui` screens (home, story, save/load, settings, keymap, pack/import/greeting). |
+| `storytui` (app) | Binary + `import`/`export` subcommands + `diagnostic` and `bench` library surfaces. |
 
 ## Run
 
@@ -51,9 +55,16 @@ directly and wires the model itself:
   (embedding/rerank/audio), and auto-selects one. The model ID is persisted
   to `saves/user-settings.toml` (the URL never is), so later runs start with
   your selection immediately.
-- **No server running**: the start menu still opens, with a one-line Korean
-  status notice. Turn your model server on, then open 설정 (Settings) — the
-  app retries auto-setup there.
+- **No server running**: the app still opens, with a one-line Korean status
+  notice. While the server is down and no generation is in flight, the app
+  re-probes every ~15s — turn your model server on and the status flips to
+  connected without opening 설정 (Settings). Opening 설정 also retries
+  auto-setup as before.
+- **Returning**: with an autosave present the app resumes the last session
+  straight into the story (notice: "이전 세션을 이어요") — press `Home` to
+  open the start menu. Set `auto_resume = false` in `saves/user-settings.toml`
+  to keep the menu first. A failed generation retries itself once (~1.5s
+  later) before the [R]/[Esc] overlay appears.
 - **Model changes**: press `o`, then `p`, to open the server-advertised model
   picker; `Enter` selects the main model, while `d` and `w` select the
   optional Director and Writer models. `c` selects the lightweight model used
@@ -98,6 +109,11 @@ cargo run -p storytui -- \
 
 `--save-dir` also selects which `user-settings.toml` is loaded, so an isolated
 run does not inherit model choices from the default `./saves` directory.
+
+Two subcommands never enter the TUI: `storytui import …` compiles a character
+card into a pack directory and prints a report, and
+`storytui export <slot> [--format txt|jsonl]` renders a save slot as a
+portable transcript.
 
 ## Provider configuration
 
