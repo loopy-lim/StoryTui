@@ -3,8 +3,10 @@
 //! StoryTUI executable: configuration, terminal lifecycle, engine effects, and
 //! the real OpenAI-compatible provider are assembled here.
 
-mod host;
+mod export_cmd;
 mod import_cmd;
+
+use storytui::host;
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -23,6 +25,15 @@ async fn main() {
     // pack directory and prints a report.
     if raw_args.first().map(String::as_str) == Some("import") {
         if let Err(message) = import_cmd::run(&raw_args[1..]).await {
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
+        return;
+    }
+    // The export subcommand never enters the TUI either: it renders a save
+    // slot as a portable txt/jsonl transcript.
+    if raw_args.first().map(String::as_str) == Some("export") {
+        if let Err(message) = export_cmd::run(&raw_args[1..]) {
             eprintln!("{message}");
             std::process::exit(2);
         }

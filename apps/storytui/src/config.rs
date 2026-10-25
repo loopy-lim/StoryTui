@@ -87,13 +87,113 @@ impl StageModels {
     }
 }
 
+/// A named sampling taste the Settings `x` cycle switches between. One key
+/// replaces SillyTavern-style raw sampler sliders: players who never touch it
+/// stay on 자동 — the profile's own tuning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SamplingStyle {
+    /// Looser, more varied narration.
+    Creative,
+    /// The shipped default triple (Tech Spec §10.2).
+    Balanced,
+    /// Tighter, more deterministic narration.
+    Precise,
+}
+
+impl SamplingStyle {
+    /// Cycle order: 자동 → 창의적 → 균형 → 정밀 → 자동. `None` = 자동.
+    pub fn next_after(current: Option<Self>) -> Option<Self> {
+        match current {
+            None => Some(Self::Creative),
+            Some(Self::Creative) => Some(Self::Balanced),
+            Some(Self::Balanced) => Some(Self::Precise),
+            Some(Self::Precise) => None,
+        }
+    }
+
+    /// Stable id persisted in `user-settings.toml`.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Creative => "creative",
+            Self::Balanced => "balanced",
+            Self::Precise => "precise",
+        }
+    }
+
+    /// Korean label for the Settings row.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Creative => "창의적",
+            Self::Balanced => "균형",
+            Self::Precise => "정밀",
+        }
+    }
+
+    /// Parse a persisted id; anything unrecognized means 자동 (`None`).
+    pub fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "creative" => Some(Self::Creative),
+            "balanced" => Some(Self::Balanced),
+            "precise" => Some(Self::Precise),
+            _ => None,
+        }
+    }
+
+    /// The preset's `(temperature, top_p, top_k)`.
+    pub fn sampling(self) -> (f32, f32, u32) {
+        match self {
+            Self::Creative => (1.0, 0.95, 60),
+            Self::Balanced => (0.85, 0.92, 40),
+            Self::Precise => (0.4, 0.8, 20),
+        }
+    }
+}
+
+/// Korean label for the 자동 state of the style cycle.
+pub const SAMPLING_STYLE_AUTO_LABEL: &str = "자동";
+
+/// Label shown on the Settings style row for a persisted style (or 자동).
+pub fn sampling_style_label(style: Option<SamplingStyle>) -> String {
+    style
+        .map(SamplingStyle::label)
+        .unwrap_or(SAMPLING_STYLE_AUTO_LABEL)
+        .to_string()
+}
+
+/// Effective `(temperature, top_p, top_k)`: an active preset wins entirely;
+/// 자동 falls back to the legacy user temperature override, then the active
+/// profile's base values (the `base_sampling` snapshot taken before any
+/// override was applied).
+pub fn resolve_sampling(
+    preset: Option<SamplingStyle>,
+    base: (f32, f32, u32),
+    user_temperature: Option<f32>,
+) -> (f32, f32, u32) {
+    match preset {
+        Some(style) => style.sampling(),
+        None => (user_temperature.unwrap_or(base.0), base.1, base.2),
+    }
+}
+
+/// Effective player identity: user-settings fields win per-field over the
+/// base `[player]` profile. `None` inherits; `Some("")` clears.
+pub fn effective_player_profile(settings: &UserSettings, base: &PlayerProfile) -> PlayerProfile {
+    PlayerProfile {
+        name: settings.player_name.clone().or_else(|| base.name.clone()),
+        persona: settings
+            .player_persona
+            .clone()
+            .or_else(|| base.persona.clone()),
+    }
+}
+
 /// Per-user generation preferences stored independently from the project
 /// provider configuration.
 ///
 /// Every field is optional so an absent value continues to inherit the StoryTUI
 /// default or the checked-in configuration file. This file intentionally never
 /// contains endpoint or authentication settings.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct UserSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
@@ -142,9 +242,120 @@ pub struct UserSettings {
     /// config's `use_director_writer` (ADR-005 default: `false`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub use_director_writer: Option<bool>,
+    /// Response-style preset id from the Settings `x` cycle
+    /// (`creative` / `balanced` / `precise`). `None` — or any unrecognized
+    /// value — means 자동: the active profile's own sampling stays in charge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sampling_preset: Option<String>,
+    /// Player identity override from the Settings `a` persona modal, winning
+    /// per-field over the base `[player]` profile. `Some("")` explicitly
+    /// clears a field; `None` inherits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub player_name: Option<String>,
+    /// Persona text override (see [`UserSettings::player_name`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub player_persona: Option<String>,
+    /// Author's note (SillyTavern-style steering note) from the Settings `t`
+    /// modal, injected verbatim into every turn's system prompt. `Some("")`
+    /// is stored by an explicit clear; an absent field means "no note".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author_note: Option<String>,
+    /// TOML-only display post-processing rules applied to newly shown
+    /// transcript text (`[[display_rules]]`). No UI by design — raw regex is
+    /// a power-user knob like the provider URL. Order is significant.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub display_rules: Vec<DisplayRule>,
+    /// TOML-only quick actions (`[quick_actions]`): `"1" = "텍스트"` fills
+    /// the free-input buffer via Alt+1..Alt+9. No UI by design; absent map
+    /// means the shortcuts do nothing.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub quick_actions: BTreeMap<String, String>,
+    /// Resume the previous autosaved session right after startup instead of
+    /// showing the home menu first. Absent field means on (`true`) so a
+    /// returning player lands one keypress from play; `false` keeps the
+    /// classic home-first flow.
+    #[serde(default = "default_auto_resume")]
+    pub auto_resume: bool,
 }
 
+fn default_auto_resume() -> bool {
+    true
+}
+
+impl Default for UserSettings {
+    fn default() -> Self {
+        Self {
+            provider: None,
+            model: None,
+            director_model: None,
+            choice_model: None,
+            writer_model: None,
+            stage_models: BTreeMap::new(),
+            max_tokens: None,
+            context_budget_tokens: None,
+            temperature: None,
+            tts_enabled: None,
+            images_enabled: None,
+            expressions_enabled: None,
+            image_protocol: None,
+            use_director_writer: None,
+            sampling_preset: None,
+            player_name: None,
+            player_persona: None,
+            author_note: None,
+            display_rules: Vec::new(),
+            quick_actions: BTreeMap::new(),
+            auto_resume: default_auto_resume(),
+        }
+    }
+}
+
+/// One display post-processing rule: `pattern` is replaced with
+/// `replacement` in newly displayed transcript text, in declaration order.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub struct DisplayRule {
+    pub pattern: String,
+    pub replacement: String,
+    /// A disabled rule is kept in the file but skipped at apply time.
+    #[serde(default = "default_display_rule_enabled")]
+    pub enabled: bool,
+}
+
+fn default_display_rule_enabled() -> bool {
+    true
+}
+
+/// Upper bound on applied display rules — a runaway `[[display_rules]]`
+/// table must not be able to make the transcript crawl.
+pub const MAX_DISPLAY_RULES: usize = 16;
+
+/// Upper bound (grapheme-cluster intent, char count here) on one
+/// quick-action text.
+pub const QUICK_ACTION_MAX_CHARS: usize = 200;
+
 impl UserSettings {
+    /// The note injected into every turn's prompt: the trimmed stored value,
+    /// or `None` when unset or explicitly cleared with an empty string.
+    pub fn effective_author_note(&self) -> Option<&str> {
+        self.author_note
+            .as_deref()
+            .map(str::trim)
+            .filter(|note| !note.is_empty())
+    }
+
+    /// The quick-action text bound to `key` (`"1"`..`"9"`), or `None` for
+    /// anything else — unknown keys, oversized values, and blank text all
+    /// mean "no action".
+    pub fn quick_action(&self, key: &str) -> Option<&str> {
+        if !matches!(key, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9") {
+            return None;
+        }
+        self.quick_actions
+            .get(key)
+            .map(|text| text.trim())
+            .filter(|text| !text.is_empty() && text.chars().count() <= QUICK_ACTION_MAX_CHARS)
+    }
+
     /// Sampling/context overrides are machine-level tastes: applied at load
     /// and re-applied on provider switches. `model` is deliberately excluded —
     /// a switch repairs the model against the new server's advertised list.
@@ -157,6 +368,27 @@ impl UserSettings {
         }
         if let Some(temperature) = self.temperature {
             provider.temperature = temperature;
+        }
+    }
+
+    /// The style preset persisted by the `x` cycle (unknown id = 자동).
+    pub fn sampling_style(&self) -> Option<SamplingStyle> {
+        self.sampling_preset
+            .as_deref()
+            .and_then(SamplingStyle::from_id)
+    }
+
+    /// Machine-level sampling taste onto a profile: the legacy per-field
+    /// overrides, then the style preset — an active preset decides
+    /// temperature/top_p/top_k outright, the coarser and more recent knob.
+    /// Applied at load and re-applied on provider switches.
+    pub fn apply_sampling_taste(&self, provider: &mut ProviderConfig) {
+        self.apply_sampling_overrides(provider);
+        if let Some(style) = self.sampling_style() {
+            let (temperature, top_p, top_k) = style.sampling();
+            provider.temperature = temperature;
+            provider.top_p = top_p;
+            provider.top_k = top_k;
         }
     }
 
@@ -313,6 +545,11 @@ pub struct RuntimeConfig {
     /// Base-profile model used as a safe fallback when a persisted user model
     /// is no longer advertised by the local server.
     pub fallback_model: String,
+    /// The active profile's pristine `(temperature, top_p, top_k)`, snapshotted
+    /// before any user override or style preset is applied. The style cycle's
+    /// 자동 state restores these values; refreshed whenever a provider switch
+    /// clones a fresh profile.
+    pub base_sampling: (f32, f32, u32),
     pub director_model: Option<String>,
     pub choice_model: Option<String>,
     pub writer_model: Option<String>,
@@ -546,7 +783,14 @@ pub fn load(cli: &CliOptions) -> Result<RuntimeConfig, String> {
     if let Some(model) = &settings.model {
         file.provider.model = model.clone();
     }
-    settings.apply_sampling_overrides(&mut file.provider);
+    // Snapshot the profile's own tuning before any user taste is layered on —
+    // the style cycle's 자동 restores exactly these values.
+    let base_sampling = (
+        file.provider.temperature,
+        file.provider.top_p,
+        file.provider.top_k,
+    );
+    settings.apply_sampling_taste(&mut file.provider);
     // Stage assignments: the active profile's saved choice first, then the
     // `[[providers]]` TOML default, then the file-wide default. Legacy flat
     // user-settings fields fold into the active profile's entry first so an
@@ -617,6 +861,7 @@ pub fn load(cli: &CliOptions) -> Result<RuntimeConfig, String> {
         providers,
         stage_defaults,
         fallback_model,
+        base_sampling,
         director_model: file.director_model,
         choice_model: file.choice_model,
         writer_model: file.writer_model,
@@ -634,11 +879,12 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    use story_provider::MaxTokensField;
+    use story_provider::{MaxTokensField, ProviderConfig};
 
     use super::{
-        CliOptions, FileConfig, StageModels, UserSettings, load, load_user_settings,
-        preferred_config_path, save_user_settings, user_settings_path,
+        CliOptions, FileConfig, PlayerProfile, QUICK_ACTION_MAX_CHARS, SamplingStyle, StageModels,
+        UserSettings, effective_player_profile, load, load_user_settings, preferred_config_path,
+        resolve_sampling, sampling_style_label, save_user_settings, user_settings_path,
     };
     use std::collections::BTreeMap;
 
@@ -666,6 +912,69 @@ mod tests {
 
         fs::write(&local, "[provider]\n").expect("local profile");
         assert_eq!(preferred_config_path(&local, &public), local);
+
+        fs::remove_dir_all(dir).expect("clean test directory");
+    }
+
+    #[test]
+    fn note_rules_and_quick_actions_round_trip_and_validate() {
+        let dir = test_dir("note-rules-quick");
+        let mut settings = UserSettings {
+            author_note: Some("  장면은 조용하게, 문장은 짧게.  ".to_string()),
+            ..UserSettings::default()
+        };
+
+        // Author's note: trimmed text is effective, empty is an explicit clear.
+        assert_eq!(
+            settings.effective_author_note(),
+            Some("장면은 조용하게, 문장은 짧게.")
+        );
+        settings.author_note = Some("   ".to_string());
+        assert_eq!(settings.effective_author_note(), None);
+
+        // Quick actions: only "1".."9" resolve, blank and oversized are ignored.
+        settings.quick_actions.insert(
+            "2".to_string(),
+            format!("{}넘는 텍스트", "아".repeat(QUICK_ACTION_MAX_CHARS)),
+        );
+        settings
+            .quick_actions
+            .insert("3".to_string(), "   ".to_string());
+        settings
+            .quick_actions
+            .insert("x".to_string(), "해킹".to_string());
+        assert!(settings.quick_action("2").is_none(), "oversized is ignored");
+        assert!(settings.quick_action("3").is_none(), "blank is ignored");
+        assert!(
+            settings.quick_action("x").is_none(),
+            "non-digit key is ignored"
+        );
+        settings
+            .quick_actions
+            .insert("1".to_string(), "  조심스럽게 문을 연다. ".to_string());
+        assert_eq!(settings.quick_action("1"), Some("조심스럽게 문을 연다."));
+
+        // Round trip through user-settings.toml.
+        settings.author_note = Some("조용한 장면".to_string());
+        save_user_settings(&dir, &settings).expect("save");
+        let loaded = load_user_settings(&dir).expect("load");
+        assert_eq!(loaded.effective_author_note(), Some("조용한 장면"));
+        assert_eq!(loaded.quick_action("1"), Some("조심스럽게 문을 연다."));
+        assert_eq!(
+            loaded.display_rules, settings.display_rules,
+            "empty rules stay absent"
+        );
+
+        // An explicit [[display_rules]] table parses with the enabled default.
+        fs::write(
+            user_settings_path(&dir),
+            "[[display_rules]]\npattern = \"\\\\d+\"\nreplacement = \"N\"\n[[display_rules]]\npattern = \"x\"\nreplacement = \"y\"\nenabled = false\n",
+        )
+        .expect("write rules file");
+        let loaded = load_user_settings(&dir).expect("load rules");
+        assert_eq!(loaded.display_rules.len(), 2);
+        assert!(loaded.display_rules[0].enabled);
+        assert!(!loaded.display_rules[1].enabled);
 
         fs::remove_dir_all(dir).expect("clean test directory");
     }
@@ -1024,6 +1333,47 @@ mod tests {
     }
 
     #[test]
+    fn user_settings_auto_resume_round_trips_and_absent_means_on() {
+        let dir = test_dir("auto-resume-persist");
+        // Missing file: the in-memory default is already "resume".
+        assert!(load_user_settings(&dir).expect("missing file").auto_resume);
+
+        // An explicit false survives the round trip...
+        let off = UserSettings {
+            auto_resume: false,
+            ..UserSettings::default()
+        };
+        save_user_settings(&dir, &off).expect("save off");
+        assert_eq!(load_user_settings(&dir).expect("load off"), off);
+
+        // ...as does an explicit true.
+        let on = UserSettings {
+            auto_resume: true,
+            ..UserSettings::default()
+        };
+        save_user_settings(&dir, &on).expect("save on");
+        assert_eq!(load_user_settings(&dir).expect("load on"), on);
+
+        // A pre-field file (or a hand-trimmed one) parses as on.
+        let path = user_settings_path(&dir);
+        fs::write(&path, "model = \"base-model\"\n").expect("write pre-field file");
+        let loaded = load_user_settings(&dir).expect("absent field still parses");
+        assert!(loaded.auto_resume, "absent auto_resume means on");
+        assert_eq!(loaded.model.as_deref(), Some("base-model"));
+
+        // A wrongly typed value is a malformed settings file: it fails with
+        // the standard Korean parse error instead of silently flipping on.
+        fs::write(&path, "auto_resume = \"yes\"\n").expect("write invalid value");
+        let error = load_user_settings(&dir).expect_err("non-bool must fail");
+        assert!(
+            error.contains("올바르지 않습니다"),
+            "Korean parse error expected: {error}"
+        );
+
+        fs::remove_dir_all(dir).expect("clean test directory");
+    }
+
+    #[test]
     fn player_profile_is_optional_and_loads_from_toml() {
         let config: FileConfig =
             toml::from_str("[player]\nname = \"민준\"\npersona = \"말수가 적고 관찰력이 좋다\"\n")
@@ -1067,6 +1417,13 @@ mod tests {
                 expressions_enabled: None,
                 image_protocol: None,
                 use_director_writer: None,
+                sampling_preset: None,
+                player_name: None,
+                player_persona: None,
+                author_note: None,
+                display_rules: Vec::new(),
+                quick_actions: BTreeMap::new(),
+                auto_resume: true,
             },
         )
         .expect("save settings");
@@ -1111,6 +1468,13 @@ mod tests {
             expressions_enabled: Some(false),
             image_protocol: Some("halfblocks".to_string()),
             use_director_writer: Some(true),
+            sampling_preset: Some("precise".to_string()),
+            player_name: Some("민준".to_string()),
+            player_persona: None,
+            author_note: None,
+            display_rules: Vec::new(),
+            quick_actions: BTreeMap::new(),
+            auto_resume: true,
         };
         let path = user_settings_path(&dir);
         fs::write(&path, "base_url = \"must-not-survive\"\n").expect("old settings");
@@ -1330,6 +1694,117 @@ mod tests {
         // omits falls through to the TOML default.
         assert_eq!(runtime.director_model.as_deref(), Some("saved-director"));
         assert_eq!(runtime.choice_model.as_deref(), Some("toml-choice"));
+        fs::remove_dir_all(dir).expect("clean test directory");
+    }
+
+    #[test]
+    fn style_cycle_round_trips_through_auto_and_parses_unknown_as_auto() {
+        // 자동 → 창의적 → 균형 → 정밀 → 자동: the full cycle closes.
+        let cycle = SamplingStyle::next_after(None);
+        assert_eq!(cycle, Some(SamplingStyle::Creative));
+        assert_eq!(
+            SamplingStyle::next_after(cycle),
+            Some(SamplingStyle::Balanced)
+        );
+        assert_eq!(
+            SamplingStyle::next_after(SamplingStyle::next_after(cycle)),
+            Some(SamplingStyle::Precise)
+        );
+        assert_eq!(
+            SamplingStyle::next_after(SamplingStyle::from_id("precise")),
+            None
+        );
+        // Round-trip by id and the 자동 fallback for stale values.
+        for style in [
+            SamplingStyle::Creative,
+            SamplingStyle::Balanced,
+            SamplingStyle::Precise,
+        ] {
+            assert_eq!(SamplingStyle::from_id(style.id()), Some(style));
+        }
+        assert_eq!(SamplingStyle::from_id("kity"), None);
+        assert_eq!(sampling_style_label(None), "자동");
+        assert_eq!(
+            sampling_style_label(SamplingStyle::from_id("creative")),
+            "창의적"
+        );
+    }
+
+    #[test]
+    fn resolve_sampling_preset_wins_and_auto_restores_base_taste() {
+        let base = (0.85, 0.92, 40);
+        // An active preset decides the whole triple, ignoring a legacy
+        // per-field temperature override.
+        assert_eq!(
+            resolve_sampling(SamplingStyle::from_id("precise"), base, Some(0.1)),
+            (0.4, 0.8, 20)
+        );
+        // 자동: the legacy temperature override still applies to the base.
+        assert_eq!(resolve_sampling(None, base, Some(0.1)), (0.1, 0.92, 40));
+        // 자동 without a legacy override is exactly the profile's own tuning.
+        assert_eq!(resolve_sampling(None, base, None), base);
+    }
+
+    #[test]
+    fn effective_player_profile_overrides_and_inherits_per_field() {
+        let base = PlayerProfile {
+            name: Some("토마스".to_string()),
+            persona: Some("기본 페르소나".to_string()),
+        };
+        // Nothing set: both fields inherit.
+        let settings = UserSettings::default();
+        let effective = effective_player_profile(&settings, &base);
+        assert_eq!(effective.name.as_deref(), Some("토마스"));
+        assert_eq!(effective.persona.as_deref(), Some("기본 페르소나"));
+        // Each field wins independently; Some("") explicitly clears.
+        let settings = UserSettings {
+            player_name: Some(String::new()),
+            player_persona: Some("조용한 관찰자".to_string()),
+            ..UserSettings::default()
+        };
+        let effective = effective_player_profile(&settings, &base);
+        assert_eq!(effective.name.as_deref(), Some(""));
+        assert_eq!(effective.persona.as_deref(), Some("조용한 관찰자"));
+    }
+
+    #[test]
+    fn apply_sampling_taste_preset_overrides_sampling_but_not_limits() {
+        let mut provider = ProviderConfig::defaults();
+        provider.temperature = 0.85;
+        provider.top_p = 0.92;
+        provider.top_k = 40;
+        provider.max_tokens = 1800;
+        let settings = UserSettings {
+            max_tokens: Some(2_000),
+            temperature: Some(0.1),
+            sampling_preset: Some("creative".to_string()),
+            ..UserSettings::default()
+        };
+        settings.apply_sampling_taste(&mut provider);
+        // The preset decides temperature/top_p/top_k outright...
+        assert_eq!(provider.temperature, 1.0);
+        assert_eq!(provider.top_p, 0.95);
+        assert_eq!(provider.top_k, 60);
+        // ...while the legacy max_tokens override is untouched.
+        assert_eq!(provider.max_tokens, 2_000);
+    }
+
+    #[test]
+    fn user_settings_style_and_persona_fields_round_trip() {
+        let dir = test_dir("style-persona-persist");
+        let settings = UserSettings {
+            sampling_preset: Some("creative".to_string()),
+            player_name: Some("민준".to_string()),
+            player_persona: Some("말수가 적고 관찰력이 좋다".to_string()),
+            ..UserSettings::default()
+        };
+        save_user_settings(&dir, &settings).expect("save");
+        assert_eq!(load_user_settings(&dir).expect("load"), settings);
+        // A stale preset id parses as a file but resolves to 자동.
+        let path = user_settings_path(&dir);
+        fs::write(&path, "sampling_preset = \"kity\"\n").expect("write stale id");
+        let loaded = load_user_settings(&dir).expect("stale id still parses");
+        assert_eq!(loaded.sampling_style(), None);
         fs::remove_dir_all(dir).expect("clean test directory");
     }
 

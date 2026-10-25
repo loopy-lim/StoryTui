@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 story-core.workspace = true
 story-import.workspace = true
+regex.workspace = true
 story-model.workspace = true
 story-provider.workspace = true
 story-persistence.workspace = true
@@ -40,3 +41,4 @@ futures-util.workspace = true
 tokio-util.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
+wiremock.workspace = true

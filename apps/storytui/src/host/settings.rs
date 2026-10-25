@@ -5,12 +5,15 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use story_model::ProviderHealth;
+use story_model::{ProviderHealth, StoryPack};
 use story_provider::{LlmProvider, OpenAiCompatibleProvider, ProviderConfig};
 use story_tts::{TtsService, TtsStatus};
 use story_tui::App;
 
-use storytui::config::{RuntimeConfig, StageModels, UserSettings, save_user_settings};
+use storytui::config::{
+    PlayerProfile, RuntimeConfig, SamplingStyle, StageModels, UserSettings,
+    effective_player_profile, resolve_sampling, sampling_style_label, save_user_settings,
+};
 use storytui::diagnostic::provider_config_safe_with_models;
 
 #[allow(clippy::too_many_arguments)] // the projection stays explicit at the host boundary
@@ -26,7 +29,10 @@ pub fn refresh_view(
     image_backend: Option<String>,
     use_director_writer: bool,
     expressions_enabled: bool,
+    user_settings: &UserSettings,
+    base_player: &PlayerProfile,
 ) {
+    let effective = effective_player_profile(user_settings, base_player);
     app.set_settings(
         provider_config_safe_with_models(
             provider_config,
@@ -44,7 +50,124 @@ pub fn refresh_view(
         image_backend,
         use_director_writer,
         expressions_enabled,
+        sampling_style_label(user_settings.sampling_style()),
+        persona_status_label(&effective),
+        effective.name.unwrap_or_default(),
+        effective.persona.unwrap_or_default(),
     );
+}
+
+/// Persona status row: the player's name when set, `설정됨` for a
+/// text-only persona, `없음` when both fields are off.
+pub fn persona_status_label(profile: &PlayerProfile) -> String {
+    let name = profile
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+    let persona = profile
+        .persona
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    match (name, persona) {
+        (Some(name), _) => name.to_string(),
+        (None, Some(_)) => "설정됨".to_string(),
+        (None, None) => "없음".to_string(),
+    }
+}
+
+/// Marker heading of the injected player-identity section. The app-name
+/// suffix keeps the strip match away from anything an imported card might
+/// coincidentally carry — only a section this code wrote can match.
+const PLAYER_PROFILE_SECTION: &str = "\n\n# Player profile (StoryTUI)\n";
+
+/// Idempotently set (or clear) the pack's `# Player profile` section: the
+/// previous section is truncated off before the new one is appended, so
+/// repeated application across edits, pack switches, and new games never
+/// duplicates. An identity with neither field set leaves no section at all.
+pub fn set_player_profile_section(system: &mut String, profile: &PlayerProfile) {
+    if let Some(index) = system.find(PLAYER_PROFILE_SECTION) {
+        system.truncate(index);
+    }
+    let name = profile
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+    let persona = profile
+        .persona
+        .as_deref()
+        .map(str::trim)
+        .filter(|persona| !persona.is_empty());
+    if name.is_none() && persona.is_none() {
+        return;
+    }
+    system.push_str(PLAYER_PROFILE_SECTION);
+    if let Some(name) = name {
+        system.push_str(&format!(
+            "플레이어의 이름은 `{name}`이다. 다른 이름이나 '이름 씨' 같은 임시 호칭을 만들지 말고, 필요한 호칭에는 `{name} 씨`를 사용한다.\n"
+        ));
+    }
+    if let Some(persona) = persona {
+        system.push_str(&format!(
+            "플레이어 페르소나: {persona}\n플레이어가 직접 입력하지 않은 행동·감정은 이 페르소나만으로 확정하지 않는다.\n"
+        ));
+    }
+}
+
+/// Marker heading of the injected author's note section. Same app-specific
+/// suffix discipline as [`PLAYER_PROFILE_SECTION`] — only a section this
+/// code wrote can match.
+const AUTHOR_NOTE_SECTION: &str = "\n\n# Author's note (StoryTUI)\n";
+
+/// Rewrite BOTH host-owned prompt overlays — the player identity and the
+/// author's note — idempotently: everything from the earliest marker onward
+/// is truncated, then the profile and note sections are re-appended in a
+/// fixed order. Repeated application across persona edits, note edits, pack
+/// loads, pack switches, and new games therefore never duplicates, drops, or
+/// reorders the other's section.
+pub fn apply_prompt_overlays(system: &mut String, profile: &PlayerProfile, note: Option<&str>) {
+    let cut = system
+        .find(PLAYER_PROFILE_SECTION)
+        .into_iter()
+        .chain(system.find(AUTHOR_NOTE_SECTION))
+        .min();
+    if let Some(index) = cut {
+        system.truncate(index);
+    }
+    set_player_profile_section(system, profile);
+    if let Some(note) = note.map(str::trim).filter(|note| !note.is_empty()) {
+        system.push_str(AUTHOR_NOTE_SECTION);
+        system.push_str(note);
+        system.push('\n');
+    }
+}
+
+/// Activate an edited author's note: persist it and rewrite the pack's
+/// overlay sections (idempotent — the next turn builds its prompt from the
+/// pack). Returns the trimmed effective text so the UI can re-prefill the
+/// modal; an empty string means the note is off.
+pub fn activate_author_note(
+    note: String,
+    pack: &mut StoryPack,
+    user_settings: &mut UserSettings,
+    base_player: &PlayerProfile,
+    config: &RuntimeConfig,
+) -> Result<String, String> {
+    user_settings.author_note = Some(note);
+    save_user_settings(&config.save_dir, user_settings)?;
+    let effective = user_settings
+        .effective_author_note()
+        .unwrap_or_default()
+        .to_string();
+    let profile = effective_player_profile(user_settings, base_player);
+    apply_prompt_overlays(
+        &mut pack.prompts.system,
+        &profile,
+        user_settings.effective_author_note(),
+    );
+    Ok(effective)
 }
 
 /// Map the service status onto the UI's plain display type.
@@ -256,7 +379,8 @@ pub async fn reprobe_if_unconfigured(
                 if let Err(error) = save_user_settings(&config.save_dir, user_settings) {
                     tracing::warn!(%error, "auto-selected model could not be persisted");
                 }
-                refresh_projection(app, provider_config, provider, config, tts).await;
+                refresh_projection(app, provider_config, provider, config, tts, user_settings)
+                    .await;
                 refresh_model_list(app, provider, provider_config, false).await;
                 tracing::info!(
                     base_url = %base_url,
@@ -275,6 +399,64 @@ pub async fn reprobe_if_unconfigured(
     Some(outcome)
 }
 
+/// One background availability reprobe (AC-4), shared by the settings-open
+/// path and the periodic frame timer. Re-runs auto-setup while no model is
+/// selected; otherwise probes health and, on any change, re-projects the
+/// Settings screen and refreshes the home status line. Returns `true` when
+/// availability changed (worth a redraw).
+pub async fn reprobe_availability(
+    app: &mut App,
+    provider_config: &mut ProviderConfig,
+    provider: &mut Arc<OpenAiCompatibleProvider>,
+    user_settings: &mut UserSettings,
+    config: &mut RuntimeConfig,
+    tts: &TtsService,
+) -> bool {
+    if provider_config.model.trim().is_empty() {
+        let outcome =
+            reprobe_if_unconfigured(app, provider_config, provider, user_settings, config, tts)
+                .await;
+        return match outcome {
+            Some(DiscoveryOutcome::Connected { .. }) => {
+                // Adopted a server: the "no model" guidance line is stale.
+                clear_home_status_if_matches(
+                    app,
+                    &unconfigured_home_status(&DiscoveryOutcome::NoServer).0,
+                );
+                true
+            }
+            Some(other) => {
+                app.set_home_status(Some(unconfigured_home_status(&other)));
+                false
+            }
+            None => false,
+        };
+    }
+    let health = provider
+        .health()
+        .await
+        .unwrap_or(ProviderHealth::Unavailable);
+    let previous = app.provider_health().unwrap_or(ProviderHealth::Unavailable);
+    if health == previous {
+        return false;
+    }
+    refresh_projection(app, provider_config, provider, config, tts, user_settings).await;
+    if health != ProviderHealth::Unavailable {
+        // The server came back: the gray "서버를 켠 뒤…" line must go.
+        clear_home_status_if_matches(app, &server_down_home_status().0);
+        tracing::info!(?health, "provider recovered; status refreshed");
+    }
+    true
+}
+
+/// Drop the home status line when it still holds exactly `text` — a recovery
+/// clears the notice it owns, never a player-facing picker error.
+fn clear_home_status_if_matches(app: &mut App, text: &str) {
+    if app.home_status_text() == Some(text) {
+        app.set_home_status(None);
+    }
+}
+
 /// Re-project the Settings screen after a model-stage activation: probe
 /// health, read back the session assignments, and refresh the display.
 async fn refresh_projection(
@@ -283,6 +465,7 @@ async fn refresh_projection(
     provider: &OpenAiCompatibleProvider,
     config: &RuntimeConfig,
     tts: &TtsService,
+    user_settings: &UserSettings,
 ) {
     let health = provider
         .health()
@@ -301,7 +484,84 @@ async fn refresh_projection(
         app.image_backend_label(),
         app.use_director_writer(),
         app.expressions_enabled(),
+        user_settings,
+        &config.player,
     );
+}
+
+/// Apply a style preset (or 자동) onto the live profile: resolve the triple
+/// against the base snapshot and the legacy user temperature, write it into
+/// the active config, and return the label + values for the Settings patch.
+/// Pure — no I/O, no provider calls.
+pub fn apply_style_to_config(
+    style: Option<SamplingStyle>,
+    user_settings: &UserSettings,
+    provider_config: &mut ProviderConfig,
+    config: &RuntimeConfig,
+) -> (String, f32, f32, u32) {
+    let (temperature, top_p, top_k) =
+        resolve_sampling(style, config.base_sampling, user_settings.temperature);
+    provider_config.temperature = temperature;
+    provider_config.top_p = top_p;
+    provider_config.top_k = top_k;
+    (sampling_style_label(style), temperature, top_p, top_k)
+}
+
+/// Cycle the Settings `x` style preset (자동 → 창의적 → 균형 → 정밀): apply
+/// the next preset to the live provider, rebuild it, persist the choice, and
+/// patch the sampling block. Sampling rides the request config, so the next
+/// turn generates with the new values; nothing else in the session changes.
+pub async fn cycle_sampling_style(
+    app: &mut App,
+    provider_config: &mut ProviderConfig,
+    provider: &mut Arc<OpenAiCompatibleProvider>,
+    user_settings: &mut UserSettings,
+    config: &mut RuntimeConfig,
+) -> Result<(), String> {
+    let next = SamplingStyle::next_after(user_settings.sampling_style());
+    user_settings.sampling_preset = next.map(|style| style.id().to_string());
+    let (label, temperature, top_p, top_k) =
+        apply_style_to_config(next, user_settings, provider_config, config);
+    // Build before swapping: a failed construction leaves the old provider
+    // fully in charge (same discipline as `apply_model`).
+    *provider = Arc::new(
+        OpenAiCompatibleProvider::new(provider_config.clone())
+            .map_err(|e| format!("샘플링 스타일을 적용하지 못했습니다: {e}"))?,
+    );
+    save_user_settings(&config.save_dir, user_settings)?;
+    app.update_settings_sampling(label.clone(), temperature, top_p, top_k);
+    tracing::info!(style = %label, temperature, top_p, top_k, "sampling style cycled");
+    Ok(())
+}
+
+/// Activate an edited player identity from the persona modal: persist it,
+/// rewrite the pack's `# Player profile` section (idempotent — the next turn
+/// builds its prompt from the pack), and return the display values for the
+/// Settings patch (`label`, name, persona text).
+pub fn activate_persona(
+    name: String,
+    persona: String,
+    pack: &mut StoryPack,
+    user_settings: &mut UserSettings,
+    base_player: &PlayerProfile,
+    config: &RuntimeConfig,
+) -> Result<(String, String, String), String> {
+    user_settings.player_name = Some(name);
+    user_settings.player_persona = Some(persona);
+    save_user_settings(&config.save_dir, user_settings)?;
+    let effective = effective_player_profile(user_settings, base_player);
+    // Re-apply both overlays so a persona edit never drops the author's note.
+    apply_prompt_overlays(
+        &mut pack.prompts.system,
+        &effective,
+        user_settings.effective_author_note(),
+    );
+    let label = persona_status_label(&effective);
+    Ok((
+        label,
+        effective.name.unwrap_or_default(),
+        effective.persona.unwrap_or_default(),
+    ))
 }
 
 /// Which stages a resolution or preflight pass had to repair to the active
@@ -430,11 +690,14 @@ pub async fn switch_provider(
         "switching provider"
     );
     // Build before swapping any state: a failed construction (rare — client
-    // build) must leave the old provider fully in charge. Sampling overrides
-    // are machine-level tastes and travel across switches; `model` does not —
-    // the repair below resolves it against the new server's advertised list.
+    // build) must leave the old provider fully in charge. Sampling taste is
+    // machine-level and travels across switches; `model` does not — the
+    // repair below resolves it against the new server's advertised list.
     let mut selected = selected.clone();
-    user_settings.apply_sampling_overrides(&mut selected);
+    // Snapshot the profile's own tuning before taste is layered on: the style
+    // cycle's 자동 restores exactly these values.
+    config.base_sampling = (selected.temperature, selected.top_p, selected.top_k);
+    user_settings.apply_sampling_taste(&mut selected);
     let rebuilt = Arc::new(
         OpenAiCompatibleProvider::new(selected.clone())
             .map_err(|e| format!("프로바이더 '{name}'를 적용하지 못했습니다: {e}"))?,
@@ -546,6 +809,8 @@ pub async fn apply_provider(
         app.image_backend_label(),
         app.use_director_writer(),
         app.expressions_enabled(),
+        user_settings,
+        &config.player,
     );
     let roster: Vec<(String, String)> = providers
         .iter()
@@ -576,7 +841,7 @@ pub async fn apply_model(
         OpenAiCompatibleProvider::new(provider_config.clone())
             .map_err(|e| format!("선택한 모델을 적용하지 못했습니다: {e}"))?,
     );
-    refresh_projection(app, provider_config, provider, config, tts).await;
+    refresh_projection(app, provider_config, provider, config, tts, user_settings).await;
     Ok(())
 }
 
@@ -598,7 +863,7 @@ pub async fn apply_director_model(
         .or_default()
         .director = Some(model);
     save_user_settings(&config.save_dir, user_settings)?;
-    refresh_projection(app, provider_config, provider, config, tts).await;
+    refresh_projection(app, provider_config, provider, config, tts, user_settings).await;
     Ok(())
 }
 
@@ -620,7 +885,7 @@ pub async fn apply_choice_model(
         .or_default()
         .choice = Some(model);
     save_user_settings(&config.save_dir, user_settings)?;
-    refresh_projection(app, provider_config, provider, config, tts).await;
+    refresh_projection(app, provider_config, provider, config, tts, user_settings).await;
     Ok(())
 }
 
@@ -642,16 +907,18 @@ pub async fn apply_writer_model(
         .or_default()
         .writer = Some(model);
     save_user_settings(&config.save_dir, user_settings)?;
-    refresh_projection(app, provider_config, provider, config, tts).await;
+    refresh_projection(app, provider_config, provider, config, tts, user_settings).await;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        DiscoveryOutcome, StageRepairs, filter_chat_models, pick_auto_model, probe_candidates,
-        reconcile_active_model, record_repaired_stages, resolve_stage_assignments,
-        server_down_home_status, switch_provider, unconfigured_home_status,
+        DiscoveryOutcome, StageRepairs, activate_author_note, activate_persona,
+        apply_prompt_overlays, apply_style_to_config, filter_chat_models, persona_status_label,
+        pick_auto_model, probe_candidates, reconcile_active_model, record_repaired_stages,
+        resolve_stage_assignments, server_down_home_status, set_player_profile_section,
+        switch_provider, unconfigured_home_status,
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -712,6 +979,241 @@ mod tests {
         // No chat model at all → nothing to pick.
         let embeddings = vec!["text-embedding-nomic-embed-text-v1.5".to_string()];
         assert_eq!(pick_auto_model("", "", &embeddings), None);
+    }
+
+    #[test]
+    fn persona_section_is_idempotent_and_clears() {
+        let base = "이야기 지침.\n";
+        let profile = PlayerProfile {
+            name: Some("민준".to_string()),
+            persona: Some("조용한 관찰자".to_string()),
+        };
+        let mut system = base.to_string();
+        set_player_profile_section(&mut system, &profile);
+        let once = system.clone();
+        set_player_profile_section(&mut system, &profile);
+        assert_eq!(system, once, "repeated application never duplicates");
+        assert_eq!(system.matches("# Player profile").count(), 1);
+        assert!(system.starts_with(base));
+        assert!(system.contains("`민준`"));
+
+        // Replacing the identity swaps the content in place.
+        let replacement = PlayerProfile {
+            name: Some("레오".to_string()),
+            persona: None,
+        };
+        set_player_profile_section(&mut system, &replacement);
+        assert_eq!(system.matches("# Player profile").count(), 1);
+        assert!(system.contains("`레오`"));
+        assert!(!system.contains("민준"));
+
+        // An identity with both fields off leaves no section at all.
+        let empty = PlayerProfile::default();
+        set_player_profile_section(&mut system, &empty);
+        assert!(!system.contains("# Player profile"));
+        assert_eq!(system, base);
+    }
+
+    #[test]
+    fn persona_status_label_prefers_name_then_text_then_none() {
+        let both = PlayerProfile {
+            name: Some("민준".to_string()),
+            persona: Some("관찰자".to_string()),
+        };
+        assert_eq!(persona_status_label(&both), "민준");
+        let text_only = PlayerProfile {
+            name: Some(String::new()),
+            persona: Some("관찰자".to_string()),
+        };
+        assert_eq!(persona_status_label(&text_only), "설정됨");
+        assert_eq!(persona_status_label(&PlayerProfile::default()), "없음");
+    }
+
+    #[test]
+    fn style_activation_uses_preset_then_restores_base_taste() {
+        let user_settings = UserSettings {
+            temperature: Some(0.5),
+            ..UserSettings::default()
+        };
+        let mut config = runtime_for(PathBuf::from("."), vec![dead_profile("a", "a-main")]);
+        config.base_sampling = (0.85, 0.92, 40);
+        let mut provider_config = config.provider.clone();
+
+        // 자동: the legacy user temperature applies to the base triple...
+        let (label, temperature, top_p, top_k) =
+            apply_style_to_config(None, &user_settings, &mut provider_config, &config);
+        assert_eq!(label, "자동");
+        assert_eq!((temperature, top_p, top_k), (0.5, 0.92, 40));
+        assert_eq!(
+            (
+                provider_config.temperature,
+                provider_config.top_p,
+                provider_config.top_k
+            ),
+            (0.5, 0.92, 40)
+        );
+
+        // ...while an active preset decides the whole triple.
+        let style = storytui::config::SamplingStyle::from_id("precise");
+        let (label, temperature, top_p, top_k) =
+            apply_style_to_config(style, &user_settings, &mut provider_config, &config);
+        assert_eq!(label, "정밀");
+        assert_eq!((temperature, top_p, top_k), (0.4, 0.8, 20));
+        assert_eq!(
+            (
+                provider_config.temperature,
+                provider_config.top_p,
+                provider_config.top_k
+            ),
+            (0.4, 0.8, 20)
+        );
+    }
+
+    #[tokio::test]
+    async fn sampling_style_survives_provider_switch() {
+        let save_dir = switch_test_dir("style-switch");
+        let profile_a = dead_profile("a", "a-main");
+        let profile_b = dead_profile("b", "b-main");
+        let mut config = runtime_for(save_dir.clone(), vec![profile_a.clone(), profile_b.clone()]);
+        let mut provider_config = profile_a;
+        let mut provider =
+            Arc::new(OpenAiCompatibleProvider::new(provider_config.clone()).expect("provider"));
+        let mut user_settings = UserSettings {
+            sampling_preset: Some("precise".to_string()),
+            ..UserSettings::default()
+        };
+
+        // Clone the roster: the call also needs `config` mutably.
+        let roster = config.providers.clone();
+        switch_provider(
+            "b",
+            &roster,
+            &mut provider_config,
+            &mut provider,
+            &mut user_settings,
+            &mut config,
+        )
+        .await
+        .expect("switch")
+        .expect("profile exists");
+
+        // The preset re-applied on top of profile b's own defaults...
+        assert_eq!(provider_config.temperature, 0.4);
+        assert_eq!(provider_config.top_p, 0.8);
+        assert_eq!(provider_config.top_k, 20);
+        // ...and b's pristine tuning is snapshotted for the 자동 restore.
+        assert_eq!(config.base_sampling, (0.85, 0.92, 40));
+        assert_eq!(user_settings.sampling_preset.as_deref(), Some("precise"));
+        std::fs::remove_dir_all(save_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn persona_submit_persists_and_rewrites_the_pack_section() {
+        let save_dir = switch_test_dir("persona-apply");
+        let mut config = runtime_for(save_dir.clone(), vec![dead_profile("a", "a-main")]);
+        config.player = PlayerProfile {
+            name: Some("토마스".to_string()),
+            persona: Some("TOML 기본 페르소나".to_string()),
+        };
+        let mut pack = story_core::tests_support::sample_pack();
+        let mut user_settings = UserSettings::default();
+
+        let (label, name_text, persona_text) = activate_persona(
+            "레오".to_string(),
+            "조용한 관찰자".to_string(),
+            &mut pack,
+            &mut user_settings,
+            &config.player,
+            &config,
+        )
+        .expect("activate persona");
+        assert_eq!(label, "레오");
+        assert_eq!(
+            (name_text.as_str(), persona_text.as_str()),
+            ("레오", "조용한 관찰자")
+        );
+        // The user-settings identity wins over the base [player] profile.
+        let system = &pack.prompts.system;
+        assert_eq!(system.matches("# Player profile").count(), 1);
+        assert!(system.contains("`레오`"));
+        assert!(!system.contains("토마스"));
+        let persisted = load_user_settings(&save_dir).expect("reload");
+        assert_eq!(persisted.player_name.as_deref(), Some("레오"));
+
+        // Submitting both fields empty clears the section entirely.
+        let (label, _, _) = activate_persona(
+            String::new(),
+            String::new(),
+            &mut pack,
+            &mut user_settings,
+            &config.player,
+            &config,
+        )
+        .expect("clear persona");
+        assert_eq!(label, "없음");
+        assert!(!pack.prompts.system.contains("# Player profile"));
+        std::fs::remove_dir_all(save_dir).ok();
+    }
+
+    #[test]
+    fn prompt_overlays_are_idempotent_and_keep_each_other() {
+        let base = "이야기 지침.\n";
+        let profile = PlayerProfile {
+            name: Some("민준".to_string()),
+            persona: None,
+        };
+        let mut system = base.to_string();
+        apply_prompt_overlays(&mut system, &profile, Some("조용한 장면"));
+        let once = system.clone();
+        apply_prompt_overlays(&mut system, &profile, Some("조용한 장면"));
+        assert_eq!(system, once, "repeated application never duplicates");
+        assert_eq!(system.matches("# Player profile").count(), 1);
+        assert_eq!(system.matches("# Author's note (StoryTUI)").count(), 1);
+        assert!(system.starts_with(base));
+
+        // A persona edit re-applies both sections — the note survives it.
+        let replacement = PlayerProfile {
+            name: Some("레오".to_string()),
+            persona: None,
+        };
+        apply_prompt_overlays(&mut system, &replacement, Some("다른 노트"));
+        assert!(system.contains("`레오`") && system.contains("다른 노트"));
+        assert!(!system.contains("민준") && !system.contains("조용한 장면"));
+
+        // A blank note drops the note section but keeps the profile.
+        apply_prompt_overlays(&mut system, &replacement, Some("   "));
+        assert!(!system.contains("# Author's note"));
+        assert!(system.contains("`레오`"));
+    }
+
+    #[test]
+    fn author_note_submit_persists_and_rewrites_sections() {
+        let save_dir = switch_test_dir("note-apply");
+        let config = runtime_for(save_dir.clone(), vec![dead_profile("a", "a-main")]);
+        let mut pack = story_core::tests_support::sample_pack();
+        let mut user_settings = UserSettings::default();
+        let base = PlayerProfile::default();
+
+        let effective = activate_author_note(
+            "조용한 장면".to_string(),
+            &mut pack,
+            &mut user_settings,
+            &base,
+            &config,
+        )
+        .expect("set note");
+        assert_eq!(effective, "조용한 장면");
+        assert_eq!(pack.prompts.system.matches("# Author's note").count(), 1);
+        let persisted = load_user_settings(&save_dir).expect("reload");
+        assert_eq!(persisted.effective_author_note(), Some("조용한 장면"));
+
+        // An empty submit clears the note section entirely.
+        let effective =
+            activate_author_note(String::new(), &mut pack, &mut user_settings, &base, &config)
+                .expect("clear note");
+        assert_eq!(effective, "");
+        assert!(!pack.prompts.system.contains("# Author's note"));
+        std::fs::remove_dir_all(save_dir).ok();
     }
 
     #[test]
@@ -918,6 +1420,7 @@ mod tests {
             providers,
             stage_defaults: Default::default(),
             fallback_model: String::new(),
+            base_sampling: (0.85, 0.92, 40),
             director_model: None,
             choice_model: None,
             writer_model: None,
