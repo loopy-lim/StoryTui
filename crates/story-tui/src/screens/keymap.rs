@@ -62,6 +62,11 @@ pub const KEYMAP: &[KeymapRow] = &[
         group: KeymapGroup::Game,
     },
     KeymapRow {
+        key: "Alt+1-9",
+        action_ko: "퀵 입력",
+        group: KeymapGroup::Game,
+    },
+    KeymapRow {
         key: "Enter",
         action_ko: "현재 선택 확정",
         group: KeymapGroup::Game,
@@ -77,8 +82,33 @@ pub const KEYMAP: &[KeymapRow] = &[
         group: KeymapGroup::Game,
     },
     KeymapRow {
+        key: "w",
+        action_ko: "이어쓰기",
+        group: KeymapGroup::Game,
+    },
+    KeymapRow {
+        key: "z",
+        action_ko: "대필",
+        group: KeymapGroup::Game,
+    },
+    KeymapRow {
+        key: "g",
+        action_ko: "인물 대화",
+        group: KeymapGroup::Game,
+    },
+    KeymapRow {
+        key: "p",
+        action_ko: "인물 목록",
+        group: KeymapGroup::Game,
+    },
+    KeymapRow {
         key: "u",
         action_ko: "직전 턴 되돌리기",
+        group: KeymapGroup::Game,
+    },
+    KeymapRow {
+        key: "[ / ]",
+        action_ko: "변형 순환 (영문 모드)",
         group: KeymapGroup::Game,
     },
     KeymapRow {
@@ -167,6 +197,31 @@ pub const KEYMAP: &[KeymapRow] = &[
         action_ko: "표정 스프라이트 켜기/끄기",
         group: KeymapGroup::Settings,
     },
+    KeymapRow {
+        key: "x",
+        action_ko: "스타일 프리셋 순환",
+        group: KeymapGroup::Settings,
+    },
+    KeymapRow {
+        key: "a",
+        action_ko: "페르소나 편집",
+        group: KeymapGroup::Settings,
+    },
+    KeymapRow {
+        key: "w",
+        action_ko: "로어북",
+        group: KeymapGroup::Settings,
+    },
+    KeymapRow {
+        key: "t",
+        action_ko: "노트",
+        group: KeymapGroup::Settings,
+    },
+    KeymapRow {
+        key: "r",
+        action_ko: "프롬프트",
+        group: KeymapGroup::Settings,
+    },
 ];
 
 const GAME_HEADER: &str = "게임 화면";
@@ -215,14 +270,35 @@ pub fn keymap_lines() -> Vec<Line<'static>> {
 
 /// Build the keymap as two balanced columns so the table fits mid-size
 /// terminals without scrolling. The split never strands a group header at
-/// the bottom of a column: the left column carries the game group's first
-/// rows, the right column the rest plus the settings group and the note.
+/// the bottom of a column: the settings group always shares the right column
+/// (its header must sit at a column top), so the game rows are what
+/// rebalances — the split point keeps both columns inside the `?` help
+/// overlay's 20-row body budget (22-line popup minus borders) while staying
+/// as even as that budget allows.
 pub fn keymap_lines_two_columns() -> (Vec<Line<'static>>, Vec<Line<'static>>) {
+    /// Rows the `?` overlay body offers per column (`render_help_overlay`'s
+    /// 22-line popup minus its borders).
+    const HELP_BODY_BUDGET: usize = 20;
+
     let game: Vec<&KeymapRow> = group_rows(KeymapGroup::Game).collect();
     let settings: Vec<&KeymapRow> = group_rows(KeymapGroup::Settings).collect();
 
+    // Everything after the game tail in the right column: blank + settings
+    // header + settings rows + blank + alias note.
+    let right_fixed = 4 + settings.len();
+    // The split must keep right ≤ budget, then go as even as possible.
+    let min_split = game
+        .len()
+        .saturating_sub(HELP_BODY_BUDGET.saturating_sub(right_fixed));
+    let balanced = (game.len() + right_fixed).div_ceil(2);
+    // The left column carries the game header plus its rows, so it also has
+    // its own budget: once the game group outgrows the even split, the clamp
+    // moves overflow to the right column (which then must still fit — the
+    // budget test below fails loudly when the whole table no longer does).
+    let max_split = HELP_BODY_BUDGET.saturating_sub(1);
+    let split_at = balanced.max(min_split).min(max_split).min(game.len());
+
     let mut left = vec![group_header(GAME_HEADER)];
-    let split_at = game.len().div_ceil(2);
     left.extend(game[..split_at].iter().map(|row| keymap_line(row)));
 
     let mut right: Vec<Line<'static>> = game[split_at..]
@@ -282,10 +358,13 @@ mod tests {
                     .collect()
             })
             .collect();
-        // Every bound key still appears exactly once.
+        // Every bound row appears exactly once. Match on the full row (key +
+        // description): the same keycap may be documented in both groups
+        // (story `w` 이어쓰기 vs settings `w` 로어북) by design.
         for row in KEYMAP {
-            let hits = flat.iter().filter(|line| line.starts_with(row.key)).count();
-            assert_eq!(hits, 1, "key '{}' appears {hits} times", row.key);
+            let expected = format!("{}  ·  {}", row.key, row.action_ko);
+            let hits = flat.iter().filter(|line| **line == expected).count();
+            assert_eq!(hits, 1, "row '{expected}' appears {hits} times");
         }
         // Group headers sit at a column top, never as the last line.
         assert_eq!(flat[0], GAME_HEADER);
@@ -298,5 +377,18 @@ mod tests {
             "settings header must not be the last line of a column"
         );
         assert!(flat.last().is_some_and(|line| line.contains("2벌식")));
+    }
+
+    #[test]
+    fn both_columns_fit_the_help_overlay_body_budget() {
+        // The `?` overlay body is 20 rows tall (22-line popup minus borders).
+        // A column past the budget would silently clip its tail rows.
+        let (left, right) = keymap_lines_two_columns();
+        assert!(
+            left.len() <= 20 && right.len() <= 20,
+            "help columns exceed the overlay budget: left={}, right={}",
+            left.len(),
+            right.len()
+        );
     }
 }

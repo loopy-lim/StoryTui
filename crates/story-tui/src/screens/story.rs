@@ -35,6 +35,8 @@ pub const MIN_HEIGHT: u16 = 16;
 pub enum ListMode {
     History,
     Memory,
+    /// Read-only cast roster (이름 · 관계단계 · 감정 · 호감/신뢰/긴장).
+    Cast,
     ModelPicker,
     ProviderPicker,
 }
@@ -78,14 +80,16 @@ pub fn render_list(frame: &mut Frame, area: Rect, mode: ListMode, items: &[Strin
     let title = match mode {
         ListMode::History => "이전 생성 기록",
         ListMode::Memory => "기억 목록",
+        ListMode::Cast => "인물 목록",
         ListMode::ModelPicker => "모델 선택",
         ListMode::ProviderPicker => "프로바이더 선택",
     };
+    let empty_message = match mode {
+        ListMode::Cast => "등장인물이 없습니다.",
+        _ => "아직 기록이 없습니다.",
+    };
     let rows: Vec<Line> = if items.is_empty() {
-        vec![Line::from(Span::styled(
-            "아직 기록이 없습니다.",
-            Styles::muted(),
-        ))]
+        vec![Line::from(Span::styled(empty_message, Styles::muted()))]
     } else {
         items
             .iter()
@@ -599,7 +603,7 @@ pub fn home_shortcut_at(
 /// of the real content end. The greedy simulation below matches the wrapper
 /// for space-separated Korean prose; only a trailing-whitespace edge can
 /// differ by one line, which the scroll clamp absorbs.
-fn wrapped_line_count(lines: &[Line<'_>], width: u16) -> usize {
+pub(crate) fn wrapped_line_count(lines: &[Line<'_>], width: u16) -> usize {
     let width = width.max(1) as usize;
     lines
         .iter()
@@ -1452,6 +1456,10 @@ mod tests {
             loading: None,
             error: None,
             undo_checkpoint_id: None,
+            variant_label: None,
+            cast: Vec::new(),
+            truncation: story_model::TruncationStatus::None,
+            empty_side_result: false,
         }
     }
 

@@ -34,6 +34,10 @@ fn sample_view(turn: u32) -> AppViewModel {
         loading: None,
         error: None,
         undo_checkpoint_id: None,
+        variant_label: None,
+        cast: Vec::new(),
+        truncation: story_model::TruncationStatus::None,
+        empty_side_result: false,
     }
 }
 

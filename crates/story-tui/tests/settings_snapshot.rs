@@ -98,6 +98,8 @@ fn snapshot_settings_loopback_ready() {
         image_backend_manual: false,
         use_director_writer: true,
         expressions_enabled: true,
+        sampling_style: "자동",
+        persona_label: "없음",
         theme_name: "default",
         returns_home: false,
     };
@@ -125,6 +127,8 @@ fn snapshot_settings_image_backend_manual() {
         image_backend_manual: true,
         use_director_writer: false,
         expressions_enabled: false,
+        sampling_style: "자동",
+        persona_label: "없음",
         theme_name: "default",
         returns_home: false,
     };
@@ -153,6 +157,8 @@ fn snapshot_settings_non_loopback_warning() {
         image_backend_manual: false,
         use_director_writer: false,
         expressions_enabled: false,
+        sampling_style: "자동",
+        persona_label: "없음",
         theme_name: "default",
         returns_home: false,
     };
@@ -182,6 +188,8 @@ fn settings_below_min_size_renders_warning() {
         image_backend_manual: false,
         use_director_writer: true,
         expressions_enabled: true,
+        sampling_style: "자동",
+        persona_label: "없음",
         theme_name: "default",
         returns_home: false,
     };
@@ -227,6 +235,8 @@ fn settings_masked_secret_never_renders() {
         image_backend_manual: false,
         use_director_writer: true,
         expressions_enabled: true,
+        sampling_style: "자동",
+        persona_label: "없음",
         theme_name: "default",
         returns_home: false,
     };
