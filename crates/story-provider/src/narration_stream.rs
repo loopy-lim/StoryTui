@@ -15,6 +15,14 @@
 //!   mis-extracted partial (e.g. a doubly-encoded response, or the key token
 //!   appearing inside another string) is corrected the moment the final view
 //!   replaces `streaming_narration`.
+//! - Only a ROOT-LEVEL `narration` member is streamed (issue #8): the scanner
+//!   tracks object/array nesting depth (string-aware, so braces inside string
+//!   values do not count) and activates the key match at depth 1 only. A
+//!   `"narration"` key nested inside `state_patch.set_strings` or a choices
+//!   element therefore never over-streams a non-prose value. Known limit: an
+//!   unbalanced `{` inside pre-model thinking text can masquerade as the
+//!   root and suppress extraction for that turn — the failure mode is "no
+//!   streaming prose" (loading overlay only), never wrong prose.
 //! - Feeds are `&str` (the SSE parser already buffers split UTF-8), but JSON
 //!   `\uXXXX` escapes — including surrogate pairs split across feeds — are
 //!   decoded here.
@@ -30,6 +38,17 @@ pub struct NarrationStreamExtractor {
     /// `KEY.len() - 1` chars are retained between feeds so a huge
     /// thinking/prelude block cannot grow it unboundedly.
     scan_buf: String,
+    /// JSON nesting depth since the first `{` (issue #8). The key match is
+    /// only active at depth 1 — a direct member of the root object — so a
+    /// `"narration"` key inside `state_patch.set_strings` (or any nested
+    /// map/array) never streams.
+    depth: usize,
+    /// Inside a JSON string while scanning: braces/brackets in string values
+    /// must not affect `depth`.
+    in_string: bool,
+    /// The previous char was `\` inside a string (an escaped `\"` must not
+    /// close it).
+    in_escape: bool,
     /// Scratch for the 4 hex digits of a `\uXXXX` escape in flight.
     hex_buf: [u8; 4],
     hex_len: usize,
@@ -78,17 +97,66 @@ impl NarrationStreamExtractor {
     fn step(&mut self, out: &mut String, ch: char) {
         match self.state {
             State::Scanning => {
+                // Pre-root (before the first `{`): no key can exist. Only the
+                // root object's opening brace is tracked; prelude/thinking
+                // text is dropped without touching the scan buffer.
+                if self.depth == 0 {
+                    if ch == '{' {
+                        self.depth = 1;
+                        self.scan_buf.clear();
+                        self.in_string = false;
+                        self.in_escape = false;
+                    }
+                    return;
+                }
+                // Accumulate and attempt the key match in both structural and
+                // in-string positions: the key token's own quotes toggle
+                // `in_string`, and a value string that happens to read
+                // `narration` is rejected later by the AfterKey `:` grammar
+                // check (a value is always followed by `,`/`}`, never `:`).
                 self.scan_buf.push(ch);
                 if let Some(at) = self.scan_buf.find(KEY) {
                     let rest: String = self.scan_buf[at + KEY.len()..].chars().collect();
                     self.scan_buf.clear();
-                    self.state = State::AfterKey;
-                    for c in rest.chars() {
-                        self.step(out, c);
+                    // The matched token's quotes are balanced; both ends land
+                    // on a structural position.
+                    self.in_string = false;
+                    self.in_escape = false;
+                    if self.depth == 1 {
+                        self.state = State::AfterKey;
+                        for c in rest.chars() {
+                            self.step(out, c);
+                        }
+                    }
+                    // A nested occurrence (depth > 1) is consumed and ignored
+                    // — the scan simply continues past it.
+                    return;
+                }
+                if self.in_string {
+                    if self.in_escape {
+                        self.in_escape = false;
+                    } else if ch == '\\' {
+                        self.in_escape = true;
+                    } else if ch == '"' {
+                        self.in_string = false;
                     }
                 } else {
-                    self.trim_scan_buf();
+                    match ch {
+                        '"' => self.in_string = true,
+                        '{' | '[' => self.depth += 1,
+                        '}' | ']' => {
+                            self.depth = self.depth.saturating_sub(1);
+                            if self.depth == 0 {
+                                // Root closed: back to pre-root scanning (a
+                                // later `{` opens a fresh candidate root).
+                                self.in_string = false;
+                                self.in_escape = false;
+                            }
+                        }
+                        _ => {}
+                    }
                 }
+                self.trim_scan_buf();
             }
             State::AfterKey => match ch {
                 ' ' | '\t' | '\n' | '\r' => {}
@@ -330,13 +398,67 @@ mod tests {
     }
 
     #[test]
+    fn nested_narration_key_in_state_patch_is_ignored() {
+        // Issue #8: a story pack defining a "narration" string variable in
+        // state_patch.set_strings must not over-stream that value as if it
+        // were the prose — only the root-level narration is streamed.
+        let mut ex = NarrationStreamExtractor::new();
+        assert_eq!(
+            ex.feed(r#"{"state_patch":{"set_strings":{"narration":"#),
+            "",
+            "the nested key must not start streaming"
+        );
+        // Even when the nested value's text keeps flowing...
+        assert_eq!(ex.feed("\"메모"), "");
+        assert_eq!(ex.feed("장면 메모\"}}, "), "");
+        // ...the root-level narration is the one that streams.
+        assert_eq!(ex.feed("\"narration\": \"실제 본문\"}"), "실제 본문");
+    }
+
+    #[test]
+    fn narration_key_inside_array_element_is_ignored() {
+        let out = collect(&[
+            "{\"choices\": [{\"narration\": \"선택지 설명\"}], \"narration\": \"본문\"}",
+        ]);
+        assert_eq!(out, "본문");
+    }
+
+    #[test]
+    fn braces_inside_earlier_string_values_do_not_break_depth() {
+        // A `}`/`{` inside a string value must not close/reopen the root: if
+        // it did, the later root-level narration would be missed.
+        let out =
+            collect(&["{\"summary\": \"중괄호 } 와 { 를 포함한 요약\", \"narration\": \"본문\"}"]);
+        assert_eq!(out, "본문");
+    }
+
+    #[test]
+    fn value_string_reading_narration_is_rejected_by_grammar() {
+        // A VALUE string that happens to read `narration` forms the key token
+        // in the raw stream; the AfterKey grammar check (a key must be
+        // followed by `:`) rejects it and the real key still wins.
+        let out = collect(&["{\"a\": \"narration\", \"narration\": \"값\"}"]);
+        assert_eq!(out, "값");
+    }
+
+    #[test]
+    fn escaped_quote_in_value_does_not_desync_string_tracking() {
+        // `\"` inside a value string must not close it, or the depth bookkeeping
+        // derails and the root-level narration could be missed.
+        let out = collect(&["{\"summary\": \"그는 \\\"인용\\\" 했다\", \"narration\": \"본문\"}"]);
+        assert_eq!(out, "본문");
+    }
+
+    #[test]
     fn huge_prelude_does_not_grow_the_scan_buffer() {
         let mut ex = NarrationStreamExtractor::new();
         for _ in 0..10_000 {
             ex.feed("생각 중인 텍스트가 흐른다. ");
         }
         assert!(ex.scan_buf.chars().count() <= KEY.len());
-        assert_eq!(ex.feed("\"narration\": \"도착\""), "도착");
+        // Since issue #8 the key must sit at the root object's depth, so the
+        // feed wraps it in `{...}`.
+        assert_eq!(ex.feed("{\"narration\": \"도착\""), "도착");
     }
 
     #[test]

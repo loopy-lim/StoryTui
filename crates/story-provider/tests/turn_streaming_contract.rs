@@ -464,3 +464,64 @@ async fn turn_stream_requests_server_side_usage_accounting() {
     let n = server.received_requests().await.expect("recorded").len();
     assert_eq!(n, 1, "exactly one streaming request — got {n}");
 }
+
+#[tokio::test]
+async fn turn_stream_ignores_nested_narration_key_in_state_patch() {
+    // Issue #8: a story pack whose state_patch.set_strings defines a
+    // "narration" string variable streamed BEFORE the prose must not
+    // over-stream that value — only the root-level narration surfaces.
+    let body = serde_json::json!({
+      "state_patch": {
+        "affection_delta": {},"trust_delta": {},"tension_delta": {},"relationship_transitions": {},
+        "set_flags": {},"number_delta": {},
+        "set_strings": {"narration": "메모장면 기록"},
+        "inventory_delta": {},"add_events": [],
+        "next_location": null,"next_time_slot": null,"proposed_route": null
+      },
+      "narration": "비가 그쳤다. 노란 우산이 멈춰 섰다.",
+      "choices": [
+        {"id":"c1","label":"a","intent":"i","tone":null,"target":null,"risk":"safe","hidden_requirements":[],"preview":null}
+      ],
+      "summary": {
+        "facts": [],"unresolved": [],"relationship_changes": [],"knowledge_changes": [],
+        "interpretation": null,"address_form_changes": [],"important_player_actions": [],
+        "source_history_ids": []
+      }
+    });
+    let mut sse = String::new();
+    for piece in split_pieces(&body.to_string(), 11) {
+        sse.push_str(&delta_event(&piece));
+    }
+    sse.push_str("data: [DONE]\n\n");
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(sse_response(sse.into_bytes()))
+        .mount(&server)
+        .await;
+
+    let provider = OpenAiCompatibleProvider::new(cfg_for(&server)).expect("provider");
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<WriterEvent>(16);
+    let draft = provider
+        .generate_turn_stream(turn_request(), tx, CancellationToken::new())
+        .await
+        .expect("ok");
+
+    // The committed draft still parses the complete object.
+    assert_eq!(draft.narration, NARRATION);
+    // The surfaced chunks contain ONLY the root-level narration.
+    let mut narration = String::new();
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            WriterEvent::Chunk { text } => narration.push_str(&text),
+            WriterEvent::Done { .. } => break,
+            WriterEvent::Error { .. } => {}
+        }
+    }
+    assert_eq!(narration, NARRATION);
+    assert!(
+        !narration.contains("메모장면"),
+        "the nested set_strings value leaked into the stream: {narration:?}"
+    );
+}
