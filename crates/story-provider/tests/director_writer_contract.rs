@@ -16,7 +16,7 @@ use story_model::uuid::Uuid;
 use story_model::{ChatMessage, DirectorRequest, ProviderError, WriterEvent, WriterRequest};
 use story_provider::{LlmProvider, OpenAiCompatibleProvider, ProviderConfig, StructuredOutputMode};
 use tokio_util::sync::CancellationToken;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn cfg_for(server: &MockServer) -> ProviderConfig {
@@ -412,6 +412,40 @@ async fn write_stream_without_finish_reason_yields_none() {
         .expect("ok");
     assert_eq!(finish.full_text, "완결");
     assert_eq!(finish.finish_reason, None);
+}
+
+#[tokio::test]
+async fn write_stream_requests_server_side_usage_accounting() {
+    // Issue #9: the Writer path must ask for a final usage frame
+    // (stream_options.include_usage) exactly like the streaming turn path —
+    // without it, spec-conformant servers never attach usage and token
+    // accounting silently disappears.
+    let mut sse = String::new();
+    sse.push_str("data: {\"choices\":[{\"delta\":{\"content\":\"본문\"}}]}\n\n");
+    sse.push_str(
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":4,\"total_tokens\":11}}\n\n",
+    );
+    sse.push_str("data: [DONE]\n\n");
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains(
+            "\"stream_options\":{\"include_usage\":true}",
+        ))
+        .respond_with(sse_response(sse.into_bytes()))
+        .mount(&server)
+        .await;
+
+    let provider = OpenAiCompatibleProvider::new(cfg_for(&server)).expect("provider");
+    let (tx, _rx) = tokio::sync::mpsc::channel::<WriterEvent>(16);
+    let finish = provider
+        .write_stream(writer_request(), tx, CancellationToken::new())
+        .await
+        .expect("matched request must succeed");
+    assert_eq!(finish.full_text, "본문");
+    let usage = finish.usage.expect("usage frame must be captured");
+    assert_eq!(usage.total_tokens, 11);
 }
 
 // --- director parse-failure retry temperature --------------------------------

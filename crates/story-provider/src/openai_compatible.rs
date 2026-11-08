@@ -1125,96 +1125,25 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
         };
         let mut body = ChatCompletionRequest::from_writer(&request, model_name);
         body.max_tokens_field = self.config.max_tokens_field;
+        // Ask spec-conformant servers to attach a final usage frame so token
+        // accounting does not silently disappear on this streamed path either
+        // (issue #9; the turn path already did).
+        body.stream_options = Some(crate::envelope::StreamOptions {
+            include_usage: true,
+        });
         let generation_id = request.generation_id;
 
-        if cancel.is_cancelled() {
-            return Err(ProviderError::Cancelled);
-        }
+        let summary = self
+            .run_sse_stream(&body, &cancel, |text| {
+                // Forward to the sink; ignore a full channel (the host may
+                // have dropped the receiver).
+                let _ = sink.try_send(WriterEvent::Chunk {
+                    text: text.to_string(),
+                });
+            })
+            .await?;
 
-        // Single attempt — once the stream has started we cannot transparently
-        // retry (chunks may have already been surfaced to the UI). Pre-stream
-        // errors (connect / 4xx / 5xx) are surfaced immediately.
-        let send = self
-            .authorize(self.client.post(self.chat_url()))
-            .json(&body)
-            .send();
-        let resp = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
-            r = send => r.map_err(|e| map_send_error(e, self.config.request_timeout_ms))?,
-        };
-
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(ProviderError::Protocol(format!("HTTP {}", status.as_u16())));
-        }
-
-        let mut stream = resp.bytes_stream();
-        let mut parser = SseParser::new();
-        let mut full_text = String::new();
-        let mut usage: Option<TokenUsage> = None;
-        // The server-reported termination reason rides the final chunk before
-        // `[DONE]` ("stop" / "length" / ...). The last chunk that carries one
-        // wins; a stream with no finish_reason stays `None`.
-        let mut finish_reason: Option<String> = None;
-        let mut saw_done = false;
-
-        loop {
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => {
-                    // Cancel discards any buffered / in-flight text.
-                    return Err(ProviderError::Cancelled);
-                }
-                chunk = stream.next() => {
-                    match chunk {
-                        None => break,
-                        Some(Err(e)) => {
-                            return Err(map_send_error(e, self.config.request_timeout_ms));
-                        }
-                        Some(Ok(bytes)) => {
-                            for ev in parser.feed(bytes.as_ref()) {
-                                match ev {
-                                    SseEvent::Data(payload) => {
-                                        if let Some(parsed) = parse_stream_delta(&payload) {
-                                            if let Some(text) = parsed.text
-                                                && !text.is_empty()
-                                            {
-                                                // Forward to the sink; ignore a full
-                                                // channel (the host may have dropped the
-                                                // receiver). Coalesce regardless.
-                                                let _ = sink.try_send(WriterEvent::Chunk {
-                                                    text: text.clone(),
-                                                });
-                                                full_text.push_str(&text);
-                                            }
-                                            if let Some(u) = parsed.usage {
-                                                usage = Some(u);
-                                            }
-                                            if parsed.finish_reason.is_some() {
-                                                finish_reason = parsed.finish_reason;
-                                            }
-                                        }
-                                        // Unknown payloads (keep-alive comments,
-                                        // unparseable deltas) are ignored.
-                                    }
-                                    SseEvent::Done => {
-                                        saw_done = true;
-                                        break;
-                                    }
-                                    SseEvent::Incomplete => {}
-                                }
-                            }
-                            if saw_done {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if !saw_done {
+        if !summary.saw_done {
             // Stream ended without `[DONE]` — treat as a protocol error so the
             // host surfaces a recoverable error rather than partial text.
             return Err(ProviderError::Protocol(
@@ -1224,16 +1153,16 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
 
         // Best-effort final notification; a dropped receiver is not an error.
         let _ = sink.try_send(WriterEvent::Done {
-            usage: usage.clone(),
-            finish_reason: finish_reason.clone(),
+            usage: summary.usage.clone(),
+            finish_reason: summary.finish_reason.clone(),
         });
 
-        log_token_usage("writer", generation_id, model_name, usage.clone());
+        log_token_usage("writer", generation_id, model_name, summary.usage.clone());
         Ok(WriterFinish {
             generation_id,
-            full_text,
-            usage,
-            finish_reason,
+            full_text: summary.full_text,
+            usage: summary.usage,
+            finish_reason: summary.finish_reason,
         })
     }
 
@@ -1317,6 +1246,114 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
 }
 
 impl OpenAiCompatibleProvider {
+    /// Shared SSE machinery for both streaming paths (issue #9): send with
+    /// cancellation raced, status check, byte-stream pump through
+    /// [`SseParser`], per-delta decode, usage / finish_reason capture, and
+    /// `[DONE]` detection. `on_text` observes every non-empty delta text in
+    /// arrival order — forwarding chunks or feeding the narration extractor
+    /// is the caller's concern.
+    ///
+    /// A body that ends without `[DONE]` is NOT an error here: the Writer
+    /// path hard-errors on it, while the turn path first attempts a strict
+    /// parse of the accumulated text (see `saw_done` in the summary).
+    async fn run_sse_stream<F>(
+        &self,
+        body: &ChatCompletionRequest,
+        cancel: &CancellationToken,
+        mut on_text: F,
+    ) -> Result<SseStreamSummary, ProviderError>
+    where
+        F: FnMut(&str),
+    {
+        if cancel.is_cancelled() {
+            return Err(ProviderError::Cancelled);
+        }
+
+        // Single attempt — once the stream has started we cannot transparently
+        // retry (chunks may have already been surfaced to the UI). Pre-stream
+        // errors (connect / 4xx / 5xx) are surfaced to the caller.
+        let send = self
+            .authorize(self.client.post(self.chat_url()))
+            .json(&body)
+            .send();
+        let resp = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
+            r = send => r.map_err(|e| map_send_error(e, self.config.request_timeout_ms))?,
+        };
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(ProviderError::Protocol(format!("HTTP {}", status.as_u16())));
+        }
+
+        let mut stream = resp.bytes_stream();
+        let mut parser = SseParser::new();
+        let mut full_text = String::new();
+        let mut usage: Option<TokenUsage> = None;
+        // The server-reported termination reason rides the final chunk before
+        // `[DONE]` ("stop" / "length" / ...). The last chunk that carries one
+        // wins; a stream with no finish_reason stays `None`.
+        let mut finish_reason: Option<String> = None;
+        let mut saw_done = false;
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    // Cancel discards any buffered / in-flight text.
+                    return Err(ProviderError::Cancelled);
+                }
+                chunk = stream.next() => {
+                    match chunk {
+                        None => break,
+                        Some(Err(e)) => {
+                            return Err(map_send_error(e, self.config.request_timeout_ms));
+                        }
+                        Some(Ok(bytes)) => {
+                            for ev in parser.feed(bytes.as_ref()) {
+                                match ev {
+                                    SseEvent::Data(payload) => {
+                                        if let Some(parsed) = parse_stream_delta(&payload) {
+                                            if let Some(text) = parsed.text
+                                                && !text.is_empty()
+                                            {
+                                                full_text.push_str(&text);
+                                                on_text(&text);
+                                            }
+                                            if let Some(u) = parsed.usage {
+                                                usage = Some(u);
+                                            }
+                                            if parsed.finish_reason.is_some() {
+                                                finish_reason = parsed.finish_reason;
+                                            }
+                                        }
+                                        // Unknown payloads (keep-alive comments,
+                                        // unparseable deltas) are ignored.
+                                    }
+                                    SseEvent::Done => {
+                                        saw_done = true;
+                                        break;
+                                    }
+                                    SseEvent::Incomplete => {}
+                                }
+                            }
+                            if saw_done {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(SseStreamSummary {
+            full_text,
+            usage,
+            finish_reason,
+            saw_done,
+        })
+    }
+
     /// Single-attempt streaming body of [`Self::generate_turn_stream`].
     ///
     /// `emitted` is set once a narration chunk has actually been accepted by
@@ -1343,101 +1380,29 @@ impl OpenAiCompatibleProvider {
             &request.model
         };
 
-        if cancel.is_cancelled() {
-            return Err(ProviderError::Cancelled);
-        }
-
-        // Single attempt (see the method-level retry note). Pre-stream
-        // errors (connect / 4xx / 5xx) either fall back to the
-        // non-streaming path in the caller or surface immediately.
-        let send = self
-            .authorize(self.client.post(self.chat_url()))
-            .json(&body)
-            .send();
-        let resp = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
-            r = send => r.map_err(|e| map_send_error(e, self.config.request_timeout_ms))?,
-        };
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(ProviderError::Protocol(format!("HTTP {}", status.as_u16())));
-        }
-
-        let mut stream = resp.bytes_stream();
-        let mut parser = SseParser::new();
-        let mut full_text = String::new();
+        // Only the decoded narration prose is surfaced; JSON tokens stay
+        // invisible. `emitted` gates the caller's non-streaming fallback, so
+        // it must be latched even when the pump below ends in an error.
+        let mut emitted_local = false;
         let mut extractor = crate::narration_stream::NarrationStreamExtractor::new();
-        let mut usage: Option<TokenUsage> = None;
-        // Last chunk's server-reported termination reason ("stop"/"length"),
-        // surfaced through `WriterEvent::Done` like the Writer path.
-        let mut finish_reason: Option<String> = None;
-        let mut saw_done = false;
-
-        loop {
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => {
-                    // Cancel discards any buffered / in-flight text.
-                    return Err(ProviderError::Cancelled);
+        let pump = self
+            .run_sse_stream(&body, cancel, |text| {
+                let narration = extractor.feed(text);
+                if !narration.is_empty()
+                    && sink
+                        .try_send(WriterEvent::Chunk { text: narration })
+                        .is_ok()
+                {
+                    emitted_local = true;
                 }
-                chunk = stream.next() => {
-                    match chunk {
-                        None => break,
-                        Some(Err(e)) => {
-                            return Err(map_send_error(e, self.config.request_timeout_ms));
-                        }
-                        Some(Ok(bytes)) => {
-                            for ev in parser.feed(bytes.as_ref()) {
-                                match ev {
-                                    SseEvent::Data(payload) => {
-                                        if let Some(parsed) = parse_stream_delta(&payload) {
-                                            if let Some(text) = parsed.text
-                                                && !text.is_empty()
-                                            {
-                                                full_text.push_str(&text);
-                                                // Only the decoded narration
-                                                // prose is surfaced; JSON
-                                                // tokens stay invisible.
-                                                let narration = extractor.feed(&text);
-                                                if !narration.is_empty()
-                                                    && sink
-                                                        .try_send(WriterEvent::Chunk {
-                                                            text: narration,
-                                                        })
-                                                        .is_ok()
-                                                {
-                                                    *emitted = true;
-                                                }
-                                            }
-                                            if let Some(u) = parsed.usage {
-                                                usage = Some(u);
-                                            }
-                                            if parsed.finish_reason.is_some() {
-                                                finish_reason = parsed.finish_reason;
-                                            }
-                                        }
-                                        // Unknown payloads (keep-alive
-                                        // comments, unparseable deltas) are
-                                        // ignored.
-                                    }
-                                    SseEvent::Done => {
-                                        saw_done = true;
-                                        break;
-                                    }
-                                    SseEvent::Incomplete => {}
-                                }
-                            }
-                            if saw_done {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
+            })
+            .await;
+        if emitted_local {
+            *emitted = true;
         }
+        let summary = pump?;
 
-        if !saw_done {
+        if !summary.saw_done {
             // Some OpenAI-compatible servers/proxies close the body after
             // the last delta without the `[DONE]` sentinel. The accumulated
             // text is still run through the strict parser below; only an
@@ -1452,28 +1417,34 @@ impl OpenAiCompatibleProvider {
 
         // Best-effort final notification; a dropped receiver is not an error.
         let _ = sink.try_send(WriterEvent::Done {
-            usage: usage.clone(),
-            finish_reason: finish_reason.clone(),
+            usage: summary.usage.clone(),
+            finish_reason: summary.finish_reason.clone(),
         });
-        log_token_usage("turn", request.generation_id, model_name, usage.clone());
+        log_token_usage(
+            "turn",
+            request.generation_id,
+            model_name,
+            summary.usage.clone(),
+        );
 
         // The committed turn ALWAYS goes through the existing strict parser
         // on the complete text — the streaming extractor is display-only.
+        let full_text = &summary.full_text;
         let parsed_content = if is_choice_only_request(request) {
-            crate::recovery::parse_generated_choices(&full_text, request.generation_id)
+            crate::recovery::parse_generated_choices(full_text, request.generation_id)
         } else {
-            parse_generated_turn(&full_text, request.generation_id)
+            parse_generated_turn(full_text, request.generation_id)
         };
         match parsed_content {
             Ok(outcome) => {
                 let mut draft = outcome.draft;
                 if draft.usage.is_none() {
-                    draft.usage = usage;
+                    draft.usage = summary.usage;
                 }
                 Ok(draft)
             }
             Err(e) => {
-                if !saw_done {
+                if !summary.saw_done {
                     // Unparseable body AND no `[DONE]`: protocol error so
                     // the host surfaces a recoverable error and the engine
                     // restores the checkpoint rather than committing
@@ -1499,6 +1470,16 @@ impl OpenAiCompatibleProvider {
 // ---------------------------------------------------------------------------
 // OpenAI streaming-delta payload parsing
 // ---------------------------------------------------------------------------
+
+/// Result of one shared SSE pump run ([`OpenAiCompatibleProvider::run_sse_stream`]):
+/// the coalesced text, the last observed usage / finish_reason, and whether
+/// the `[DONE]` sentinel was seen before the body ended.
+struct SseStreamSummary {
+    full_text: String,
+    usage: Option<TokenUsage>,
+    finish_reason: Option<String>,
+    saw_done: bool,
+}
 
 /// Decoded payload from one OpenAI streaming chunk: the delta text (if any),
 /// the optional per-chunk / final usage, and the optional `finish_reason`.
