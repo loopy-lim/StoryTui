@@ -38,6 +38,12 @@ const BASE_BACKOFF_MS: u64 = 20;
 /// UI probes must never inherit the multi-minute generation deadline.
 const PROBE_TIMEOUT_MS: u64 = 3_000;
 
+/// Minimum remaining turn budget for attempting the non-streaming fallback
+/// after a failed stream (issue #10). Below this a fresh request has no
+/// plausible chance of completing, so the error surfaces immediately instead
+/// of guaranteeing another near-deadline wait.
+const FALLBACK_MIN_BUDGET_MS: u64 = 250;
+
 /// Returns `true` when the host part of `url` is a loopback address
 /// (`127.0.0.0/8`, `localhost`, `::1`). Used to decide the ADR-002 non-loopback
 /// warning — no external URL crate is pulled in (ADR-003: keep deps minimal).
@@ -1188,6 +1194,11 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
         sink: Sender<WriterEvent>,
         cancel: CancellationToken,
     ) -> Result<GeneratedTurnDraft, ProviderError> {
+        // Issue #10: the streaming attempt and any non-streaming fallback
+        // share ONE `request_timeout_ms` budget (see `fallback_within_budget`),
+        // so a slow model's worst-case turn latency stays bounded at roughly
+        // a single deadline instead of doubling.
+        let started = std::time::Instant::now();
         let mut emitted = false;
         let result = self
             .do_generate_turn_stream(&request, &sink, &cancel, &mut emitted)
@@ -1213,7 +1224,7 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
                     error = %error,
                     "streamed turn violated the contract; retrying non-streaming"
                 );
-                self.generate_turn(request, cancel).await
+                self.fallback_within_budget(request, cancel, started).await
             }
             Err(error) if !emitted => {
                 tracing::warn!(
@@ -1222,7 +1233,7 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
                     error = %error,
                     "turn streaming failed before any narration chunk; falling back to non-streaming generation"
                 );
-                self.generate_turn(request, cancel).await
+                self.fallback_within_budget(request, cancel, started).await
             }
             // A transient transport failure mid-stream (connection reset,
             // truncated body → Protocol/Unavailable) also falls back: the
@@ -1238,7 +1249,7 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
                     error = %error,
                     "turn stream broke mid-generation; retrying non-streaming"
                 );
-                self.generate_turn(request, cancel).await
+                self.fallback_within_budget(request, cancel, started).await
             }
             Err(error) => Err(error),
         }
@@ -1246,6 +1257,48 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
 }
 
 impl OpenAiCompatibleProvider {
+    /// Non-streaming fallback bounded by the turn's remaining time budget
+    /// (issue #10). The streaming attempt already consumed part of
+    /// `request_timeout_ms`; the fallback ladder (its own transient retries
+    /// plus any repair pass) runs only inside what remains, so the
+    /// worst-case turn latency is roughly one `request_timeout_ms` instead
+    /// of doubling. A budget that already ran out (or is too small to
+    /// plausibly complete a fresh request) surfaces `Timeout` immediately —
+    /// the player has waited a full deadline either way.
+    async fn fallback_within_budget(
+        &self,
+        request: TurnRequest,
+        cancel: CancellationToken,
+        started: std::time::Instant,
+    ) -> Result<GeneratedTurnDraft, ProviderError> {
+        let remaining_ms = self
+            .config
+            .request_timeout_ms
+            .saturating_sub(started.elapsed().as_millis() as u64);
+        if remaining_ms < FALLBACK_MIN_BUDGET_MS {
+            tracing::warn!(
+                target: "story_provider::openai_compatible",
+                generation_id = %request.generation_id,
+                remaining_ms,
+                "turn budget exhausted by the streaming attempt; surfacing Timeout instead of a non-streaming re-ask"
+            );
+            return Err(ProviderError::Timeout {
+                ms: self.config.request_timeout_ms,
+            });
+        }
+        match tokio::time::timeout(
+            Duration::from_millis(remaining_ms),
+            crate::provider::LlmProvider::generate_turn(self, request, cancel),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_deadline_elapsed) => Err(ProviderError::Timeout {
+                ms: self.config.request_timeout_ms,
+            }),
+        }
+    }
+
     /// Shared SSE machinery for both streaming paths (issue #9): send with
     /// cancellation raced, status check, byte-stream pump through
     /// [`SseParser`], per-delta decode, usage / finish_reason capture, and

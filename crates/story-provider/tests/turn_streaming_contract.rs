@@ -466,6 +466,73 @@ async fn turn_stream_requests_server_side_usage_accounting() {
 }
 
 #[tokio::test]
+async fn turn_stream_fallback_is_bounded_by_the_remaining_turn_budget() {
+    // Issue #10: the streaming attempt and the non-streaming fallback share
+    // ONE request_timeout_ms budget. A slow stream that fails the contract
+    // after consuming most of the deadline must not re-ask with a fresh full
+    // deadline — the fallback is cut off when the turn budget runs out, so
+    // the worst-case latency stays ~1x instead of doubling.
+    let streamed = "{\"narration\": \"잘려 나간 본문\", \"choices\": []}";
+    let mut sse = delta_event(streamed);
+    sse.push_str("data: [DONE]\n\n");
+
+    let server = MockServer::start().await;
+    // The streaming attempt burns 600ms of a 1200ms budget before failing
+    // the contract. (600 — not 900 — so the fallback-attempt window between
+    // `FALLBACK_MIN_BUDGET_MS` and the deadline stays several hundred ms
+    // wide and the `n == 2` assertion cannot flake under CI load.)
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("\"stream\":true"))
+        .respond_with(sse_response(sse.into_bytes()).set_delay(Duration::from_millis(600)))
+        .mount(&server)
+        .await;
+    // The non-streaming fallback would take forever — the remaining ~600ms
+    // budget must cut it off.
+    let envelope = serde_json::json!({
+        "id": "chatcmpl-x",
+        "model": "test",
+        "choices": [
+            {"index": 0, "message": {"role": "assistant", "content": VALID_TURN}, "finish_reason": "stop"}
+        ],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+    });
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("\"stream\":false"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(envelope)
+                .set_delay(Duration::from_secs(30)),
+        )
+        .mount(&server)
+        .await;
+
+    let mut cfg = cfg_for(&server);
+    cfg.request_timeout_ms = 1_200;
+    cfg.max_retries = 0;
+    let provider = OpenAiCompatibleProvider::new(cfg).expect("provider");
+    let (tx, _rx) = tokio::sync::mpsc::channel::<WriterEvent>(16);
+    let started = std::time::Instant::now();
+    let err = provider
+        .generate_turn_stream(turn_request(), tx, CancellationToken::new())
+        .await
+        .expect_err("the fallback must be cut off by the turn budget");
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(err, ProviderError::Timeout { .. }),
+        "expected Timeout once the budget ran out, got {err:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "total turn latency must stay near one deadline, took {elapsed:?}"
+    );
+    // Stream attempt + the one cut-off fallback attempt (no further ladder).
+    let n = server.received_requests().await.expect("recorded").len();
+    assert_eq!(n, 2, "stream + one budget-cut fallback — got {n}");
+}
+
+#[tokio::test]
 async fn turn_stream_ignores_nested_narration_key_in_state_patch() {
     // Issue #8: a story pack whose state_patch.set_strings defines a
     // "narration" string variable streamed BEFORE the prose must not
