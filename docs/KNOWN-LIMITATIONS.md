@@ -61,18 +61,38 @@ chooses to load. Two principles the code enforces:
    in Korean. A model that ignores this instruction is a model-quality
    issue the engine cannot fully prevent.
 
-## Streaming is the two-stage path, not the single-pass default
+## Streaming caveats (single-pass SSE and the two-stage path)
 
-The `OpenAiCompatibleProvider` implements both `direct` (Director) and
-`write_stream` (Writer SSE) — see W10. The single-call path
-(`generate_turn`) does not stream tokens to the renderer: its response is
-one structured JSON draft (narration + choices + patch), so there is no
-prose to reveal early — the loading overlay reflects the whole call. The
-streaming experience lives in the optional 2-stage Director → Writer path
-(`EngineState::use_director_writer`): the Director plans silently, then the
-Writer's narration streams into the transcript live. Players toggle that
-path in Settings (`g`) or persist it in `user-settings.toml`; the shipped
-default stays single-pass (ADR-005) until the real-model A/B gate passes.
+Both generation paths stream narration over SSE. The single-call path
+(`generate_turn_stream`, on by default via `[provider] stream_turns` in
+`config/storytui.toml`, issue #2) accumulates the structured JSON draft while
+decoding `narration` prose incrementally through the same chain the optional
+2-stage Director → Writer path (`EngineState::use_director_writer`,
+`direct` + `write_stream`, see W10) uses for its Writer stage. Players toggle
+the two-stage path in Settings (`g`) or persist it in `user-settings.toml`;
+the committed turn on either path always comes from the strict full-text
+parser, never from the streamed display. Remaining limitations:
+
+- The streaming attempt is single-shot. If it fails **before** the first
+  narration chunk (connect error, `stream:true`-rejecting 4xx/5xx), the
+  provider silently falls back to the non-streaming request with its full
+  retry ladder. A **contract failure after chunks were shown** (typically
+  max_tokens truncating the JSON) or a **transient transport break**
+  (connection reset mid-stream) also retries non-streaming — the streamed
+  text is display-only and is replaced by the committed view, so nothing
+  duplicates. A timeout after a chunk surfaces an error (a non-streaming
+  re-ask would just re-wait the deadline) and the engine restores the
+  checkpoint.
+- If the host's event channel is momentarily full, a narration chunk is
+  dropped from the partial display (same policy as the Writer path); the
+  committed turn is unaffected because it comes from the full text.
+- The `min_narration_chars` rewrite (currently disabled at `0`) only runs on
+  the non-streaming path; a streamed short scene is kept as-is.
+- `request_timeout_ms` is a reqwest client timeout that bounds the whole
+  stream (code default 180 s, shipped profile 600 s) — same condition as the
+  Writer path.
+- The settings UI does not yet expose `stream_turns` (edit the TOML), nor
+  `EngineState::use_director_writer`.
 
 ## Expression sprites are keyword-classified, not model-judged
 

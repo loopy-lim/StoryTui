@@ -355,29 +355,24 @@ impl OpenAiCompatibleProvider {
         }
     }
 
-    /// One full pass through the transient-retry loop. Returns the parsed draft
-    /// plus the server-reported `finish_reason` (when the envelope carried one)
-    /// on success, or an error. `suppress_rf` is set on the Auto-fallback pass
-    /// so `response_format` is omitted even though the capability flag is
-    /// already disabled for the session. The `finish_reason` lets the caller
-    /// detect an output-cap cut (`"length"`) behind an otherwise valid turn.
-    async fn do_generate(
+    /// Assemble the chat-completions body for a turn request. The engine
+    /// owns prompt construction, while the runtime provider owns sampling —
+    /// MVP placeholder values embedded in a [`TurnRequest`] never override
+    /// the operator's TOML profile. Engine-owned repair requests may carry a
+    /// smaller output cap (respected, with the profile as the upper bound)
+    /// and a deterministic `temperature_override`. Shared by the
+    /// non-streaming retry loop and the streaming path so both sample with
+    /// identical parameters.
+    fn assemble_turn_body(
         &self,
         request: &TurnRequest,
         suppress_rf: bool,
-        cancel: &CancellationToken,
         temperature_override: Option<f32>,
-    ) -> Result<(GeneratedTurnDraft, Option<String>), ProviderError> {
-        // The engine owns prompt construction, while the runtime provider
-        // owns sampling.  Do not let MVP placeholder values embedded in a
-        // TurnRequest silently override the operator's TOML profile.
+    ) -> ChatCompletionRequest {
         let mut configured_request = request.clone();
         configured_request.temperature = temperature_override.unwrap_or(self.config.temperature);
         configured_request.top_p = self.config.top_p;
         configured_request.top_k = self.config.top_k;
-        // Engine-owned repair requests intentionally carry a smaller output
-        // cap. Respect that cap while retaining the operator's profile as the
-        // upper bound for ordinary turns.
         configured_request.max_tokens = if request.max_tokens == 0 {
             self.config.max_tokens
         } else {
@@ -392,6 +387,23 @@ impl OpenAiCompatibleProvider {
         };
         let mut body = ChatCompletionRequest::from_turn(&bounded_request, model_name, send_rf);
         body.max_tokens_field = self.config.max_tokens_field;
+        body
+    }
+
+    /// One full pass through the transient-retry loop. Returns the parsed draft
+    /// plus the server-reported `finish_reason` (when the envelope carried one)
+    /// on success, or an error. `suppress_rf` is set on the Auto-fallback pass
+    /// so `response_format` is omitted even though the capability flag is
+    /// already disabled for the session. The `finish_reason` lets the caller
+    /// detect an output-cap cut (`"length"`) behind an otherwise valid turn.
+    async fn do_generate(
+        &self,
+        request: &TurnRequest,
+        suppress_rf: bool,
+        cancel: &CancellationToken,
+        temperature_override: Option<f32>,
+    ) -> Result<(GeneratedTurnDraft, Option<String>), ProviderError> {
+        let body = self.assemble_turn_body(request, suppress_rf, temperature_override);
         let max_attempts = self.config.max_retries.saturating_add(1);
 
         for attempt in 0..max_attempts {
@@ -1223,6 +1235,264 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
             usage,
             finish_reason,
         })
+    }
+
+    /// Streaming MVP turn path (issue #2): SSE deltas are surfaced as decoded
+    /// `narration` chunks while the full JSON object accumulates; the final
+    /// draft always comes from the existing strict parser on the complete
+    /// text.
+    ///
+    /// Retry policy: single streaming attempt. Failures fall back to the
+    /// non-streaming [`Self::generate_turn`] — which reuses the full retry
+    /// ladder (HTTP 400 auto-fallback, envelope repair) — whenever the
+    /// fallback cannot duplicate visible text: before the first chunk
+    /// (obviously), after a contract violation, and after a transient
+    /// transport break (the streamed text is display-only and is replaced by
+    /// the committed view). Timeout surfaces instead of falling back (a
+    /// non-streaming re-ask would just re-wait the deadline), and
+    /// cancellation is player intent. A `stream:true`-rejecting 4xx is
+    /// retried exactly once in non-streaming form — a fallback to a different
+    /// request shape, not an ADR-002 4xx retry.
+    async fn generate_turn_stream(
+        &self,
+        request: TurnRequest,
+        sink: Sender<WriterEvent>,
+        cancel: CancellationToken,
+    ) -> Result<GeneratedTurnDraft, ProviderError> {
+        let mut emitted = false;
+        let result = self
+            .do_generate_turn_stream(&request, &sink, &cancel, &mut emitted)
+            .await;
+        match result {
+            Ok(draft) => Ok(draft),
+            // Cancellation is player intent, not a failure — never retried.
+            Err(ProviderError::Cancelled) => Err(ProviderError::Cancelled),
+            // A timeout means the model is slow; re-asking non-streaming
+            // would just re-wait the full deadline (do_generate's timeout
+            // policy), so surface it for the player to act on.
+            Err(error @ ProviderError::Timeout { .. }) => Err(error),
+            // A contract failure (typically max_tokens truncating the JSON
+            // after the narration streamed) historically self-healed via
+            // the non-streaming ladder. The streamed text is display-only
+            // and is replaced by the committed view, so the bounded retry
+            // does not duplicate anything — restore that self-healing.
+            Err(error @ ProviderError::InvalidGeneration(_)) => {
+                tracing::warn!(
+                    target: "story_provider::openai_compatible",
+                    generation_id = %request.generation_id,
+                    chunks_surfaced = emitted,
+                    error = %error,
+                    "streamed turn violated the contract; retrying non-streaming"
+                );
+                self.generate_turn(request, cancel).await
+            }
+            Err(error) if !emitted => {
+                tracing::warn!(
+                    target: "story_provider::openai_compatible",
+                    generation_id = %request.generation_id,
+                    error = %error,
+                    "turn streaming failed before any narration chunk; falling back to non-streaming generation"
+                );
+                self.generate_turn(request, cancel).await
+            }
+            // A transient transport failure mid-stream (connection reset,
+            // truncated body → Protocol/Unavailable) also falls back: the
+            // streamed text is display-only and is replaced by the committed
+            // view, so the non-streaming ladder's retries — which the
+            // pre-PR single-pass path always had — never duplicate visible
+            // prose. Timeout is excluded above; Cancelled is player intent.
+            Err(error @ (ProviderError::Protocol(_) | ProviderError::Unavailable(_))) => {
+                tracing::warn!(
+                    target: "story_provider::openai_compatible",
+                    generation_id = %request.generation_id,
+                    chunks_surfaced = emitted,
+                    error = %error,
+                    "turn stream broke mid-generation; retrying non-streaming"
+                );
+                self.generate_turn(request, cancel).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl OpenAiCompatibleProvider {
+    /// Single-attempt streaming body of [`Self::generate_turn_stream`].
+    ///
+    /// `emitted` is set once a narration chunk has actually been accepted by
+    /// the sink, gating the non-streaming fallback in the caller.
+    async fn do_generate_turn_stream(
+        &self,
+        request: &TurnRequest,
+        sink: &Sender<WriterEvent>,
+        cancel: &CancellationToken,
+        emitted: &mut bool,
+    ) -> Result<GeneratedTurnDraft, ProviderError> {
+        // Identical envelope to a normal turn (shared assembly), but SSE.
+        // `include_usage` is required for spec-conformant servers (e.g.
+        // api.openai.com) to attach a final usage frame — without it token
+        // accounting silently disappears on the streamed path.
+        let mut body = self.assemble_turn_body(request, false, None);
+        body.stream = true;
+        body.stream_options = Some(crate::envelope::StreamOptions {
+            include_usage: true,
+        });
+        let model_name = if request.model.is_empty() || request.model == "mock" {
+            &self.config.model
+        } else {
+            &request.model
+        };
+
+        if cancel.is_cancelled() {
+            return Err(ProviderError::Cancelled);
+        }
+
+        // Single attempt (see the method-level retry note). Pre-stream
+        // errors (connect / 4xx / 5xx) either fall back to the
+        // non-streaming path in the caller or surface immediately.
+        let send = self
+            .authorize(self.client.post(self.chat_url()))
+            .json(&body)
+            .send();
+        let resp = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
+            r = send => r.map_err(|e| map_send_error(e, self.config.request_timeout_ms))?,
+        };
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(ProviderError::Protocol(format!("HTTP {}", status.as_u16())));
+        }
+
+        let mut stream = resp.bytes_stream();
+        let mut parser = SseParser::new();
+        let mut full_text = String::new();
+        let mut extractor = crate::narration_stream::NarrationStreamExtractor::new();
+        let mut usage: Option<TokenUsage> = None;
+        // Last chunk's server-reported termination reason ("stop"/"length"),
+        // surfaced through `WriterEvent::Done` like the Writer path.
+        let mut finish_reason: Option<String> = None;
+        let mut saw_done = false;
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    // Cancel discards any buffered / in-flight text.
+                    return Err(ProviderError::Cancelled);
+                }
+                chunk = stream.next() => {
+                    match chunk {
+                        None => break,
+                        Some(Err(e)) => {
+                            return Err(map_send_error(e, self.config.request_timeout_ms));
+                        }
+                        Some(Ok(bytes)) => {
+                            for ev in parser.feed(bytes.as_ref()) {
+                                match ev {
+                                    SseEvent::Data(payload) => {
+                                        if let Some(parsed) = parse_stream_delta(&payload) {
+                                            if let Some(text) = parsed.text
+                                                && !text.is_empty()
+                                            {
+                                                full_text.push_str(&text);
+                                                // Only the decoded narration
+                                                // prose is surfaced; JSON
+                                                // tokens stay invisible.
+                                                let narration = extractor.feed(&text);
+                                                if !narration.is_empty()
+                                                    && sink
+                                                        .try_send(WriterEvent::Chunk {
+                                                            text: narration,
+                                                        })
+                                                        .is_ok()
+                                                {
+                                                    *emitted = true;
+                                                }
+                                            }
+                                            if let Some(u) = parsed.usage {
+                                                usage = Some(u);
+                                            }
+                                            if parsed.finish_reason.is_some() {
+                                                finish_reason = parsed.finish_reason;
+                                            }
+                                        }
+                                        // Unknown payloads (keep-alive
+                                        // comments, unparseable deltas) are
+                                        // ignored.
+                                    }
+                                    SseEvent::Done => {
+                                        saw_done = true;
+                                        break;
+                                    }
+                                    SseEvent::Incomplete => {}
+                                }
+                            }
+                            if saw_done {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !saw_done {
+            // Some OpenAI-compatible servers/proxies close the body after
+            // the last delta without the `[DONE]` sentinel. The accumulated
+            // text is still run through the strict parser below; only an
+            // unparseable body without `[DONE]` becomes a protocol error
+            // (never a commit of partial text).
+            tracing::warn!(
+                target: "story_provider::openai_compatible",
+                generation_id = %request.generation_id,
+                "stream ended without [DONE]; attempting strict parse of accumulated text"
+            );
+        }
+
+        // Best-effort final notification; a dropped receiver is not an error.
+        let _ = sink.try_send(WriterEvent::Done {
+            usage: usage.clone(),
+            finish_reason: finish_reason.clone(),
+        });
+        log_token_usage("turn", request.generation_id, model_name, usage.clone());
+
+        // The committed turn ALWAYS goes through the existing strict parser
+        // on the complete text — the streaming extractor is display-only.
+        let parsed_content = if is_choice_only_request(request) {
+            crate::recovery::parse_generated_choices(&full_text, request.generation_id)
+        } else {
+            parse_generated_turn(&full_text, request.generation_id)
+        };
+        match parsed_content {
+            Ok(outcome) => {
+                let mut draft = outcome.draft;
+                if draft.usage.is_none() {
+                    draft.usage = usage;
+                }
+                Ok(draft)
+            }
+            Err(e) => {
+                if !saw_done {
+                    // Unparseable body AND no `[DONE]`: protocol error so
+                    // the host surfaces a recoverable error and the engine
+                    // restores the checkpoint rather than committing
+                    // partial text.
+                    return Err(ProviderError::Protocol(
+                        "stream ended without [DONE]".to_string(),
+                    ));
+                }
+                tracing::warn!(
+                    target: "story_provider::openai_compatible",
+                    generation_id = %request.generation_id,
+                    model = %self.config.model,
+                    assistant_content_chars = full_text.chars().count(),
+                    error = %e,
+                    "streamed turn content rejected by game response contract"
+                );
+                Err(e)
+            }
+        }
     }
 }
 

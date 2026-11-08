@@ -3746,6 +3746,51 @@ mod tests {
     }
 
     #[test]
+    fn writer_chunk_streams_then_clears_on_completed_view() {
+        // Issue #2: MVP-path streaming reuses the WriterChunk →
+        // streaming_narration render chain. Pin the app-side behavior:
+        // append with a generation-id guard, render as a partial transcript
+        // entry, discard stale chunks, and release on completion.
+        let id = story_model::uuid::Uuid::nil();
+        let mut loading_view = sample_view(2);
+        loading_view.loading = Some(story_model::LoadingState {
+            generation_id: id,
+            message_ko: "장면을 쓰는 중...".to_string(),
+        });
+        let mut app = App::new(loading_view);
+
+        // Matching id appends and becomes visible in the transcript blocks.
+        app.push_writer_chunk(id, "비가 조금씩");
+        app.push_writer_chunk(id, " 그쳤다.");
+        assert_eq!(
+            app.streaming_narration.as_deref(),
+            Some("비가 조금씩 그쳤다.")
+        );
+        let blocks = app.story_blocks();
+        let streaming_visible = blocks.iter().any(|b| match b {
+            StoryBlock::Text(lines) => lines
+                .iter()
+                .any(|l| l.to_string().contains("비가 조금씩 그쳤다.")),
+            _ => false,
+        });
+        assert!(
+            streaming_visible,
+            "partial narration must render in the transcript"
+        );
+
+        // A late chunk from a stale generation id is discarded.
+        app.push_writer_chunk(story_model::uuid::Uuid::new_v4(), "늦은 청크");
+        assert_eq!(
+            app.streaming_narration.as_deref(),
+            Some("비가 조금씩 그쳤다.")
+        );
+
+        // Completing the turn (loading cleared) releases the partial text.
+        app.set_view(sample_view(2));
+        assert_eq!(app.streaming_narration, None);
+    }
+
+    #[test]
     fn set_view_clamps_selection() {
         let mut app = App::new(sample_view(3));
         app.selected = 2;

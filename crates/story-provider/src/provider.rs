@@ -75,4 +75,28 @@ pub trait LlmProvider: Send + Sync {
     ) -> Result<WriterFinish, ProviderError> {
         Err(ProviderError::UnsupportedCapability("streaming".into()))
     }
+
+    /// Streaming variant of [`Self::generate_turn`] (issue #2). `sink`
+    /// receives [`WriterEvent::Chunk`]s carrying the decoded `narration`
+    /// prose as it arrives; the method returns the final
+    /// [`GeneratedTurnDraft`] built from the complete text through the
+    /// existing strict parser. Real impl on
+    /// [`crate::OpenAiCompatibleProvider`]; the default returns
+    /// [`ProviderError::UnsupportedCapability`] so providers that do not
+    /// advertise `supports_streaming` (e.g. [`crate::MockProvider`]) keep
+    /// using the non-streaming [`Self::generate_turn`].
+    ///
+    /// Implementations that fail BEFORE the first chunk may transparently
+    /// fall back to [`Self::generate_turn`]; once a chunk has been surfaced
+    /// a failure must be returned so the engine's checkpoint recovery runs.
+    async fn generate_turn_stream(
+        &self,
+        _req: TurnRequest,
+        _sink: Sender<WriterEvent>,
+        _cancel: CancellationToken,
+    ) -> Result<GeneratedTurnDraft, ProviderError> {
+        Err(ProviderError::UnsupportedCapability(
+            "turn_streaming".into(),
+        ))
+    }
 }
