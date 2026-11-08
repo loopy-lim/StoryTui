@@ -25,11 +25,10 @@ use tokio_util::sync::CancellationToken;
 /// `Arc<dyn LlmProvider>`). The four methods are intentionally minimal:
 /// identity, advertised capabilities, health probe, and the single
 /// generation entry point.
-///
-/// `clippy::double_must_use` fires inside the `#[async_trait]` macro
-/// expansion (rustc 1.99 marks the boxed must_use future returning a
-/// must_use `Result`); the reason cannot be carried into the generated
-/// items, so the lint is suppressed at the trait.
+// Newer clippy (1.99+) fires `double_must_use` inside async_trait's
+// expansion: the macro emits a bare `#[must_use]` for methods that already
+// return `Result` (must_use by type). The attribute is the macro's, not
+// ours — silence it at the trait boundary.
 #[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
@@ -96,6 +95,8 @@ pub trait LlmProvider: Send + Sync {
         _sink: Sender<WriterEvent>,
         _cancel: CancellationToken,
     ) -> Result<GeneratedTurnDraft, ProviderError> {
-        Err(ProviderError::UnsupportedCapability("turn_streaming".into()))
+        Err(ProviderError::UnsupportedCapability(
+            "turn_streaming".into(),
+        ))
     }
 }

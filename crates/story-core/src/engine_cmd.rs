@@ -11,8 +11,8 @@
 
 use story_model::uuid::Uuid;
 use story_model::{
-    AppViewModel, DirectorPlan, DirectorRequest, DomainErrorView, GeneratedTurnDraft, ParsedAction,
-    TurnRequest, WriterFinish, WriterRequest,
+    AppViewModel, DirectorPlan, DirectorRequest, DomainErrorView, GeneratedTurnDraft,
+    LorebookEntry, ParsedAction, TurnRequest, WriterFinish, WriterRequest,
 };
 
 /// A user / host intent handed to the engine. The engine validates each
@@ -112,6 +112,54 @@ pub enum EngineCommand {
     },
     /// Dismiss the current error overlay.
     DismissError,
+    /// (Side-generation family) Extend the LAST COMMITTED turn's narration
+    /// with a model continuation. No new turn is opened and no new checkpoint
+    /// is pushed: choices and the applied state patch stay exactly as they
+    /// are, and the response is accepted through the normal
+    /// [`EngineCommand::AcceptGeneration`] flow (narration only) so autosave
+    /// persists the extended prose. Ignored while a generation is in flight
+    /// or an error overlay is up, and when nothing is committed yet.
+    ContinueNarration,
+    /// (Side-generation family) Ask the model for a one-sentence suggested
+    /// PLAYER action (Korean). Commits nothing: the suggestion is stored on
+    /// [`crate::engine::EngineState`] for the host to collect via
+    /// `EngineState::take_suggested_action` — sending it remains the
+    /// player's decision. Ignored while a generation is in flight or an
+    /// error overlay is up.
+    SuggestAction,
+    /// (Side-generation family) Ask the model for one group-conversation
+    /// scene bit in which two or more cast members talk to each other in the
+    /// `이름: "대사"` line format. Accepted exactly like a continuation: the
+    /// narration is appended to the LAST COMMITTED turn, no new turn and no
+    /// checkpoint push, and the draft's choices/state patch are discarded —
+    /// a scene never changes relationship state (explicit limitation:
+    /// only committed player turns move the meters). Requires a committed
+    /// turn; ignored while a generation is in flight or an error overlay
+    /// is up.
+    GroupScene,
+    /// Hot-replace the pack's active lorebook entries for the rest of the
+    /// session (in-engine override; the pack file is untouched and the view
+    /// does not change). The NEXT turn's prompt matches against the new
+    /// entries. Ignored while a generation is in flight (same ignore rule as
+    /// the loading gate); a fresh [`EngineCommand::StartNewGame`] reverts to
+    /// pack canon.
+    SetLorebookEntries {
+        /// The replacement entry set (full book contents, not a diff).
+        entries: Vec<LorebookEntry>,
+    },
+    /// Rotate the LAST committed turn's narration through its stored variant
+    /// list (wrapping). Variants are the narrations of earlier attempts for
+    /// that turn discarded by undo (session memory only — a restart drops
+    /// them). Identity while a generation is in flight or an error overlay
+    /// is up, when the current turn has no variant list, or when that list
+    /// holds a single narration. On rotation the view narration is replaced,
+    /// the current-turn rewind snapshot is upserted, and the autosave effect
+    /// re-fires so the shown variant is persisted (same discipline as a
+    /// continue accept).
+    CycleTurnVariant {
+        /// Step through the list: `1` forward, `-1` back; wraps at the ends.
+        delta: i32,
+    },
     /// The host is quitting. The engine returns the current state unchanged;
     /// terminal teardown is the host's responsibility.
     Quit,

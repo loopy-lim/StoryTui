@@ -95,11 +95,49 @@ fn snapshot_settings_loopback_ready() {
         tts_voice: None,
         images_enabled: true,
         image_backend: Some("kitty".to_string()),
+        image_backend_manual: false,
+        use_director_writer: true,
+        expressions_enabled: true,
+        sampling_style: "자동",
+        persona_label: "없음",
         theme_name: "default",
         returns_home: false,
     };
     let out = render_to_string(view, 80, 24);
     insta::assert_snapshot!("settings_loopback_ready", out);
+}
+
+#[test]
+fn snapshot_settings_image_backend_manual() {
+    // Images OFF + a player-forced protocol: the auto/manual marker must
+    // stay visible so the `b` cycle shows its effect without enabling
+    // images.
+    let view = SettingsView {
+        provider: &safe_loopback(),
+        health: ProviderHealth::Ready,
+        temperature: 0.85,
+        top_p: 0.92,
+        top_k: 40,
+        max_tokens: 1800,
+        tts_enabled: true,
+        tts_backend: "say".to_string(),
+        tts_voice: None,
+        images_enabled: false,
+        image_backend: Some("halfblocks".to_string()),
+        image_backend_manual: true,
+        use_director_writer: false,
+        expressions_enabled: false,
+        sampling_style: "자동",
+        persona_label: "없음",
+        theme_name: "default",
+        returns_home: false,
+    };
+    let out = render_to_string(view, 80, 24);
+    insta::assert_snapshot!("settings_image_backend_manual", out);
+    assert!(
+        out.contains("꺼짐 · halfblocks (수동)"),
+        "manual halfblocks label missing:\n{out}"
+    );
 }
 
 #[test]
@@ -116,6 +154,11 @@ fn snapshot_settings_non_loopback_warning() {
         tts_voice: Some("shimmer".to_string()),
         images_enabled: false,
         image_backend: None,
+        image_backend_manual: false,
+        use_director_writer: false,
+        expressions_enabled: false,
+        sampling_style: "자동",
+        persona_label: "없음",
         theme_name: "default",
         returns_home: false,
     };
@@ -142,6 +185,11 @@ fn settings_below_min_size_renders_warning() {
         tts_voice: None,
         images_enabled: true,
         image_backend: Some("kitty".to_string()),
+        image_backend_manual: false,
+        use_director_writer: true,
+        expressions_enabled: true,
+        sampling_style: "자동",
+        persona_label: "없음",
         theme_name: "default",
         returns_home: false,
     };
@@ -184,6 +232,11 @@ fn settings_masked_secret_never_renders() {
         tts_voice: None,
         images_enabled: true,
         image_backend: Some("kitty".to_string()),
+        image_backend_manual: false,
+        use_director_writer: true,
+        expressions_enabled: true,
+        sampling_style: "자동",
+        persona_label: "없음",
         theme_name: "default",
         returns_home: false,
     };

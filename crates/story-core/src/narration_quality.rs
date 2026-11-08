@@ -30,6 +30,12 @@ pub enum NarrationQualityIssue {
     StalledProgress,
     /// The bounded repair returned essentially the same rejected prose.
     UnchangedRepair,
+    /// The candidate narration is empty or whitespace only — nothing a player
+    /// can read. Checked before every other heuristic: an empty prose
+    /// trivially passes the fingerprint/similarity scans below, so without
+    /// this variant it would commit unconditionally (P1: the 2-stage Writer
+    /// path has no provider-side empty guard).
+    Empty,
 }
 
 /// Result of the pre-commit narration quality gate.
@@ -66,6 +72,10 @@ impl NarrationQualityReport {
                     "재작성 결과가 거절된 원문과 거의 같다. 문장 치환이 아니라 새로운 장면 전개로 완전히 다시 쓴다."
                         .to_string(),
                 ),
+                NarrationQualityIssue::Empty => lines.push(
+                    "본문이 비어 있다. 플레이어에게 보여 줄 한국어 산문을 처음부터 새로 쓴다."
+                        .to_string(),
+                ),
             }
         }
         lines.join("\n- ")
@@ -92,6 +102,11 @@ pub fn assess_narration(
     enforce_progress: bool,
 ) -> NarrationQualityReport {
     let mut issues = Vec::new();
+    // Empty prose gate first (see the `Empty` docs): the scans below skip
+    // empty candidates, so this is the only check that ever fires for one.
+    if narration.trim().is_empty() {
+        issues.push(NarrationQualityIssue::Empty);
+    }
     let recent_start = game.history.len().saturating_sub(HISTORY_WINDOW);
     let candidate_fingerprint = prose_fingerprint(narration);
 
@@ -538,5 +553,33 @@ mod tests {
             "유나는 초대장을 내밀었다.",
             "유나는, 초대장을 내밀었다!"
         ));
+    }
+
+    #[test]
+    fn empty_narration_is_flagged_even_when_history_is_empty() {
+        let pack = crate::tests_support::sample_pack();
+        let game = crate::engine::EngineState::initial(&pack).game;
+        // Empty and whitespace-only prose must be flagged — the
+        // fingerprint/similarity scans silently skip them.
+        for candidate in ["", "   \n\t "] {
+            let report = assess_narration(&game, candidate, &StatePatch::default(), None, true);
+            assert!(
+                report.issues.contains(&NarrationQualityIssue::Empty),
+                "{candidate:?} must be flagged Empty, got {:?}",
+                report.issues
+            );
+        }
+        let report = assess_narration(
+            &game,
+            "첫 번째 장면이 조용히 시작된다.",
+            &StatePatch::default(),
+            None,
+            true,
+        );
+        assert!(
+            !report.issues.contains(&NarrationQualityIssue::Empty),
+            "readable prose is not Empty: {:?}",
+            report.issues
+        );
     }
 }

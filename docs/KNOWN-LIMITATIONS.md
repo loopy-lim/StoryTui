@@ -61,22 +61,28 @@ chooses to load. Two principles the code enforces:
    in Korean. A model that ignores this instruction is a model-quality
    issue the engine cannot fully prevent.
 
-## MVP streaming caveats
+## Streaming caveats (single-pass SSE and the two-stage path)
 
-Turn generation streams over SSE by default (`[provider] stream_turns` in
-`config/storytui.toml`, issue #2). Decoded `narration` prose renders
-incrementally through the same chain the Director/Writer path uses; the
-committed turn always comes from the strict full-text parser. Remaining
-limitations:
+Both generation paths stream narration over SSE. The single-call path
+(`generate_turn_stream`, on by default via `[provider] stream_turns` in
+`config/storytui.toml`, issue #2) accumulates the structured JSON draft while
+decoding `narration` prose incrementally through the same chain the optional
+2-stage Director → Writer path (`EngineState::use_director_writer`,
+`direct` + `write_stream`, see W10) uses for its Writer stage. Players toggle
+the two-stage path in Settings (`g`) or persist it in `user-settings.toml`;
+the committed turn on either path always comes from the strict full-text
+parser, never from the streamed display. Remaining limitations:
 
 - The streaming attempt is single-shot. If it fails **before** the first
   narration chunk (connect error, `stream:true`-rejecting 4xx/5xx), the
   provider silently falls back to the non-streaming request with its full
   retry ladder. A **contract failure after chunks were shown** (typically
-  max_tokens truncating the JSON) also retries once non-streaming — the
-  streamed text is display-only and is replaced by the committed view, so
-  nothing duplicates. Any other failure after a chunk (protocol/timeout)
-  surfaces an error and the engine restores the checkpoint.
+  max_tokens truncating the JSON) or a **transient transport break**
+  (connection reset mid-stream) also retries non-streaming — the streamed
+  text is display-only and is replaced by the committed view, so nothing
+  duplicates. A timeout after a chunk surfaces an error (a non-streaming
+  re-ask would just re-wait the deadline) and the engine restores the
+  checkpoint.
 - If the host's event channel is momentarily full, a narration chunk is
   dropped from the partial display (same policy as the Writer path); the
   committed turn is unaffected because it comes from the full text.
@@ -87,6 +93,32 @@ limitations:
   Writer path.
 - The settings UI does not yet expose `stream_turns` (edit the TOML), nor
   `EngineState::use_director_writer`.
+
+## Expression sprites are keyword-classified, not model-judged
+
+Character expression sprites (`pack/images/expressions/<character-id>/<emotion>.png`,
+with the character portrait as the fallback) are picked by a zero-inference
+keyword classifier over each turn's narration (`story_tui::classify_emotion`)
+— deliberately NOT by a separate classifier model the way SillyTavern's
+Expressions extension runs one. A weak local setup pays no extra generation
+for expressions, and a misread degrades to "no sprite / neutral", never to
+wrong story state. The tradeoff: the rule table reads surface cues only
+(Korean-led, a few English cues) — sarcasm, negation, and who is speaking are
+out of reach, and narration in other languages classifies as neutral. The
+Settings `f` toggle turns sprites off without touching scene images (`i`).
+
+## Manual image protocol forcing can garble unsupported terminals
+
+Scene images follow the terminal capability probed once at startup
+(`Picker::from_query_stdio`), and the Settings `b` cycle can force a protocol
+(`kitty`/`sixel`/`iterm2`/`halfblocks`, persisted in `user-settings.toml`).
+Forcing kitty/sixel/iterm2 on a terminal that does not actually support them
+prints raw graphics escape bytes — the display needs a redraw or restart to
+recover; auto (the default) never does this. Without a detected base picker
+only halfblocks is forceable, since the other protocols need the queried cell
+size. A protocol switch re-encodes every scene image immediately, but
+graphics already painted by the previous protocol may linger until the
+terminal clears them (kitty/sixel images live outside the text grid).
 
 ## Cross-pack runtime evidence is still limited
 
@@ -108,13 +140,126 @@ proprietary auth flows, SDKs, or non-OpenAI wire shapes are intentionally
 out of scope. A cloud provider that speaks the OpenAI shape (e.g.
 `openrouter`) will work; one that does not, will not.
 
-## Settings are profile-based
+## Undo is one-key, with the ring persisted in saves
+
+The story screen's `u` rewinds the most recently committed turn (the AI
+Dungeon "rewind" / SillyTavern "swipe" equivalent): the previous turn's
+narration and choices come back and the autosave slot is rewritten with the
+rewound state, so quitting and resuming never resurrects an undone turn.
+Bounds, all deliberate:
+
+- The checkpoint ring keeps **8 committed turns** and now travels inside the
+  save payload (`SavePayload.undo_stack`), so `u` works right after loading a
+  save. Old saves without the field behave exactly as before — the ring fills
+  as turns commit. The ring stores full state snapshots, so saves got larger.
+- There is no redo/history tree (NovelAI-style branching): undo always steps
+  back one turn, and re-committing after an undo pushes a fresh checkpoint —
+  the stale same-turn entry can never be restored into a redo by accident.
+  Branching today means "undo, pick differently, then `s` to save the branch";
+  the undone turn's narration is kept as a **variant** — `[` / `]` on the
+  story screen swipes the re-committed turn through kept alternatives
+  (session memory only: restarting drops the variant list, the shown text
+  stays). A full tree UI remains future work.
+- Undo is refused while a generation is in flight or an error overlay is up;
+  the failed-retry slot is cleared so an old turn cannot replay on top of the
+  rewound state.
+
+## Re-rolls restart the request; in-flight drafts are not cached
+
+`r` while loading re-issues the same turn from the same checkpoint with a
+fresh generation id (the AI Dungeon retry / SillyTavern swipe moment), and
+`r` on an error overlay retries the failed one — each `r` is a new model
+call and the in-flight draft is never cached. Committed variants, however,
+are kept: after undo + re-commit, `[` / `]` swipes the turn's narration
+through the kept alternatives (rewriting the autosave), so comparing
+alternatives no longer needs the redo/history cycle.
+
+## Automation assists are bounded; manual fallbacks stay one step away
+
+Since 2026-10-23 the app takes a few actions on its own, each with a hard
+cap — defense must not stall the flow (a length floor once caused a
+near-per-turn regeneration at ~2x latency and was disabled for exactly that
+reason, see `config/storytui.toml`):
+
+- **Auto-resume** — with an autosave present, startup lands directly in the
+  restored story (notice: "이전 세션을 이어요"; `Home` reopens the start menu).
+  `auto_resume = false` in user-settings.toml restores the menu-first
+  startup, and a fresh install (no autosave) always sees the menu.
+- **Auto-retry once** — a failed generation is re-issued once ~1.5s later
+  with a status line before the [R]/[Esc] overlay appears. The second
+  failure is always manual, player cancellation (`c`) never auto-retries,
+  and each `r` remains a fresh model call.
+- **Server recovery probing** — while the provider is unavailable and no
+  generation is in flight, the app re-probes every ~15s, so a returning
+  server flips the status surfaces (home notice, settings projection) without
+  opening Settings. The story screen itself has no server-status surface —
+  a failed turn there still shows the error overlay until retried.
+- **Truncation continue** — a Writer turn that ends at the token cap
+  (finish_reason "length") gets one automatic continue append per turn
+  ("✎ 이어씀" badge); if a narration repair already ran that turn the hint
+  is manual-only (`w`). There is deliberately no minimum-length floor. Like
+  the kept turn variants, the badge and the empty-side flag are session
+  memory — restarting the app clears them.
+- **Empty side-result retry** — a continue/scene/suggest generation that
+  returns empty narration is re-dispatched once, then reported via a toast;
+  side generations still never move state or the turn count.
 
 The current Settings contract is a TOML profile plus CLI and per-save-directory
 user overrides. The in-app model picker reads `/v1/models` and persists the
-main, Director, and Writer selections to `saves/user-settings.toml`; if a
-persisted model disappears, startup selects the checked-in fallback (or the
-first advertised model) and repairs the user setting. Provider URL,
-authentication, sampling, timeouts, retry budget, context budget, and save
-directory still come from the base profile or CLI. Editing those values in the
-TUI remains a future UX improvement.
+main selection to `saves/user-settings.toml`; Director/Choice/Writer
+assignments are per provider profile — keyed by profile name in
+`[stage_models.<name>]`, restored when the profile is switched to, with
+`[[providers]]` entries able to carry per-profile defaults (precedence:
+user-settings profile entry, then the profile default, then the file-wide
+default). Old flat `director_model`/`choice_model`/`writer_model` user
+settings are folded into the active profile on load. If a persisted model
+disappears, startup and switches repair it to an advertised model. Response
+style is editable in-app as a preset cycle (`x`: 자동 → 창의적 → 균형 → 정밀),
+which decides temperature/top_p/top_k while active and persists in
+user-settings; 자동 — the default — keeps the profile's own tuning. The player
+identity is editable in-app too (`a`: name + persona), overriding the base
+`[player]` profile per field and applying to the pack prompt from the next
+turn. Two more steering surfaces joined the same contract: an author's note
+(`t`) injected verbatim into every turn's system prompt, and the lorebook
+dialog (`w`) — view entries, toggle `enabled`, edit content/keys; edits apply
+to the very next turn, but persist only when the pack ships its
+`lorebook.toml` as a file (otherwise the edit is session-only, and the dialog
+says so). Non-steering extras: `w` on the story screen continues the last
+narration without a new turn (choices and state stay put; single-pass only —
+the two-stage path is not combined), `z` asks the model for a one-line
+suggested player action into the free-input buffer, `r` in Settings shows the
+last sent system/user prompts (session memory, never persisted), and
+`storytui export <slot> [--format txt|jsonl]` writes a save out as a
+portable transcript. Group-slice extras on the story screen: `g` asks the
+model for one group-conversation scene bit (`이름: "대사"` lines) appended to
+the last narration, and `@캐릭터 내용` free input pins the targeted character
+(`p` opens the read-only cast roster). Raw sampler values, provider URL, authentication,
+timeouts, retry budget, context budget, and save directory still come from
+the base profile or CLI; editing those exact numbers in the TUI remains a
+future UX improvement (deliberately — one preset key instead of five
+sliders). Two TOML-only power knobs follow the same policy (no UI, no keys,
+off by default): `[[display_rules]]` — at most 16 regex display rewrites
+applied to newly shown transcript text, invalid patterns are skipped with a
+warning — and `[quick_actions]`, where `"1" = "텍스트"` binds Alt+1..9 to fill
+the input buffer.
+
+## Frontend-parity gaps that remain
+
+The 2026-10-23 survey (docs/FRONTEND-COMPARISON.md) brought SillyTavern-style
+lorebook editing, an author's note, continue, impersonate, a prompt viewer,
+chat export, display rules, quick actions, variant swiping, and the group
+slice into the TUI. Still open:
+
+- **Group chat / multi-character conversation** — the minimal slice landed
+  (2026-10-23): `g` attaches one cast-driven scene bit to the last narration
+  and `@캐릭터 내용` targets one character, but a scene **never changes
+  relationship state** (the draft's state patch is discarded by design — only
+  committed player turns move the meters), and per-turn actor selection with
+  per-cast commits remains an engine and pack-schema redesign, deliberately
+  out of scope.
+- The lorebook dialog edits keys (`\,` escapes a literal comma), content,
+  `enabled`, `constant` (`c`), and probability (`p` cycles 100/75/50/25);
+  sticky/cooldown, recursion flags, and insertion positioning stay
+  editor-in-TOML territory. The suspected activation-timer defect (ledger
+  lost on accept) was fixed in the 2026-10-23 follow-up cycle — timers now
+  survive accepts, retries, and undo/re-commits.

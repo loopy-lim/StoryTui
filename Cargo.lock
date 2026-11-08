@@ -3312,6 +3312,7 @@ dependencies = [
  "insta",
  "ratatui",
  "ratatui-image",
+ "regex",
  "story-core",
  "story-model",
  "story-persistence",
@@ -3329,6 +3330,7 @@ dependencies = [
  "image",
  "ratatui",
  "ratatui-image",
+ "regex",
  "semver",
  "serde",
  "serde_json",
@@ -3346,6 +3348,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "wiremock",
 ]
 
 [[package]]

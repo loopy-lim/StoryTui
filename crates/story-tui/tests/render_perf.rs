@@ -33,6 +33,11 @@ fn sample_view(turn: u32) -> AppViewModel {
         },
         loading: None,
         error: None,
+        undo_checkpoint_id: None,
+        variant_label: None,
+        cast: Vec::new(),
+        truncation: story_model::TruncationStatus::None,
+        empty_side_result: false,
     }
 }
 
@@ -50,6 +55,7 @@ fn entry(turn: u32) -> story_tui::StoryStackEntry {
         player_action: Some("조용히 자리에 앉는다".to_string()),
         narration,
         location: None,
+        emotion: story_model::Emotion::Neutral,
     }
 }
 

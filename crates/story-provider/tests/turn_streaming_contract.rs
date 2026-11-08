@@ -2,15 +2,15 @@
 //! single-call path streamed over SSE against a wiremock server.
 //!
 //! Covers: narration-only chunk surfacing (JSON tokens never leak), final
-//! draft through the existing strict parser, mid-stream cancellation, and the
-//! non-streaming fallback when the stream fails before the first chunk.
+//! draft through the existing strict parser, mid-stream cancellation, the
+//! `stream_options.include_usage` request shape, and the non-streaming
+//! fallback when the stream fails before the first chunk or breaks
+//! transiently mid-generation.
 
 use std::time::Duration;
 
 use story_model::{ChatMessage, ProviderError, TurnRequest, WriterEvent};
-use story_provider::{
-    LlmProvider, OpenAiCompatibleProvider, ProviderConfig, StructuredOutputMode,
-};
+use story_provider::{LlmProvider, OpenAiCompatibleProvider, ProviderConfig, StructuredOutputMode};
 use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -275,10 +275,7 @@ async fn turn_stream_pre_chunk_failure_falls_back_to_non_streaming() {
 
     assert_eq!(draft.narration, NARRATION);
     // No narration chunk was surfaced before the fallback.
-    assert!(
-        rx.try_recv().is_err(),
-        "no chunks expected before fallback"
-    );
+    assert!(rx.try_recv().is_err(), "no chunks expected before fallback");
     // Exactly one stream attempt + one non-streaming fallback.
     let n = server.received_requests().await.expect("recorded").len();
     assert_eq!(n, 2, "stream attempt + non-streaming fallback — got {n}");
@@ -310,7 +307,10 @@ async fn turn_stream_timeout_does_not_fall_back() {
         "expected Timeout, got {err:?}"
     );
     let n = server.received_requests().await.expect("recorded").len();
-    assert_eq!(n, 1, "timeout must not trigger a fallback request — got {n}");
+    assert_eq!(
+        n, 1,
+        "timeout must not trigger a fallback request — got {n}"
+    );
 }
 
 #[tokio::test]
@@ -385,10 +385,13 @@ async fn turn_stream_contract_failure_after_chunks_retries_non_streaming() {
 }
 
 #[tokio::test]
-async fn turn_stream_late_failure_after_chunk_does_not_fall_back() {
-    // A stream that surfaces a narration chunk and then dies without [DONE]
-    // must surface the protocol error (engine checkpoint recovery), never a
-    // silent second request whose text would differ from what was shown.
+async fn turn_stream_late_transparent_break_after_chunk_falls_back() {
+    // A stream that surfaces a narration chunk and then breaks transiently
+    // (truncated body / reset connection → no [DONE], unparseable text)
+    // falls back to one non-streaming attempt: the streamed text is
+    // display-only and is replaced by the committed view, so retrying
+    // restores the pre-streaming transient-retry behavior without
+    // duplicating visible prose.
     let mut body = delta_event("{\"narration\": \"부분").into_bytes();
     body.extend_from_slice(" 텍스트만 흘러간 뒤\"}}]\n\n".as_bytes());
     // No `data: [DONE]` — the stream just ends.
@@ -396,20 +399,68 @@ async fn turn_stream_late_failure_after_chunk_does_not_fall_back() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
+        .and(body_string_contains("\"stream\":true"))
         .respond_with(sse_response(body))
+        .mount(&server)
+        .await;
+    let envelope = serde_json::json!({
+        "id": "chatcmpl-x",
+        "model": "test",
+        "choices": [
+            {"index": 0, "message": {"role": "assistant", "content": VALID_TURN}, "finish_reason": "stop"}
+        ],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+    });
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("\"stream\":false"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(envelope))
         .mount(&server)
         .await;
 
     let provider = OpenAiCompatibleProvider::new(cfg_for(&server)).expect("provider");
     let (tx, _rx) = tokio::sync::mpsc::channel::<WriterEvent>(16);
-    let err = provider
+    let draft = provider
         .generate_turn_stream(turn_request(), tx, CancellationToken::new())
         .await
-        .expect_err("stream without [DONE] must fail");
-    assert!(
-        matches!(err, ProviderError::Protocol(ref m) if m.contains("[DONE]")),
-        "expected Protocol([DONE]), got {err:?}"
-    );
+        .expect("transient mid-stream break must self-heal");
+    assert_eq!(draft.narration, NARRATION);
     let n = server.received_requests().await.expect("recorded").len();
-    assert_eq!(n, 1, "no fallback after a surfaced chunk — got {n}");
+    assert_eq!(
+        n, 2,
+        "stream attempt + one non-streaming fallback — got {n}"
+    );
+}
+
+#[tokio::test]
+async fn turn_stream_requests_server_side_usage_accounting() {
+    // Spec-conformant servers omit `usage` from every SSE frame unless the
+    // request carries stream_options.include_usage — without it token
+    // accounting silently disappears on the streamed path.
+    let mut sse = String::new();
+    for piece in split_pieces(VALID_TURN, 3) {
+        sse.push_str(&delta_event(&piece));
+    }
+    sse.push_str("data: [DONE]\n\n");
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("\"stream\":true"))
+        .and(body_string_contains(
+            "\"stream_options\":{\"include_usage\":true}",
+        ))
+        .respond_with(sse_response(sse.into_bytes()))
+        .mount(&server)
+        .await;
+
+    let provider = OpenAiCompatibleProvider::new(cfg_for(&server)).expect("provider");
+    let (tx, _rx) = tokio::sync::mpsc::channel::<WriterEvent>(16);
+    let draft = provider
+        .generate_turn_stream(turn_request(), tx, CancellationToken::new())
+        .await
+        .expect("matched request must succeed");
+    assert_eq!(draft.narration, NARRATION);
+    let n = server.received_requests().await.expect("recorded").len();
+    assert_eq!(n, 1, "exactly one streaming request — got {n}");
 }

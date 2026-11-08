@@ -2,18 +2,21 @@
 //!
 //! Convention (no pack schema change): `images/locations/<location-id>.png`
 //! wins, then `images/characters/<character-id>.png` for the primary
-//! character. Extensions are probed in [`IMAGE_EXTENSIONS`] order. The pack
-//! loader stays text-only (`ADR-003`); the host owns all file access.
+//! character. Expression sprites extend the same convention:
+//! `images/expressions/<character-id>/<emotion>.png` — the keyword-classified
+//! turn emotion picks the sprite, the character portrait is the fallback.
+//! Extensions are probed in [`IMAGE_EXTENSIONS`] order. The pack loader stays
+//! text-only (`ADR-003`); the host owns all file access.
 //!
-//! The transcript shows one image per scene boundary, so resolution is
-//! per-location and cached in a [`LocationImageStore`] — a location decodes
-//! at most once per pack session.
+//! The transcript shows one image per scene boundary (and one sprite per
+//! emotion change), so resolution is cached per key in [`LocationImageStore`]
+//! / [`ExpressionImageStore`] — each decodes at most once per pack session.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use image::DynamicImage;
-use story_model::StoryPack;
+use story_model::{Emotion, StoryPack};
 
 pub const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp"];
 
@@ -133,18 +136,110 @@ impl LocationImageStore {
     }
 }
 
+/// `Emotion` variant name as a sprite file stem. Every variant is a single
+/// CamelCase word, so lowercase matches the serde `snake_case` spelling the
+/// pack convention documents (`Affectionate` → `affectionate`).
+pub fn emotion_stem(emotion: Emotion) -> String {
+    format!("{emotion:?}").to_lowercase()
+}
+
+/// Candidate sprite paths for `emotion` of `character`, most specific first:
+/// the emotion sprite, then the character's portrait (the neutral stand-in
+/// when a pack ships no art for this emotion).
+pub fn expression_image_candidates(
+    pack: &StoryPack,
+    character: &str,
+    emotion: Emotion,
+) -> Vec<PathBuf> {
+    let expressions = pack.pack_root.join("images").join("expressions");
+    let mut candidates: Vec<PathBuf> =
+        Vec::with_capacity(IMAGE_EXTENSIONS.len() * (1 + IMAGE_EXTENSIONS.len()));
+    if is_safe_stem(character) {
+        let stem = emotion_stem(emotion);
+        for ext in IMAGE_EXTENSIONS {
+            candidates.push(expressions.join(character).join(format!("{stem}.{ext}")));
+        }
+        // A portrait is the fallback when the emotion has no sprite.
+        for ext in IMAGE_EXTENSIONS {
+            candidates.push(
+                pack.pack_root
+                    .join("images")
+                    .join("characters")
+                    .join(format!("{character}.{ext}")),
+            );
+        }
+    }
+    candidates
+}
+
+/// First candidate that actually DECODES — same fall-through contract as
+/// [`load_location_image`]: a corrupt sprite must not shadow the portrait.
+pub fn load_expression_image(
+    pack: &StoryPack,
+    character: &str,
+    emotion: Emotion,
+) -> Option<(PathBuf, DynamicImage)> {
+    expression_image_candidates(pack, character, emotion)
+        .into_iter()
+        .filter(|path| path.is_file())
+        .find_map(|path| decode_scene_image(&path).map(|decoded| (path, decoded)))
+}
+
+/// Per-emotion sprite cache. Same authoritative-absence invariant as
+/// [`LocationImageStore`]: `None` means resolved-but-unusable, and the paired
+/// `App::reset_expression_images` must run in lockstep on a pack switch.
+#[derive(Default)]
+pub struct ExpressionImageStore {
+    resolved: HashMap<Emotion, Option<PathBuf>>,
+}
+
+impl ExpressionImageStore {
+    /// Resolve + decode every `emotion` in `emotions` not already cached
+    /// under a still-existing path, for `character` (the pack's primary).
+    /// Returns ONLY emotions whose outcome changed, so the host pushes them
+    /// into the app exactly once.
+    pub fn load_missing(
+        &mut self,
+        pack: &StoryPack,
+        character: &str,
+        emotions: &[Emotion],
+    ) -> Vec<(Emotion, Option<(PathBuf, DynamicImage)>)> {
+        let mut updates = Vec::new();
+        for emotion in emotions {
+            if let Some(Some(path)) = self.resolved.get(emotion)
+                && path.is_file()
+            {
+                continue;
+            }
+            let usable = load_expression_image(pack, character, *emotion);
+            let path = usable.as_ref().map(|(path, _)| path.clone());
+            if self.resolved.get(emotion) != Some(&path) {
+                updates.push((*emotion, usable));
+            }
+            self.resolved.insert(*emotion, path);
+        }
+        updates
+    }
+
+    /// Drop every resolution. Lockstep with `App::reset_expression_images`.
+    pub fn clear(&mut self) {
+        self.resolved.clear();
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(in crate::host) mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
     use story_model::{
-        CharacterDef, CharacterId, LocationDef, LocationId, PackContentPolicy, PackInitialState,
-        PackMetadata, PackRating, PromptFragments, RelationshipStage, StoryRules, TimeSlot,
+        CharacterDef, CharacterId, Emotion, LocationDef, LocationId, PackContentPolicy,
+        PackInitialState, PackMetadata, PackRating, PromptFragments, RelationshipStage, StoryRules,
+        TimeSlot,
     };
 
     /// A minimal in-memory pack whose `pack_root` is `root`.
-    fn pack_at(root: &Path) -> StoryPack {
+    pub(in crate::host) fn pack_at(root: &Path) -> StoryPack {
         let metadata = PackMetadata {
             schema_version: semver::Version::new(1, 0, 0),
             story_id: "test".to_string(),
@@ -220,7 +315,7 @@ mod tests {
         }
     }
 
-    fn write_png(path: &Path) {
+    pub(in crate::host) fn write_png(path: &Path) {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).expect("create image dir");
         }
@@ -352,5 +447,94 @@ mod tests {
         assert!(!is_safe_stem(""));
         assert!(!is_safe_stem(".."));
         assert!(!is_safe_stem("."));
+    }
+
+    #[test]
+    fn emotion_stem_matches_the_sprite_convention() {
+        // All variants are single CamelCase words, so lowercase IS snake_case
+        // — the documented file naming (`Affectionate` → `affectionate.png`).
+        assert_eq!(emotion_stem(Emotion::Neutral), "neutral");
+        assert_eq!(emotion_stem(Emotion::Affectionate), "affectionate");
+        assert_eq!(emotion_stem(Emotion::Embarrassed), "embarrassed");
+    }
+
+    #[test]
+    fn expression_sprite_wins_then_portrait_falls_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pack = pack_at(dir.path());
+
+        // No art at all.
+        assert!(load_expression_image(&pack, "yuna", Emotion::Happy).is_none());
+
+        // Portrait appears as the fallback.
+        let portrait = dir.path().join("images/characters/yuna.png");
+        write_png(&portrait);
+        assert_eq!(
+            load_expression_image(&pack, "yuna", Emotion::Happy).map(|(path, _)| path),
+            Some(portrait.clone())
+        );
+
+        // The emotion sprite takes precedence.
+        let sprite = dir.path().join("images/expressions/yuna/happy.png");
+        write_png(&sprite);
+        assert_eq!(
+            load_expression_image(&pack, "yuna", Emotion::Happy).map(|(path, _)| path),
+            Some(sprite)
+        );
+    }
+
+    #[test]
+    fn broken_expression_sprite_falls_through_to_portrait() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pack = pack_at(dir.path());
+        let broken = dir.path().join("images/expressions/yuna/sad.png");
+        std::fs::create_dir_all(broken.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&broken, b"not a png").expect("write junk");
+        let portrait = dir.path().join("images/characters/yuna.png");
+        write_png(&portrait);
+
+        assert_eq!(
+            load_expression_image(&pack, "yuna", Emotion::Sad).map(|(path, _)| path),
+            Some(portrait)
+        );
+    }
+
+    #[test]
+    fn unsafe_character_id_yields_no_expression_candidates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pack = pack_at(dir.path());
+        assert!(load_expression_image(&pack, "../evil", Emotion::Happy).is_none());
+    }
+
+    #[test]
+    fn sprite_store_caches_until_the_file_vanishes_and_clear_re_resolves() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pack = pack_at(dir.path());
+        let sprite = dir.path().join("images/expressions/yuna/happy.png");
+        write_png(&sprite);
+
+        let mut store = ExpressionImageStore::default();
+        let updates = store.load_missing(&pack, "yuna", &[Emotion::Happy]);
+        assert_eq!(updates.len(), 1, "fresh store resolves and reports");
+        assert!(updates[0].1.is_some());
+
+        // Cached winner is trusted while the path exists.
+        assert!(
+            store
+                .load_missing(&pack, "yuna", &[Emotion::Happy])
+                .is_empty()
+        );
+
+        // Once the file vanishes the store re-resolves and reports absence.
+        std::fs::remove_file(&sprite).expect("remove");
+        let updates = store.load_missing(&pack, "yuna", &[Emotion::Happy]);
+        assert_eq!(updates.len(), 1);
+        assert!(updates[0].1.is_none());
+
+        // A cleared store re-resolves authoritatively (pack-switch lockstep).
+        store.clear();
+        let updates = store.load_missing(&pack, "yuna", &[Emotion::Happy]);
+        assert_eq!(updates.len(), 1, "fresh store must re-resolve");
+        assert!(updates[0].1.is_none());
     }
 }

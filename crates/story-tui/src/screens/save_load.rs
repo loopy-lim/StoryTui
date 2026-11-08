@@ -11,10 +11,12 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListState, Paragraph, Wrap};
 use story_persistence::SlotMeta;
+
+use crate::theme::{BORDER_TYPE, Palette, Styles};
 
 use super::popup::render_min_size_warning;
 
@@ -75,22 +77,14 @@ pub fn render_save_load(
 
     // Title bar, with the save target as its quieter second span so the
     // player always knows what Enter will write.
-    let mut title_line = vec![Span::styled(
-        title.to_string(),
-        Style::default()
-            .add_modifier(Modifier::BOLD)
-            .fg(Color::Cyan),
-    )];
+    let mut title_line = vec![Span::styled(title.to_string(), Styles::title())];
     if let Some(target) = target {
-        title_line.push(Span::styled("  ·  ", Style::default().fg(Color::DarkGray)));
-        title_line.push(Span::styled(
-            target.to_string(),
-            Style::default().fg(Color::DarkGray),
-        ));
+        title_line.push(Span::styled("  ·  ", Styles::muted()));
+        title_line.push(Span::styled(target.to_string(), Styles::subtle()));
     }
     let title_block = Block::default()
         .borders(Borders::BOTTOM)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Styles::border_muted());
     let title_para = Paragraph::new(Line::from(title_line))
         .block(title_block)
         .alignment(Alignment::Center);
@@ -99,19 +93,16 @@ pub fn render_save_load(
     // Slot list.
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(crate::theme::BORDER_TYPE)
-        .border_style(crate::theme::Styles::border_muted())
-        .title(Span::styled(
-            " ✦ 슬롯 목록 ✦ ",
-            crate::theme::Styles::title(),
-        ));
+        .border_type(BORDER_TYPE)
+        .border_style(Styles::border_muted())
+        .title(Span::styled(" ✦ 슬롯 목록 ✦ ", Styles::title()));
     let inner = block.inner(chunks[1]);
     frame.render_widget(block, chunks[1]);
 
     let items: Vec<Line> = if slots.is_empty() {
         vec![Line::from(Span::styled(
             "저장된 슬롯이 없습니다.".to_string(),
-            Style::default().fg(crate::theme::Palette::MUTED),
+            Styles::muted(),
         ))]
     } else {
         slots
@@ -119,8 +110,8 @@ pub fn render_save_load(
             .map(|s| {
                 if s.story_id.is_empty() {
                     return Line::from(vec![
-                        Span::raw(format!("[{}] ", s.slot_id)),
-                        Span::styled("빈 슬롯", Style::default().fg(crate::theme::Palette::MUTED)),
+                        Span::styled(format!("[{}] ", s.slot_id), Styles::muted()),
+                        Span::styled("빈 슬롯", Styles::muted()),
                     ]);
                 }
                 let desc = s
@@ -129,24 +120,20 @@ pub fn render_save_load(
                     .unwrap_or_else(|| "(설명 없음)".to_string());
                 let when = s.saved_at.format("%Y-%m-%d %H:%M").to_string();
                 Line::from(vec![
-                    Span::raw(format!("[{}] ", s.slot_id)),
-                    Span::raw(s.story_id.clone()),
-                    Span::raw(" · "),
-                    Span::raw(desc),
-                    Span::raw(" · "),
-                    Span::styled(when, Style::default().fg(crate::theme::Palette::MUTED)),
+                    Span::styled(format!("[{}] ", s.slot_id), Styles::keycap()),
+                    Span::styled(s.story_id.clone(), Style::default().fg(Palette::ACCENT)),
+                    Span::styled(" · ", Styles::muted()),
+                    Span::styled(desc, Styles::item_normal()),
+                    Span::styled(" · ", Styles::muted()),
+                    Span::styled(when, Styles::muted()),
                 ])
             })
             .collect()
     };
 
     let list = List::new(items)
-        .style(Style::default().fg(crate::theme::Palette::PROSE))
-        .highlight_style(
-            Style::default()
-                .add_modifier(Modifier::BOLD)
-                .fg(crate::theme::Palette::SELECTED),
-        )
+        .style(Styles::item_normal())
+        .highlight_style(Styles::item_selected())
         .highlight_symbol("▶ ");
 
     let mut state = ListState::default();
@@ -158,8 +145,9 @@ pub fn render_save_load(
     // Footer hint.
     let footer_para = Paragraph::new(Line::from(Span::styled(
         footer.to_string(),
-        Style::default().fg(Color::DarkGray),
+        Styles::muted(),
     )))
+    .alignment(Alignment::Center)
     .wrap(Wrap { trim: false });
     frame.render_widget(footer_para, chunks[2]);
 }

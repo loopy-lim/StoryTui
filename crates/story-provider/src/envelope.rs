@@ -38,9 +38,21 @@ pub struct ChatCompletionRequest {
     pub max_tokens_field: MaxTokensField,
     /// Streaming flag (always `false` for the W6 MVP).
     pub stream: bool,
+    /// `stream_options`, sent only on streaming requests that need server-side
+    /// usage accounting. Spec-conformant servers (e.g. api.openai.com) omit
+    /// `usage` from every SSE frame unless `include_usage` is requested, which
+    /// would silently disable token accounting on the streamed paths.
+    pub stream_options: Option<StreamOptions>,
     /// Structured-output constraint, included only when the provider's
     /// capability confirms support AND the request carries a schema.
     pub response_format: Option<ResponseFormat>,
+}
+
+/// `stream_options` payload for streaming requests.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct StreamOptions {
+    /// Ask the server to attach a final `usage` frame to the SSE stream.
+    pub include_usage: bool,
 }
 
 impl Serialize for ChatCompletionRequest {
@@ -60,6 +72,9 @@ impl Serialize for ChatCompletionRequest {
             }
         }
         map.serialize_entry("stream", &self.stream)?;
+        if let Some(stream_options) = &self.stream_options {
+            map.serialize_entry("stream_options", stream_options)?;
+        }
         if let Some(response_format) = &self.response_format {
             map.serialize_entry("response_format", response_format)?;
         }
@@ -115,6 +130,7 @@ impl ChatCompletionRequest {
             max_tokens: req.max_tokens,
             max_tokens_field: MaxTokensField::MaxTokens,
             stream: false,
+            stream_options: None,
             response_format,
         }
     }
@@ -149,6 +165,7 @@ impl ChatCompletionRequest {
             max_tokens: req.max_tokens,
             max_tokens_field: MaxTokensField::MaxTokens,
             stream: false,
+            stream_options: None,
             response_format,
         }
     }
@@ -166,6 +183,7 @@ impl ChatCompletionRequest {
             max_tokens: req.max_tokens,
             max_tokens_field: MaxTokensField::MaxTokens,
             stream: true,
+            stream_options: None,
             response_format: None,
         }
     }

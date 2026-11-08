@@ -17,12 +17,12 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use image::DynamicImage;
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui_image::picker::Picker;
 use ratatui_image::sliced::SlicedProtocol;
 use story_core::engine_cmd::EngineCommand;
 use story_model::uuid::Uuid;
-use story_model::{ActionType, AppViewModel, LocationId, ParsedAction};
+use story_model::{ActionType, AppViewModel, Emotion, LocationId, ParsedAction, RelationshipStage};
 use story_model::{ProviderConfigSafe, ProviderHealth};
 use story_persistence::SlotMeta;
 
@@ -39,6 +39,7 @@ use crate::screens::story::{
     render_model_picker, render_provider_picker, render_story, story_entry_lines,
     streaming_entry_lines,
 };
+use crate::theme::Styles;
 
 /// Which manual save manager the host should open.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,6 +115,85 @@ struct SettingsState {
     tts: TtsDisplay,
     images_enabled: bool,
     image_backend: Option<String>,
+    /// Whether `image_backend` was player-forced (Settings `b` cycle).
+    image_backend_manual: bool,
+    /// Two-stage Director → Writer generation path (streaming narration).
+    use_director_writer: bool,
+    /// Whether expression sprites are currently shown.
+    expressions_enabled: bool,
+    /// Response-style preset label (`자동` when the profile's own tuning is
+    /// in charge) shown at the top of the sampling block.
+    sampling_style: String,
+    /// Persona row label for the status block (`없음` / name / `설정됨`).
+    persona_label: String,
+    /// Effective persona values, prefilled into the edit modal. Empty means
+    /// the field is off (nothing inherited or explicitly cleared).
+    persona_name: String,
+    persona_text: String,
+}
+
+/// Two-field persona editor opened from the Settings screen (`a`). Plain
+/// buffers so the host receives exactly the submitted text.
+#[derive(Clone, Debug)]
+struct PersonaDialogState {
+    name: InputBuffer,
+    persona: InputBuffer,
+    /// Focused field: 0 = 이름, 1 = 페르소나.
+    focus: usize,
+}
+
+/// Buffer capacity for the persona modal fields (grapheme clusters).
+const PERSONA_NAME_MAX_CHARS: usize = 32;
+const PERSONA_TEXT_MAX_CHARS: usize = 400;
+
+/// Single-field author's note editor opened from the Settings screen (`t`).
+#[derive(Clone, Debug)]
+struct AuthorNoteDialogState {
+    note: InputBuffer,
+}
+
+/// Buffer capacity for the author's note modal (grapheme clusters).
+const AUTHOR_NOTE_MAX_CHARS: usize = 400;
+
+/// Lorebook data the host pushes for the Settings `w` editor. `persisted`
+/// mirrors "a lorebook.toml exists to save into" — when false the dialog
+/// labels the edits session-only.
+#[derive(Clone, Debug)]
+struct LorebookData {
+    entries: Vec<story_model::LorebookEntry>,
+    persisted: bool,
+}
+
+/// Lorebook editor opened from the Settings screen (`w`). Holds a working
+/// copy of the entries; every mutation flags `dirty`, and leaving the list
+/// while dirty hands the full updated list to the host.
+#[derive(Clone, Debug)]
+struct LorebookDialogState {
+    entries: Vec<story_model::LorebookEntry>,
+    selected: usize,
+    persisted: bool,
+    dirty: bool,
+    /// Open single-line editor for the selected entry, if any.
+    edit: Option<LorebookEdit>,
+}
+
+/// Which field of the selected lorebook entry the single-line editor holds.
+#[derive(Clone, Debug)]
+enum LorebookEdit {
+    Content { buffer: InputBuffer },
+    Keys { buffer: InputBuffer },
+}
+
+/// Editor capacities for the lorebook modal fields (grapheme clusters).
+const LOREBOOK_CONTENT_MAX_CHARS: usize = 2_000;
+const LOREBOOK_KEYS_MAX_CHARS: usize = 400;
+
+/// Last-sent prompts the host captured before a provider call. Session
+/// memory only — never persisted, like every other host-side capture.
+#[derive(Clone, Debug)]
+struct PromptPreview {
+    system: String,
+    user: String,
 }
 
 /// A scene image pre-encoded for the detected terminal graphics protocol.
@@ -141,6 +221,10 @@ impl std::fmt::Debug for SceneImage {
 /// Upper bound for an inline scene image so it never dominates the transcript.
 const SCENE_IMAGE_MAX_COLS: u16 = 26;
 const SCENE_IMAGE_MAX_ROWS: u16 = 14;
+/// Tighter portrait budget for expression sprites — an emotion beat must
+/// stay visually subordinate to the location art around it.
+const EMOTE_IMAGE_MAX_COLS: u16 = 14;
+const EMOTE_IMAGE_MAX_ROWS: u16 = 14;
 
 impl SceneImage {
     /// Encode `image` fitted into the inline cell budget. `None` when the
@@ -150,10 +234,21 @@ impl SceneImage {
     /// correct slice of a partially scrolled image — plain protocols always
     /// draw from the image's first row.
     pub fn encode(picker: &Picker, image: DynamicImage) -> Option<Self> {
+        Self::encode_in(picker, image, SCENE_IMAGE_MAX_COLS, SCENE_IMAGE_MAX_ROWS)
+    }
+
+    /// Encode with an explicit cell budget — the expression sprites use a
+    /// tighter portrait budget than location art.
+    pub fn encode_in(
+        picker: &Picker,
+        image: DynamicImage,
+        max_cols: u16,
+        max_rows: u16,
+    ) -> Option<Self> {
         let protocol = SlicedProtocol::new_with_resize(
             picker,
             image,
-            ratatui::layout::Size::new(SCENE_IMAGE_MAX_COLS, SCENE_IMAGE_MAX_ROWS),
+            ratatui::layout::Size::new(max_cols, max_rows),
             ratatui_image::Resize::Fit(None),
         )
         .ok()?;
@@ -166,12 +261,11 @@ impl SceneImage {
     }
 }
 
-/// One location's resolved image: the encoded payload plus the source path it
-/// came from. The path is the dedupe key — a pack whose locations all fall
-/// back to the same character portrait must not repeat that portrait at every
-/// scene boundary.
+/// One resolved image (location art or expression sprite): the encoded
+/// payload plus the source path it came from. The path is the dedupe key —
+/// transcript positions resolving to the same file must not repeat it.
 #[derive(Clone, Debug)]
-struct LocationImage {
+struct ResolvedImage {
     source: std::path::PathBuf,
     image: Arc<SceneImage>,
 }
@@ -235,15 +329,79 @@ pub struct App {
     image_picker: Option<Picker>,
     /// Human-readable protocol name for the Settings screen (kitty 등).
     image_backend: Option<&'static str>,
+    /// Whether the current protocol was player-forced (Settings `b` cycle)
+    /// rather than the startup detection.
+    image_backend_manual: bool,
     /// Player toggle from the Settings screen — rendering skips when off.
     images_enabled: bool,
     /// Set when the player toggled images in Settings (`i`).
     images_toggle_requested: bool,
+    /// Set when the player cycled the image render protocol in Settings (`b`).
+    image_backend_cycle_requested: bool,
+    /// Set when the player toggled the generation path in Settings (`g`).
+    generation_toggle_requested: bool,
+    /// Player toggle for expression sprites from the Settings screen (`f`).
+    expressions_enabled: bool,
+    /// Set when the player toggled expressions in Settings (`f`).
+    expressions_toggle_requested: bool,
+    /// Set when the player cycled the sampling style preset in Settings (`x`).
+    sampling_style_cycle_requested: bool,
+    /// Persona edit modal (`a` in Settings); `Some` = modal active.
+    persona_dialog: Option<PersonaDialogState>,
+    /// Set when the player confirmed the persona modal with the raw
+    /// `(name, persona)` text; the host persists the identity and re-applies
+    /// it to the pack prompt.
+    persona_submit_request: Option<(String, String)>,
+    /// TOML-only display post-processing rules (`[[display_rules]]`),
+    /// compiled by the host at startup. Applied to transcript text right
+    /// before it becomes display lines — never to engine or save state.
+    display_rules: Vec<(regex::Regex, String)>,
+    /// Author's note modal (`t` in Settings); `Some` = modal active.
+    author_note_dialog: Option<AuthorNoteDialogState>,
+    /// Set when the player confirmed the note modal — the trimmed note text;
+    /// empty string means "clear the note".
+    author_note_submit_request: Option<String>,
+    /// Current author's note, host-supplied, for the `t` modal prefill.
+    author_note: String,
+    /// Lorebook editor modal (`w` in Settings); `Some` = modal active.
+    lorebook_dialog: Option<LorebookDialogState>,
+    /// Working copy + persistence flag supplied via `set_lorebook_data`.
+    /// `None` = nothing supplied yet, so Settings `w` is a no-op.
+    lorebook_data: Option<LorebookData>,
+    /// Set when a lorebook modal closed with edits: the full updated list
+    /// for the host to apply to the engine (and to lorebook.toml, if any).
+    lorebook_request: Option<Vec<story_model::LorebookEntry>>,
+    /// Last-sent prompts captured by the host (session memory only).
+    prompt_preview: Option<PromptPreview>,
+    /// Prompt preview viewer (`r` in Settings); `Some` = open, holding the
+    /// scroll offset.
+    prompt_viewer: Option<u16>,
+    /// Set when the player pressed story `w` (이어쓰기) while idle; the host
+    /// issues the continue generation.
+    continue_requested: bool,
+    /// Set when the player pressed story `z` (대필) while idle; the host
+    /// fetches a suggested action and feeds it back via `set_input_text`.
+    suggest_action_requested: bool,
+    /// Set when the player pressed story `g` (인물 대화) while idle; the host
+    /// issues the group-scene side generation.
+    group_scene_requested: bool,
+    /// Set when the player pressed `[` (이전 변형) while idle; the host sends
+    /// `EngineCommand::CycleTurnVariant { delta: -1 }`.
+    cycle_variant_back_requested: bool,
+    /// Set when the player pressed `]` (다음 변형) while idle; the host sends
+    /// `EngineCommand::CycleTurnVariant { delta: 1 }`.
+    cycle_variant_forward_requested: bool,
+    /// Digit of an Alt+1..9 quick-action press (story screen, idle), "1".."9".
+    /// The host fills the input buffer from the configured quick action.
+    quick_action_request: Option<String>,
     /// Per-location resolved images, keyed by location id. `None` = the host
     /// resolved this location and found no usable art (or the encode failed) —
     /// an authoritative absence that is not retried until the host resets it
     /// on a pack switch.
-    location_images: HashMap<String, Option<LocationImage>>,
+    location_images: HashMap<String, Option<ResolvedImage>>,
+    /// Per-emotion resolved expression sprites, keyed by [`Emotion`]. Same
+    /// authoritative-absence contract as `location_images`.
+    expression_images: HashMap<Emotion, Option<ResolvedImage>>,
     /// The pack's initial location, seeded by `set_lists` alongside the
     /// history it seeds the location fold for.
     initial_location: Option<String>,
@@ -259,6 +417,13 @@ pub struct App {
     pack_swap_request: Option<String>,
     /// Pack delete confirmation modal: the selected index into `pack_dirs`.
     pack_delete_confirm: Option<usize>,
+    /// Set while the in-game `n` confirmation modal is up (AC: one stray
+    /// keypress must not reset a run).
+    new_game_confirm: bool,
+    /// The confirm was opened from the home menu's "새 게임" row; on Enter the
+    /// original home arm (greeting picker / home_request) replays instead of
+    /// the in-game engine command.
+    new_game_confirm_from_home: bool,
     /// Set when the player confirms deletion; the host validates and removes.
     pack_delete_request: Option<String>,
     /// Alternate openings for the current pack: index 0 is the pack opening.
@@ -293,6 +458,11 @@ pub struct App {
     /// One-line start-menu status (guidance or notice) below the rows:
     /// `(line, attention)` — attention renders yellow, the rest gray.
     home_status: Option<(String, bool)>,
+    /// One-line story-screen notice rendered as a subtle tail line of the
+    /// narration blocks (same surface as the variant badge). Host-set for
+    /// automation guides ("이전 세션을 이어요", "자동 재시도…(1/1)", "✎ 이어씀")
+    /// — no new keys, no footer rows. Cleared when a new turn commits.
+    story_notice: Option<String>,
     /// Directory of the active pack; the host updates it after a swap and
     /// reads it back to scan the pack root for the picker.
     current_pack_dir: String,
@@ -350,17 +520,43 @@ impl App {
             tts_toggle_requested: false,
             image_picker: None,
             image_backend: None,
+            image_backend_manual: false,
             images_enabled: true,
             images_toggle_requested: false,
+            image_backend_cycle_requested: false,
+            generation_toggle_requested: false,
+            expressions_enabled: true,
+            expressions_toggle_requested: false,
             location_images: HashMap::new(),
+            expression_images: HashMap::new(),
             initial_location: None,
             mouse_command: None,
             import_dialog: None,
             import_request: None,
             browse_request: None,
             pack_delete_confirm: None,
+            new_game_confirm: false,
+            new_game_confirm_from_home: false,
             pack_delete_request: None,
             pack_swap_request: None,
+            sampling_style_cycle_requested: false,
+            persona_dialog: None,
+            persona_submit_request: None,
+            display_rules: Vec::new(),
+            author_note_dialog: None,
+            author_note_submit_request: None,
+            author_note: String::new(),
+            lorebook_dialog: None,
+            lorebook_data: None,
+            lorebook_request: None,
+            prompt_preview: None,
+            prompt_viewer: None,
+            continue_requested: false,
+            suggest_action_requested: false,
+            group_scene_requested: false,
+            cycle_variant_back_requested: false,
+            cycle_variant_forward_requested: false,
+            quick_action_request: None,
             greetings: Vec::new(),
             greeting_picker: None,
             greeting_selection: None,
@@ -377,6 +573,7 @@ impl App {
             home_continue_returns_to_game: false,
             home_request: None,
             home_status: None,
+            story_notice: None,
             current_pack_dir: String::new(),
             help_visible: false,
             import_last_dir: None,
@@ -525,6 +722,31 @@ impl App {
     /// Set (or clear) the one-line status under the home menu rows.
     pub fn set_home_status(&mut self, status: Option<(String, bool)>) {
         self.home_status = status;
+    }
+
+    /// The home status line text, for host-side comparison (AC-4 recovery
+    /// clears exactly the server-down/unconfigured notices it set).
+    pub fn home_status_text(&self) -> Option<&str> {
+        self.home_status.as_ref().map(|(line, _)| line.as_str())
+    }
+
+    /// The provider health last projected onto the Settings state (AC-4's
+    /// periodic reprobe reads it to decide whether a probe can change
+    /// anything). `None` before the first projection.
+    pub fn provider_health(&self) -> Option<ProviderHealth> {
+        self.settings.as_ref().map(|settings| settings.health)
+    }
+
+    /// Set (or clear) the one-line story notice (subtle tail row of the
+    /// narration blocks — the variant-badge surface, no new keys). Cleared
+    /// automatically when a later turn commits.
+    pub fn set_story_notice(&mut self, notice: Option<&str>) {
+        self.story_notice = notice.map(str::to_string);
+    }
+
+    /// The current story notice text (test/diagnostic accessor).
+    pub fn story_notice(&self) -> Option<&str> {
+        self.story_notice.as_deref()
     }
 
     /// The directory of the active pack (host bookkeeping for pack scans).
@@ -791,6 +1013,269 @@ impl App {
         }
     }
 
+    /// Open the persona editor prefilled with the effective identity the
+    /// Settings screen already shows (empty field = off).
+    fn open_persona_dialog(&mut self) {
+        let Some(settings) = self.settings.as_ref() else {
+            return;
+        };
+        let mut name = InputBuffer::new(PERSONA_NAME_MAX_CHARS);
+        let mut persona = InputBuffer::new(PERSONA_TEXT_MAX_CHARS);
+        name.insert_str(&settings.persona_name);
+        persona.insert_str(&settings.persona_text);
+        self.persona_dialog = Some(PersonaDialogState {
+            name,
+            persona,
+            focus: 0,
+        });
+    }
+
+    /// Keys while the persona modal owns the Settings screen. Tab toggles the
+    /// focused field, Enter submits the raw text (empty = off), Esc cancels.
+    fn handle_persona_dialog_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.should_quit = true;
+            return;
+        }
+        let Some(dialog) = self.persona_dialog.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => self.persona_dialog = None,
+            KeyCode::Enter => {
+                let name = dialog.name.text().trim().to_string();
+                let persona = dialog.persona.text().trim().to_string();
+                self.persona_dialog = None;
+                self.persona_submit_request = Some((name, persona));
+            }
+            KeyCode::Tab | KeyCode::Up | KeyCode::Down => {
+                dialog.focus = 1 - dialog.focus;
+            }
+            KeyCode::Backspace
+            | KeyCode::Delete
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Home
+            | KeyCode::End => {
+                let focused = match dialog.focus {
+                    0 => &mut dialog.name,
+                    _ => &mut dialog.persona,
+                };
+                match key.code {
+                    KeyCode::Backspace => focused.backspace(),
+                    KeyCode::Delete => focused.delete(),
+                    KeyCode::Left => focused.cursor_left(),
+                    KeyCode::Right => focused.cursor_right(),
+                    KeyCode::Home => focused.cursor_start(),
+                    _ => focused.cursor_end(),
+                }
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let focused = match dialog.focus {
+                    0 => &mut dialog.name,
+                    _ => &mut dialog.persona,
+                };
+                focused.insert_grapheme(&c.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    /// Open the author's note editor prefilled with the host-supplied note
+    /// (empty = the note is off).
+    fn open_author_note_dialog(&mut self) {
+        let mut note = InputBuffer::new(AUTHOR_NOTE_MAX_CHARS);
+        note.insert_str(&self.author_note);
+        self.author_note_dialog = Some(AuthorNoteDialogState { note });
+    }
+
+    /// Keys while the author's note modal owns the Settings screen. Enter
+    /// submits the trimmed text (empty = clear the note), Esc cancels.
+    fn handle_author_note_dialog_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.should_quit = true;
+            return;
+        }
+        let Some(dialog) = self.author_note_dialog.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => self.author_note_dialog = None,
+            KeyCode::Enter => {
+                let note = dialog.note.text().trim().to_string();
+                self.author_note_dialog = None;
+                self.author_note_submit_request = Some(note);
+            }
+            KeyCode::Backspace => dialog.note.backspace(),
+            KeyCode::Delete => dialog.note.delete(),
+            KeyCode::Left => dialog.note.cursor_left(),
+            KeyCode::Right => dialog.note.cursor_right(),
+            KeyCode::Home => dialog.note.cursor_start(),
+            KeyCode::End => dialog.note.cursor_end(),
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                dialog.note.insert_grapheme(&c.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    /// Open the lorebook editor from the host's working copy. Requires
+    /// `set_lorebook_data` first — without it the key is a no-op.
+    fn open_lorebook_dialog(&mut self) {
+        let Some(data) = self.lorebook_data.as_ref() else {
+            return;
+        };
+        self.lorebook_dialog = Some(LorebookDialogState {
+            entries: data.entries.clone(),
+            selected: 0,
+            persisted: data.persisted,
+            dirty: false,
+            edit: None,
+        });
+    }
+
+    /// Keys while the lorebook modal owns the Settings screen. Two levels:
+    /// the entry list (Up/Down move, Space toggles, Enter edits content, `k`
+    /// edits keys) and a single-line editor absorbed by its buffer. Esc backs
+    /// out one level; leaving the list while dirty hands the full list back.
+    fn handle_lorebook_dialog_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.should_quit = true;
+            return;
+        }
+        // Taken out so the editor level can re-borrow `entries` freely; the
+        // Esc arm leaves it out (closes the dialog), everything else puts it
+        // back.
+        let mut dialog = match self.lorebook_dialog.take() {
+            Some(dialog) => dialog,
+            None => return,
+        };
+        if let Some(edit) = dialog.edit.as_mut() {
+            let (LorebookEdit::Content { buffer } | LorebookEdit::Keys { buffer }) = edit;
+            match key.code {
+                KeyCode::Esc => dialog.edit = None,
+                KeyCode::Enter => {
+                    let text = buffer.text();
+                    if let Some(entry) = dialog.entries.get_mut(dialog.selected) {
+                        match edit {
+                            LorebookEdit::Content { .. } => entry.content = text,
+                            LorebookEdit::Keys { .. } => {
+                                entry.keys = parse_lorebook_keys(&text);
+                            }
+                        }
+                    }
+                    dialog.dirty = true;
+                    dialog.edit = None;
+                }
+                KeyCode::Backspace => buffer.backspace(),
+                KeyCode::Delete => buffer.delete(),
+                KeyCode::Left => buffer.cursor_left(),
+                KeyCode::Right => buffer.cursor_right(),
+                KeyCode::Home => buffer.cursor_start(),
+                KeyCode::End => buffer.cursor_end(),
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    buffer.insert_grapheme(&c.to_string());
+                }
+                _ => {}
+            }
+            self.lorebook_dialog = Some(dialog);
+            return;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                if dialog.dirty {
+                    self.lorebook_request = Some(dialog.entries);
+                }
+                // Already taken out — the dialog stays closed.
+                return;
+            }
+            KeyCode::Up => dialog.selected = dialog.selected.saturating_sub(1),
+            KeyCode::Down => {
+                dialog.selected = (dialog.selected + 1).min(dialog.entries.len().saturating_sub(1));
+            }
+            KeyCode::Char(' ') => {
+                if let Some(entry) = dialog.entries.get_mut(dialog.selected) {
+                    entry.enabled = !entry.enabled;
+                    dialog.dirty = true;
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(entry) = dialog.entries.get(dialog.selected) {
+                    let mut buffer = InputBuffer::new(LOREBOOK_CONTENT_MAX_CHARS);
+                    buffer.insert_str(&entry.content);
+                    dialog.edit = Some(LorebookEdit::Content { buffer });
+                }
+            }
+            // Same physical key under Korean 2-beolsik: k=ㅏ.
+            KeyCode::Char('k' | 'ㅏ') => {
+                if let Some(entry) = dialog.entries.get(dialog.selected) {
+                    let mut buffer = InputBuffer::new(LOREBOOK_KEYS_MAX_CHARS);
+                    buffer.insert_str(&join_lorebook_keys(&entry.keys));
+                    dialog.edit = Some(LorebookEdit::Keys { buffer });
+                }
+            }
+            // Same physical key under Korean 2-beolsik: c=ㅊ. Toggling the
+            // constant pin edits the entry like any other — dirty, so the
+            // same full-list request hands it over on close.
+            KeyCode::Char('c' | 'ㅊ') => {
+                if let Some(entry) = dialog.entries.get_mut(dialog.selected) {
+                    entry.constant = !entry.constant;
+                    dialog.dirty = true;
+                }
+            }
+            // Same physical key under Korean 2-beolsik: p=ㅔ. Probability
+            // cycles the ST-style preset ladder 100→75→50→25→100; a value
+            // off the ladder joins it at 75.
+            KeyCode::Char('p' | 'ㅔ') => {
+                if let Some(entry) = dialog.entries.get_mut(dialog.selected) {
+                    entry.probability = match entry.probability {
+                        75 => 50,
+                        50 => 25,
+                        25 => 100,
+                        _ => 75,
+                    };
+                    dialog.dirty = true;
+                }
+            }
+            _ => {}
+        }
+        self.lorebook_dialog = Some(dialog);
+    }
+
+    /// Open the prompt preview viewer. Session memory only: without a
+    /// captured prompt the key is a no-op.
+    fn open_prompt_viewer(&mut self) {
+        if self.prompt_preview.is_some() {
+            self.prompt_viewer = Some(0);
+        }
+    }
+
+    /// Scroll the prompt viewer by `delta` lines, clamped to the body the
+    /// renderer will draw for the captured prompts. The Paragraph wraps text
+    /// BEFORE applying the scroll offset, so the clamp counts wrapped visual
+    /// rows at the popup's inner width — never raw logical lines.
+    fn scroll_prompt_viewer(&mut self, delta: i32) {
+        let Some(scroll) = self.prompt_viewer.as_mut() else {
+            return;
+        };
+        let area = self.last_render_area.get();
+        let max = self
+            .prompt_preview
+            .as_ref()
+            .map(|preview| {
+                let (width, height) = crate::screens::settings::prompt_viewer_frame(area);
+                let lines = crate::screens::settings::prompt_viewer_body_lines(
+                    &preview.system,
+                    &preview.user,
+                );
+                let rows =
+                    crate::screens::story::wrapped_line_count(&lines, width.saturating_sub(2));
+                rows.saturating_sub(usize::from(height.saturating_sub(2)))
+            })
+            .unwrap_or(0);
+        *scroll = (*scroll as i32 + delta).clamp(0, max as i32) as u16;
+    }
+
     /// Supply the redacted configuration and health details for the Settings
     /// screen. Secrets never enter this UI state.
     #[allow(clippy::too_many_arguments)] // the projection stays explicit at the host boundary
@@ -805,6 +1290,12 @@ impl App {
         tts: TtsDisplay,
         images_enabled: bool,
         image_backend: Option<String>,
+        use_director_writer: bool,
+        expressions_enabled: bool,
+        sampling_style: String,
+        persona_label: String,
+        persona_name: String,
+        persona_text: String,
     ) {
         self.settings = Some(SettingsState {
             provider,
@@ -816,18 +1307,27 @@ impl App {
             tts,
             images_enabled,
             image_backend,
+            image_backend_manual: self.image_backend_manual,
+            use_director_writer,
+            expressions_enabled,
+            sampling_style,
+            persona_label,
+            persona_name,
+            persona_text,
         });
     }
 
     /// Record the terminal graphics capability. Call once at startup before
-    /// the first `set_location_image`.
-    pub fn set_image_picker(&mut self, picker: Option<Picker>) {
+    /// the first `set_location_image`. `manual` marks a player-forced
+    /// protocol (Settings `b` cycle) as opposed to the detected default.
+    pub fn set_image_picker(&mut self, picker: Option<Picker>, manual: bool) {
         self.image_backend = picker.as_ref().map(|picker| match picker.protocol_type() {
             ratatui_image::picker::ProtocolType::Kitty => "kitty",
             ratatui_image::picker::ProtocolType::Sixel => "sixel",
             ratatui_image::picker::ProtocolType::Iterm2 => "iterm2",
             ratatui_image::picker::ProtocolType::Halfblocks => "halfblocks",
         });
+        self.image_backend_manual = manual;
         self.image_picker = picker;
     }
 
@@ -846,9 +1346,24 @@ impl App {
         self.image_backend.map(str::to_string)
     }
 
+    /// Whether the displayed protocol was player-forced rather than detected.
+    pub fn image_backend_manual(&self) -> bool {
+        self.image_backend_manual
+    }
+
     /// Consume an image toggle request from the Settings screen.
     pub fn take_images_toggle_request(&mut self) -> bool {
         std::mem::take(&mut self.images_toggle_requested)
+    }
+
+    /// Consume an image render-protocol cycle request from the Settings screen.
+    pub fn take_image_backend_cycle_request(&mut self) -> bool {
+        std::mem::take(&mut self.image_backend_cycle_requested)
+    }
+
+    /// Consume a generation-path toggle request from the Settings screen.
+    pub fn take_generation_toggle_request(&mut self) -> bool {
+        std::mem::take(&mut self.generation_toggle_requested)
     }
 
     /// Store one location's resolved image. Decoding is host-owned; encoding
@@ -864,7 +1379,7 @@ impl App {
     ) {
         let entry = match (resolved, self.image_picker.as_ref()) {
             (Some((source, image)), Some(picker)) => {
-                SceneImage::encode(picker, image).map(|image| LocationImage {
+                SceneImage::encode(picker, image).map(|image| ResolvedImage {
                     source,
                     image: Arc::new(image),
                 })
@@ -874,11 +1389,273 @@ impl App {
         self.location_images.insert(location.to_string(), entry);
     }
 
+    /// Store one emotion's resolved expression sprite. Mirrors
+    /// [`Self::set_location_image`] with the tighter portrait cell budget.
+    pub fn set_expression_image(
+        &mut self,
+        emotion: Emotion,
+        resolved: Option<(std::path::PathBuf, DynamicImage)>,
+    ) {
+        let entry = match (resolved, self.image_picker.as_ref()) {
+            (Some((source, image)), Some(picker)) => {
+                SceneImage::encode_in(picker, image, EMOTE_IMAGE_MAX_COLS, EMOTE_IMAGE_MAX_ROWS)
+                    .map(|image| ResolvedImage {
+                        source,
+                        image: Arc::new(image),
+                    })
+            }
+            _ => None,
+        };
+        self.expression_images.insert(emotion, entry);
+    }
+
     /// Drop every per-location image. MUST move in lockstep with the host's
     /// `LocationImageStore::clear` — clearing only one side lets the previous
     /// pack's images survive a pack switch (the stale-portrait bug).
     pub fn reset_location_images(&mut self) {
         self.location_images.clear();
+    }
+
+    /// Drop every per-emotion sprite. Same lockstep contract as
+    /// [`Self::reset_location_images`] (`reset_scene_images` on the host).
+    pub fn reset_expression_images(&mut self) {
+        self.expression_images.clear();
+    }
+
+    /// Settings-screen expression toggle. Per-emotion sprites are kept, so
+    /// re-enabling is instant — no re-decode.
+    pub fn set_expressions_enabled(&mut self, enabled: bool) {
+        self.expressions_enabled = enabled;
+    }
+
+    pub fn expressions_enabled(&self) -> bool {
+        self.expressions_enabled
+    }
+
+    /// Resolved expression sprite entries (diagnostics seam — lets the host
+    /// assert the cold-toggle refresh path without rendering).
+    pub fn expression_sprite_count(&self) -> usize {
+        self.expression_images.len()
+    }
+
+    /// Consume an expression toggle request from the Settings screen.
+    pub fn take_expressions_toggle_request(&mut self) -> bool {
+        std::mem::take(&mut self.expressions_toggle_requested)
+    }
+
+    /// Consume a sampling style cycle request from the Settings screen.
+    pub fn take_sampling_style_cycle_request(&mut self) -> bool {
+        std::mem::take(&mut self.sampling_style_cycle_requested)
+    }
+
+    /// Consume a confirmed persona modal submission — the raw `(name,
+    /// persona)` text. Empty means "this field is off".
+    pub fn take_persona_submit_request(&mut self) -> Option<(String, String)> {
+        self.persona_submit_request.take()
+    }
+
+    /// Supply the current author's note for the Settings `t` modal prefill.
+    /// Empty string = the note is off.
+    pub fn set_author_note(&mut self, note: &str) {
+        self.author_note = note.to_string();
+    }
+
+    /// Consume a confirmed author's note submission — the trimmed note text.
+    /// An empty string means "clear the note".
+    pub fn take_author_note_submit(&mut self) -> Option<String> {
+        self.author_note_submit_request.take()
+    }
+
+    /// Supply the lorebook working copy for the Settings `w` editor. The
+    /// dialog clones this on open, so later pushes never clobber open edits.
+    /// `persisted == false` marks the edits session-only (no lorebook.toml).
+    pub fn set_lorebook_data(&mut self, entries: &[story_model::LorebookEntry], persisted: bool) {
+        self.lorebook_data = Some(LorebookData {
+            entries: entries.to_vec(),
+            persisted,
+        });
+    }
+
+    /// Consume the lorebook edit result: the full updated entry list, handed
+    /// over once when a dialog with edits closes. The host applies it to the
+    /// engine and (when present) to lorebook.toml.
+    pub fn take_lorebook_request(&mut self) -> Option<Vec<story_model::LorebookEntry>> {
+        // While a turn is generating the engine drops the hot-swap (identity
+        // reduce during pending) — hold the edit until it settles so the
+        // modal, the engine, and lorebook.toml cannot diverge.
+        if self.view.loading.is_some() {
+            return None;
+        }
+        self.lorebook_request.take()
+    }
+
+    /// Capture the last-sent prompts for the Settings `r` viewer. Session
+    /// memory only — nothing here is ever persisted.
+    pub fn set_prompt_preview(&mut self, system: &str, user: &str) {
+        self.prompt_preview = Some(PromptPreview {
+            system: system.to_string(),
+            user: user.to_string(),
+        });
+    }
+
+    /// Consume a story-screen `w` (이어쓰기) request.
+    pub fn take_continue_request(&mut self) -> bool {
+        std::mem::take(&mut self.continue_requested)
+    }
+
+    /// Consume a story-screen `z` (대필) request.
+    pub fn take_suggest_action_request(&mut self) -> bool {
+        std::mem::take(&mut self.suggest_action_requested)
+    }
+
+    /// Consume a story-screen `g` (인물 대화) request.
+    pub fn take_group_scene_request(&mut self) -> bool {
+        std::mem::take(&mut self.group_scene_requested)
+    }
+
+    /// Cast roster rows for the `p` overlay: `이름 · 관계단계 · 감정 ·
+    /// 호감/신뢰/긴장`. Pure display formatting over the engine-published
+    /// [`story_model::CharacterStatusView`]s — the engine view stays the
+    /// authority for the underlying numbers.
+    fn cast_roster_rows(&self) -> Vec<String> {
+        self.view
+            .cast
+            .iter()
+            .map(|member| {
+                format!(
+                    "{} · {} · {} · 호감 {} / 신뢰 {} / 긴장 {}",
+                    member.name,
+                    relationship_stage_label(member.relationship_stage),
+                    emotion_label(member.current_emotion),
+                    member.affection,
+                    member.trust,
+                    member.tension,
+                )
+            })
+            .collect()
+    }
+
+    /// Build the [`ParsedAction`] for a submitted free input. Text starting
+    /// with `@` pins the LONGEST cast member whose name follows (matched
+    /// case-insensitively, so latin names hit regardless of case) as the
+    /// `target`; the mention is stripped from `content` while
+    /// `original_text` stays verbatim. No `@` match keeps today's shape —
+    /// same as before the cast roster existed.
+    fn parsed_free_action(&self, text: &str) -> ParsedAction {
+        let trimmed = text.trim();
+        let mention = trimmed
+            .strip_prefix('@')
+            .and_then(|rest| self.mention_target(rest))
+            .filter(|(_, content)| !content.is_empty());
+        if let Some((member, content)) = mention {
+            return ParsedAction {
+                action_type: ActionType::GeneralAction,
+                target: Some(member.id.clone()),
+                intent: None,
+                tone: None,
+                content,
+                original_text: text.to_string(),
+                confidence: Some(0.0),
+            };
+        }
+        ParsedAction {
+            action_type: ActionType::GeneralAction,
+            target: None,
+            intent: None,
+            tone: None,
+            content: trimmed.to_string(),
+            original_text: text.to_string(),
+            confidence: Some(0.0),
+        }
+    }
+
+    /// Longest cast member whose name matches `rest` right after the `@`
+    /// (`(member, rest-after-name)`), or `None`. Longest wins so `한유나`
+    /// beats a shorter `유나`; case-insensitive on the latin part. A `:`
+    /// right after the name ("@유나: 안녕") is consumed, and an empty
+    /// remainder means no target — a bare `@이름` stays plain text.
+    fn mention_target(&self, rest: &str) -> Option<(&story_model::CharacterStatusView, String)> {
+        self.view
+            .cast
+            .iter()
+            .filter(|member| !member.name.is_empty())
+            .filter(|member| starts_with_case_insensitive(rest, &member.name))
+            .max_by_key(|member| member.name.chars().count())
+            .map(|member| {
+                let consumed = member.name.chars().count();
+                let remainder = rest.chars().skip(consumed).collect::<String>();
+                let remainder = remainder.trim_start();
+                let remainder = remainder.strip_prefix(':').unwrap_or(remainder);
+                (member, remainder.trim().to_string())
+            })
+    }
+
+    /// Consume a story-screen `[` (이전 변형) request — the host dispatches
+    /// `EngineCommand::CycleTurnVariant { delta: -1 }`.
+    pub fn take_cycle_variant_back_request(&mut self) -> bool {
+        std::mem::take(&mut self.cycle_variant_back_requested)
+    }
+
+    /// Consume a story-screen `]` (다음 변형) request — the host dispatches
+    /// `EngineCommand::CycleTurnVariant { delta: 1 }`.
+    pub fn take_cycle_variant_forward_request(&mut self) -> bool {
+        std::mem::take(&mut self.cycle_variant_forward_requested)
+    }
+
+    /// Consume an Alt+1..9 quick-action request — the pressed digit, "1".."9".
+    pub fn take_quick_action_request(&mut self) -> Option<String> {
+        self.quick_action_request.take()
+    }
+
+    /// Fill the free-input buffer with `text` and open input mode. The host
+    /// calls this for suggestion ("대필") and quick-action fills; the player
+    /// edits and sends with their own Enter — this never submits.
+    pub fn set_input_text(&mut self, text: &str) {
+        self.input.clear();
+        self.input.insert_str(text);
+        // Opening the editor under an open screen or overlay would spring it
+        // on the player the moment they close it — surface it only on the
+        // bare story screen; the text stays in the buffer either way.
+        self.input_mode = !self.settings_visible
+            && !self.help_visible
+            && !self.home_visible
+            && self.list_mode.is_none()
+            && self.import_dialog.is_none()
+            && self.save_load.is_none();
+    }
+
+    /// Patch the sampling block after a style cycle: the new preset label and
+    /// the effective triple now in force.
+    pub fn update_settings_sampling(
+        &mut self,
+        sampling_style: String,
+        temperature: f32,
+        top_p: f32,
+        top_k: u32,
+    ) {
+        if let Some(settings) = self.settings.as_mut() {
+            settings.sampling_style = sampling_style;
+            settings.temperature = temperature;
+            settings.top_p = top_p;
+            settings.top_k = top_k;
+        }
+    }
+
+    /// Patch the persona row and the modal prefill after a confirmed edit.
+    pub fn update_settings_persona(&mut self, label: String, name: String, persona: String) {
+        if let Some(settings) = self.settings.as_mut() {
+            settings.persona_label = label;
+            settings.persona_name = name;
+            settings.persona_text = persona;
+        }
+    }
+
+    /// Patch only the expression section of the Settings state (the `f`
+    /// toggle).
+    pub fn update_settings_expressions(&mut self, expressions_enabled: bool) {
+        if let Some(settings) = self.settings.as_mut() {
+            settings.expressions_enabled = expressions_enabled;
+        }
     }
 
     /// Patch only the TTS section of the Settings state (used by the `v`
@@ -889,17 +1666,41 @@ impl App {
         }
     }
 
-    /// Patch only the image section of the Settings state (the `i` toggle).
+    /// Patch only the image section of the Settings state (the `i` toggle
+    /// and the `b` protocol cycle).
     pub fn update_settings_images(&mut self, images_enabled: bool, image_backend: Option<String>) {
         if let Some(settings) = self.settings.as_mut() {
             settings.images_enabled = images_enabled;
             settings.image_backend = image_backend;
+            settings.image_backend_manual = self.image_backend_manual;
         }
+    }
+
+    /// Patch only the generation-path section of the Settings state (the `g`
+    /// toggle).
+    pub fn update_settings_generation(&mut self, use_director_writer: bool) {
+        if let Some(settings) = self.settings.as_mut() {
+            settings.use_director_writer = use_director_writer;
+        }
+    }
+
+    /// Generation-path value currently shown on the Settings screen. The
+    /// host's `config.use_director_writer` stays the authoritative session
+    /// value; this mirror lets settings refreshes read it without threading
+    /// the runtime config through every `apply_*` path.
+    pub fn use_director_writer(&self) -> bool {
+        self.settings
+            .as_ref()
+            .is_some_and(|settings| settings.use_director_writer)
     }
 
     pub fn set_can_continue(&mut self, can_continue: bool) {
         self.can_continue = can_continue;
-        if !can_continue && self.home_selected == 1 {
+        if can_continue {
+            // AC-2: a returning player (autosave present) opens the launcher
+            // on the 이어하기 row — 새 게임 stays an explicit choice.
+            self.home_selected = 1;
+        } else if self.home_selected == 1 {
             self.home_selected = 0;
         }
     }
@@ -909,6 +1710,18 @@ impl App {
     pub fn show_home(&mut self) {
         self.home_visible = true;
         self.home_continue_returns_to_game = false;
+    }
+
+    /// Whether the launcher currently owns the screen (AC-1 evidence: the
+    /// auto-resume startup path skips it entirely).
+    pub fn home_visible(&self) -> bool {
+        self.home_visible
+    }
+
+    /// Whether a resumable autosave exists (drives the launcher's 이어하기
+    /// row and its default cursor).
+    pub fn can_continue(&self) -> bool {
+        self.can_continue
     }
 
     /// Return to the launcher without discarding the current in-memory game.
@@ -960,13 +1773,21 @@ impl App {
 
     /// Replace the view (e.g. the host published a new one). Clamps the
     /// selection to the new choice count.
-    pub fn set_view(&mut self, view: AppViewModel) {
+    pub fn set_view(&mut self, mut view: AppViewModel) {
         let previous_turn = self.view.status.turn;
         let count = view.choices.len();
         if count == 0 {
             self.selected = 0;
         } else if self.selected >= count {
             self.selected = count - 1;
+        }
+        // Display rules also cover the choice surface — a throwaway rewrite
+        // of the incoming view copy; the engine view stays authoritative.
+        for choice in &mut view.choices {
+            choice.label = self.display_text(&choice.label).into_owned();
+            if let Some(preview) = &choice.preview {
+                choice.preview = Some(self.display_text(preview).into_owned());
+            }
         }
         self.view = view;
         if self.view.loading.is_some() {
@@ -982,6 +1803,8 @@ impl App {
         // sentinel: the renderer clamps it to the exact wrapped-line limit
         // for the current terminal size.
         if self.view.status.turn > previous_turn && previous_turn > 0 {
+            // A new turn retires the previous turn's automation guide/badge.
+            self.story_notice = None;
             self.narration_scroll = u16::MAX;
         } else if self.view.status.turn < previous_turn {
             self.narration_scroll = 0;
@@ -1026,18 +1849,23 @@ impl App {
         let previous_story_count = self.story_stack.len();
         self.initial_location = Some(initial_location.0.clone());
         let timeline = location_timeline(history, initial_location);
+        let emotions = emotion_timeline(history);
         self.history_items = history
             .iter()
             .rev()
             .map(|entry| {
                 let preview = entry.narration.lines().next().unwrap_or_default();
-                format!("턴 {} · {} — {}", entry.turn, entry.scene_id, preview)
+                // Display rules rewrite the row at the display boundary only
+                // — the engine history and the save stay authoritative.
+                let row = format!("턴 {} · {} — {}", entry.turn, entry.scene_id, preview);
+                self.display_text(&row).into_owned()
             })
             .collect();
         let stack = history
             .iter()
             .zip(timeline)
-            .map(|(entry, location)| StoryStackEntry {
+            .zip(emotions)
+            .map(|((entry, location), emotion)| StoryStackEntry {
                 turn: entry.turn,
                 scene_id: entry.scene_id.clone(),
                 model: self.generation_models.get(&entry.generation_id).cloned(),
@@ -1048,6 +1876,7 @@ impl App {
                     .map(|action| action.original_text.trim().to_string()),
                 narration: entry.narration.clone(),
                 location,
+                emotion,
             })
             .collect();
         self.replace_story_stack(stack);
@@ -1109,6 +1938,39 @@ impl App {
             self.handle_pack_delete_confirm_key(key);
             return None;
         }
+        if self.new_game_confirm {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                self.should_quit = true;
+                return None;
+            }
+            return match key.code {
+                KeyCode::Enter => {
+                    self.new_game_confirm = false;
+                    if self.new_game_confirm_from_home {
+                        // Home origin: replay the home arm — the guard lets
+                        // the from-home origin through; clear it afterwards
+                        // so a cancelled greeting picker re-asks next time.
+                        self.choose_home(0);
+                        self.new_game_confirm_from_home = false;
+                        None
+                    } else {
+                        Some(EngineCommand::StartNewGame)
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('n' | 'ㅜ') => {
+                    self.new_game_confirm = false;
+                    self.new_game_confirm_from_home = false;
+                    None
+                }
+                KeyCode::Char('q' | 'ㅂ') => {
+                    self.should_quit = true;
+                    self.new_game_confirm = false;
+                    self.new_game_confirm_from_home = false;
+                    None
+                }
+                _ => None,
+            };
+        }
         if self.pack_picker.is_some() {
             self.handle_pack_picker_key(key);
             return None;
@@ -1168,6 +2030,11 @@ impl App {
                     self.list_scroll = 0;
                     return None;
                 }
+                KeyCode::Char('p' | 'ㅔ') => {
+                    self.list_mode = Some(ListMode::Cast);
+                    self.list_scroll = 0;
+                    return None;
+                }
                 KeyCode::PageUp => self.list_scroll = self.list_scroll.saturating_sub(5),
                 KeyCode::PageDown => self.list_scroll = self.list_scroll.saturating_add(5),
                 KeyCode::Char('r' | 'ㄱ') if self.list_mode == Some(ListMode::ModelPicker) => {
@@ -1224,6 +2091,31 @@ impl App {
             return None;
         }
         if self.settings_visible {
+            // A modal owns the screen while open — every other settings key
+            // is absorbed until it closes.
+            if self.persona_dialog.is_some() {
+                self.handle_persona_dialog_key(key);
+                return None;
+            }
+            if self.author_note_dialog.is_some() {
+                self.handle_author_note_dialog_key(key);
+                return None;
+            }
+            if self.lorebook_dialog.is_some() {
+                self.handle_lorebook_dialog_key(key);
+                return None;
+            }
+            if self.prompt_viewer.is_some() {
+                match key.code {
+                    KeyCode::Esc => self.prompt_viewer = None,
+                    KeyCode::Up => self.scroll_prompt_viewer(-1),
+                    KeyCode::Down => self.scroll_prompt_viewer(1),
+                    KeyCode::PageUp => self.scroll_prompt_viewer(-10),
+                    KeyCode::PageDown => self.scroll_prompt_viewer(10),
+                    _ => {}
+                }
+                return None;
+            }
             match key.code {
                 KeyCode::Esc => {
                     // Keep the last safe settings projection. Esc only changes
@@ -1243,6 +2135,38 @@ impl App {
                 KeyCode::Char('i' | 'ㅑ') => {
                     self.images_toggle_requested = true;
                 }
+                // Same physical key under Korean 2-beolsik: g=ㅎ.
+                KeyCode::Char('g' | 'ㅎ') => {
+                    self.generation_toggle_requested = true;
+                }
+                // Same physical key under Korean 2-beolsik: f=ㄹ.
+                KeyCode::Char('f' | 'ㄹ') => {
+                    self.expressions_toggle_requested = true;
+                }
+                // Same physical key under Korean 2-beolsik: b=ㅠ.
+                KeyCode::Char('b' | 'ㅠ') => {
+                    self.image_backend_cycle_requested = true;
+                }
+                // Same physical key under Korean 2-beolsik: x=ㅌ.
+                KeyCode::Char('x' | 'ㅌ') => {
+                    self.sampling_style_cycle_requested = true;
+                }
+                // Same physical key under Korean 2-beolsik: a=ㅁ.
+                KeyCode::Char('a' | 'ㅁ') => {
+                    self.open_persona_dialog();
+                }
+                // Same physical key under Korean 2-beolsik: w=ㅈ.
+                KeyCode::Char('w' | 'ㅈ') => {
+                    self.open_lorebook_dialog();
+                }
+                // Same physical key under Korean 2-beolsik: t=ㅅ.
+                KeyCode::Char('t' | 'ㅅ') => {
+                    self.open_author_note_dialog();
+                }
+                // Same physical key under Korean 2-beolsik: r=ㄱ.
+                KeyCode::Char('r' | 'ㄱ') => {
+                    self.open_prompt_viewer();
+                }
                 KeyCode::Char('q' | 'ㅂ') => self.should_quit = true,
                 _ => {}
             }
@@ -1259,9 +2183,14 @@ impl App {
             return None;
         }
         // While a turn is being generated, choices must stay visually and
-        // logically fixed. Only cancellation and quitting remain available.
+        // logically fixed. Only cancellation, re-rolling the turn in flight
+        // (`r` → RegenerateCurrentTurn in map_key), and quitting remain
+        // available.
         if self.view.loading.is_some()
-            && !matches!(key.code, KeyCode::Char('c' | 'ㅊ' | 'q' | 'ㅂ'))
+            && !matches!(
+                key.code,
+                KeyCode::Char('c' | 'ㅊ' | 'q' | 'ㅂ' | 'r' | 'ㄱ')
+            )
             && !key.modifiers.contains(KeyModifiers::CONTROL)
         {
             return None;
@@ -1305,6 +2234,53 @@ impl App {
                     self.tts_toggle_requested = true;
                     return None;
                 }
+                // Same physical key under Korean 2-beolsik: w=ㅈ. Idle-only,
+                // like s/l/v — a turn in flight is absorbed above.
+                KeyCode::Char('w' | 'ㅈ') => {
+                    self.continue_requested = true;
+                    return None;
+                }
+                // Same physical key under Korean 2-beolsik: z=ㅋ. The host
+                // fetches a suggested action and feeds it back via
+                // `set_input_text`; nothing is sent on this key.
+                KeyCode::Char('z' | 'ㅋ') => {
+                    self.suggest_action_requested = true;
+                    return None;
+                }
+                // Same physical key under Korean 2-beolsik: g=ㅎ. Idle-only
+                // like w/z — the host issues the group-scene side generation.
+                KeyCode::Char('g' | 'ㅎ') => {
+                    self.group_scene_requested = true;
+                    return None;
+                }
+                // Same physical key under Korean 2-beolsik: p=ㅔ. Read-only
+                // cast roster, same list-overlay family as h/m.
+                KeyCode::Char('p' | 'ㅔ') => {
+                    self.list_mode = Some(ListMode::Cast);
+                    self.list_scroll = 0;
+                    return None;
+                }
+                // Variant cycling of the last committed turn: `[` = previous
+                // attempt, `]` = next. Brackets are layout-independent
+                // special keys, so there is NO Korean 2-beolsik alias (the
+                // keymap row notes it) — unlike letter keys.
+                KeyCode::Char('[') => {
+                    self.cycle_variant_back_requested = true;
+                    return None;
+                }
+                KeyCode::Char(']') => {
+                    self.cycle_variant_forward_requested = true;
+                    return None;
+                }
+                KeyCode::Char('n' | 'ㅜ') if self.view.status.turn > 0 => {
+                    // One accidental keypress must not wipe an in-progress
+                    // run — StartNewGame clears the rewind ring too, so undo
+                    // cannot recover it. Ask first. Before the opening
+                    // (turn 0) the guard fails and map_key starts directly.
+                    self.new_game_confirm = true;
+                    self.new_game_confirm_from_home = false;
+                    return None;
+                }
                 _ => {}
             }
         }
@@ -1319,6 +2295,14 @@ impl App {
             }
             KeyCode::Home if key.modifiers.contains(KeyModifiers::ALT) => {
                 self.narration_scroll = 0;
+                return None;
+            }
+            // Quick-action slots: fill the input from a configured text,
+            // never send. The ALT modifier keeps the bare digit row's direct
+            // choice-confirm untouched; digits are layout-independent, so no
+            // Korean alias is needed.
+            KeyCode::Char(c @ '1'..='9') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.quick_action_request = Some(c.to_string());
                 return None;
             }
             _ => {}
@@ -1347,6 +2331,25 @@ impl App {
             buffer.insert_str(text);
             return;
         }
+        if let Some(dialog) = self.persona_dialog.as_mut() {
+            let focused = match dialog.focus {
+                0 => &mut dialog.name,
+                _ => &mut dialog.persona,
+            };
+            focused.insert_str(text);
+            return;
+        }
+        if let Some(dialog) = self.author_note_dialog.as_mut() {
+            dialog.note.insert_str(text);
+            return;
+        }
+        if let Some(dialog) = self.lorebook_dialog.as_mut()
+            && let Some(edit) = dialog.edit.as_mut()
+        {
+            let (LorebookEdit::Content { buffer } | LorebookEdit::Keys { buffer }) = edit;
+            buffer.insert_str(text);
+            return;
+        }
         if self.input_mode {
             self.input.insert_str(text);
         }
@@ -1371,18 +2374,55 @@ impl App {
                 .story_stack
                 .iter()
                 .enumerate()
-                .map(|(index, entry)| story_entry_lines(entry, index == 0))
+                .map(|(index, entry)| {
+                    // Display rules rewrite a throwaway clone; the stack
+                    // entry itself stays authoritative.
+                    let mut entry = entry.clone();
+                    entry.narration = self.display_text(&entry.narration).into_owned();
+                    story_entry_lines(&entry, index == 0)
+                })
                 .collect();
             self.stack_lines_cache = Some((self.story_stack_version, lines));
         }
     }
 
+    /// Apply the display rules to a piece of transcript text. No rules means
+    /// a borrowed passthrough — the common case allocates nothing.
+    fn display_text<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, str> {
+        if self.display_rules.is_empty() {
+            return std::borrow::Cow::Borrowed(text);
+        }
+        let mut current = text.to_string();
+        for (pattern, replacement) in &self.display_rules {
+            if current.len() > 1_000_000 {
+                break; // pathological output growth: stop rewriting, keep showing
+            }
+            current = pattern
+                .replace_all(&current, replacement.as_str())
+                .into_owned();
+        }
+        std::borrow::Cow::Owned(current)
+    }
+
+    /// Install the host-compiled display rules (see
+    /// `[[display_rules]]` in user-settings.toml). Replaces any prior set.
+    pub fn set_display_rules(&mut self, rules: Vec<(regex::Regex, String)>) {
+        self.display_rules = rules;
+    }
+
     /// Blocks for the narration pane, in transcript order: a scene image
     /// before each turn whose location's image differs from the previous
-    /// turn's, then the turn's text.
+    /// turn's, an expression sprite before each turn whose emotion's sprite
+    /// differs, then the turn's text.
     fn story_blocks(&self) -> Vec<StoryBlock<'_>> {
+        let mut blocks: Vec<StoryBlock<'_>> = Vec::new();
+        // The dedupe key is the resolved SOURCE PATH, not the location or
+        // emotion id: a pack whose locations all fall back to the same
+        // character portrait must not repeat that portrait at every boundary,
+        // while genuinely different artwork always shows. A location without
+        // art breaks the run, so returning to imaged art shows it again.
+        let mut previous_source: Option<&std::path::PathBuf> = None;
         if self.story_stack.is_empty() {
-            let mut blocks: Vec<StoryBlock<'_>> = Vec::new();
             // The opening turn shows the initial location's image, if the
             // pack ships one — the transcript's first scene boundary.
             if self.images_enabled
@@ -1390,15 +2430,29 @@ impl App {
                 && let Some(Some(image)) = self.location_images.get(initial)
             {
                 blocks.push(StoryBlock::Image(&image.image));
+                previous_source = Some(&image.source);
+            }
+            // The opening narration's emotion is the first expression beat;
+            // it dedupes against the scene image above.
+            if self.expressions_enabled
+                && let Some(Some(image)) = self
+                    .expression_images
+                    .get(&classify_emotion(&self.view.narration))
+                && previous_source != Some(&image.source)
+            {
+                blocks.push(StoryBlock::Image(&image.image));
             }
             blocks.push(StoryBlock::Text(std::borrow::Cow::Owned(markdown_lines(
-                &self.view.narration,
+                &self.display_text(&self.view.narration),
             ))));
             if let Some(streaming) = self.streaming_narration.as_deref() {
+                let streaming = self.display_text(streaming).into_owned();
                 blocks.push(StoryBlock::Text(std::borrow::Cow::Owned(
-                    streaming_entry_lines(self.view.status.turn, streaming),
+                    streaming_entry_lines(self.view.status.turn, &streaming),
                 )));
             }
+            push_variant_badge(&mut blocks, self.view.variant_label.as_deref());
+            push_story_notice(&mut blocks, self.story_notice.as_deref());
             return blocks;
         }
         let cache = &self
@@ -1407,38 +2461,70 @@ impl App {
             .expect("fill_block_cache ran before story_blocks")
             .1;
         let mut blocks: Vec<StoryBlock<'_>> = Vec::with_capacity(cache.len() + 4);
-        // The dedupe key is the resolved SOURCE PATH, not the location id: a
-        // pack whose locations all fall back to the same character portrait
-        // must not repeat that portrait at every boundary, while genuinely
-        // different location artwork always shows. A location without art
-        // breaks the run, so returning to imaged art shows it again.
-        let mut previous_source: Option<&std::path::PathBuf> = None;
-        if !self.images_enabled {
+        if !self.images_enabled && !self.expressions_enabled {
             for lines in cache {
                 blocks.push(StoryBlock::Text(std::borrow::Cow::Borrowed(lines)));
             }
         } else {
+            // Two independent dedupe runs — scenery and expression each
+            // repeat only when their own visual actually changes — plus one
+            // shared rule: neither kind may repeat the source the other kind
+            // is currently showing (portrait-fallback collisions).
+            let mut scene_run: Option<&std::path::PathBuf> = None;
+            let mut expression_run: Option<&std::path::PathBuf> = None;
             for (entry, lines) in self.story_stack.iter().zip(cache) {
-                let resolved = entry
-                    .location
-                    .as_deref()
-                    .and_then(|location| self.location_images.get(location))
-                    .and_then(|resolved| resolved.as_ref());
-                let source = resolved.as_ref().map(|image| &image.source);
-                if let Some(image) = resolved
-                    && source != previous_source
-                {
-                    blocks.push(StoryBlock::Image(&image.image));
+                if self.images_enabled {
+                    let resolved = entry
+                        .location
+                        .as_deref()
+                        .and_then(|location| self.location_images.get(location))
+                        .and_then(|resolved| resolved.as_ref());
+                    if let Some(image) = resolved {
+                        if Some(&image.source) != scene_run && Some(&image.source) != expression_run
+                        {
+                            blocks.push(StoryBlock::Image(&image.image));
+                        }
+                        scene_run = Some(&image.source);
+                    } else {
+                        // No art at this boundary: break the scenery run so
+                        // returning to imaged art shows it again.
+                        scene_run = None;
+                    }
+                } else {
+                    scene_run = None;
                 }
-                previous_source = source;
+                if self.expressions_enabled {
+                    let sprite = self
+                        .expression_images
+                        .get(&entry.emotion)
+                        .and_then(|resolved| resolved.as_ref());
+                    match sprite {
+                        Some(image) => {
+                            if Some(&image.source) != expression_run
+                                && Some(&image.source) != scene_run
+                            {
+                                blocks.push(StoryBlock::Image(&image.image));
+                            }
+                            expression_run = Some(&image.source);
+                        }
+                        // No usable sprite this turn: break the expression
+                        // run so a returning sprite shows again.
+                        None => expression_run = None,
+                    }
+                } else {
+                    expression_run = None;
+                }
                 blocks.push(StoryBlock::Text(std::borrow::Cow::Borrowed(lines)));
             }
         }
         if let Some(streaming) = self.streaming_narration.as_deref() {
+            let streaming = self.display_text(streaming).into_owned();
             blocks.push(StoryBlock::Text(std::borrow::Cow::Owned(
-                streaming_entry_lines(self.view.status.turn, streaming),
+                streaming_entry_lines(self.view.status.turn, &streaming),
             )));
         }
+        push_variant_badge(&mut blocks, self.view.variant_label.as_deref());
+        push_story_notice(&mut blocks, self.story_notice.as_deref());
         blocks
     }
 
@@ -1507,6 +2593,9 @@ impl App {
                 .unwrap_or("");
             crate::screens::pack::render_pack_delete_confirm(frame, area, title);
         }
+        if self.new_game_confirm {
+            crate::screens::story::render_new_game_confirm(frame, area, self.view.status.turn);
+        }
     }
 
     fn render_base(&mut self, frame: &mut Frame, area: Rect) {
@@ -1560,9 +2649,14 @@ impl App {
                 render_provider_picker(frame, area, &self.provider_items, self.provider_selected);
                 return;
             }
-            let items = match mode {
+            let cast_items;
+            let items: &[String] = match mode {
                 ListMode::History => &self.history_items,
                 ListMode::Memory => &self.memory_items,
+                ListMode::Cast => {
+                    cast_items = self.cast_roster_rows();
+                    &cast_items
+                }
                 ListMode::ModelPicker | ListMode::ProviderPicker => unreachable!("rendered above"),
             };
             render_list(frame, area, mode, items, self.list_scroll);
@@ -1586,10 +2680,64 @@ impl App {
                     tts_voice: settings.tts.voice.clone(),
                     images_enabled: settings.images_enabled,
                     image_backend: settings.image_backend.clone(),
+                    image_backend_manual: settings.image_backend_manual,
+                    use_director_writer: settings.use_director_writer,
+                    expressions_enabled: settings.expressions_enabled,
+                    sampling_style: &settings.sampling_style,
+                    persona_label: &settings.persona_label,
                     theme_name: "default",
                     returns_home: self.settings_returns_home,
                 },
             );
+            // The persona modal draws last so it overlays the settings screen.
+            if let Some(dialog) = self.persona_dialog.as_ref() {
+                let name = dialog.name.split_at_cursor();
+                let persona = dialog.persona.split_at_cursor();
+                crate::screens::settings::render_persona_dialog(
+                    frame,
+                    area,
+                    (&name.0, &name.1),
+                    (&persona.0, &persona.1),
+                    dialog.focus,
+                );
+            }
+            // The other settings modals draw last so they overlay the screen.
+            if let Some(dialog) = self.author_note_dialog.as_ref() {
+                let note = dialog.note.split_at_cursor();
+                crate::screens::settings::render_author_note_dialog(
+                    frame,
+                    area,
+                    (&note.0, &note.1),
+                );
+            }
+            if let Some(dialog) = self.lorebook_dialog.as_ref() {
+                let edit = dialog.edit.as_ref().map(|edit| {
+                    let (label, buffer) = match edit {
+                        LorebookEdit::Content { buffer } => ("내용", buffer),
+                        LorebookEdit::Keys { buffer } => ("키", buffer),
+                    };
+                    let (before, after) = buffer.split_at_cursor();
+                    (label, before, after)
+                });
+                crate::screens::settings::render_lorebook_dialog(
+                    frame,
+                    area,
+                    &dialog.entries,
+                    dialog.selected,
+                    dialog.persisted,
+                    edit.as_ref()
+                        .map(|(label, before, after)| (*label, before.as_str(), after.as_str())),
+                );
+            }
+            if let (Some(preview), Some(scroll)) = (&self.prompt_preview, self.prompt_viewer) {
+                crate::screens::settings::render_prompt_viewer(
+                    frame,
+                    area,
+                    &preview.system,
+                    &preview.user,
+                    scroll,
+                );
+            }
             return;
         }
         self.fill_block_cache();
@@ -1636,6 +2784,12 @@ impl App {
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             let area = self.last_render_area.get();
+
+            // 0. The new-game confirm owns the screen: clicks must not drive
+            // the story (footer undo/home/...) from behind the modal.
+            if self.new_game_confirm {
+                return;
+            }
 
             // 1. Import dialog is keyboard-focused for path input.
             if self.import_dialog.is_some() {
@@ -1793,6 +2947,15 @@ impl App {
                             self.mouse_command = Some(EngineCommand::RegenerateChoices);
                         }
                     }
+                    StoryFooterAction::Undo => {
+                        if self.view.loading.is_none()
+                            && self.view.error.is_none()
+                            && let Some(checkpoint_id) = self.view.undo_checkpoint_id
+                        {
+                            self.mouse_command =
+                                Some(EngineCommand::RestoreCheckpoint { checkpoint_id });
+                        }
+                    }
                     StoryFooterAction::Help => {
                         self.help_visible = true;
                     }
@@ -1803,15 +2966,7 @@ impl App {
                                 self.input_mode = false;
                                 self.input.clear();
                                 self.mouse_command = Some(EngineCommand::SubmitFreeAction {
-                                    action: Box::new(ParsedAction {
-                                        action_type: ActionType::GeneralAction,
-                                        target: None,
-                                        intent: None,
-                                        tone: None,
-                                        content: text.trim().to_string(),
-                                        original_text: text,
-                                        confidence: Some(0.0),
-                                    }),
+                                    action: Box::new(self.parsed_free_action(&text)),
                                 });
                             }
                         }
@@ -1955,6 +3110,15 @@ impl App {
     fn choose_home(&mut self, selection: usize) {
         match selection {
             0 => {
+                // The destructive default row: with a run in progress, a
+                // stray Enter (or click, or `n`) on the home menu must not
+                // reset it — same confirm modal as the in-game `n`. The
+                // from-home origin replays this exact arm after Enter.
+                if self.view.status.turn > 0 && !self.new_game_confirm_from_home {
+                    self.new_game_confirm = true;
+                    self.new_game_confirm_from_home = true;
+                    return;
+                }
                 // Alternate openings gate the start — but with a single
                 // option there is nothing to choose; skip the modal.
                 if self.greetings.len() > 1 {
@@ -2007,15 +3171,7 @@ impl App {
                 self.input_mode = false;
                 self.input.clear();
                 return Some(EngineCommand::SubmitFreeAction {
-                    action: Box::new(ParsedAction {
-                        action_type: ActionType::GeneralAction,
-                        target: None,
-                        intent: None,
-                        tone: None,
-                        content: text.trim().to_string(),
-                        original_text: text,
-                        confidence: Some(0.0),
-                    }),
+                    action: Box::new(self.parsed_free_action(&text)),
                 });
             }
             KeyCode::Backspace => self.input.backspace(),
@@ -2076,6 +3232,10 @@ impl App {
             EngineCommand::CancelGeneration { .. } => {
                 pending.map(|gid| EngineCommand::CancelGeneration { generation_id: gid })
             }
+            EngineCommand::RestoreCheckpoint { checkpoint_id } if checkpoint_id.is_nil() => self
+                .view
+                .undo_checkpoint_id
+                .map(|id| EngineCommand::RestoreCheckpoint { checkpoint_id: id }),
             other => Some(other),
         }
     }
@@ -2104,6 +3264,237 @@ pub fn location_timeline(
         .collect()
 }
 
+/// Narration cues per [`Emotion`], Korean-led with a few English cues. Table
+/// order is the tie-break order when two emotions score equally.
+///
+/// This is the zero-inference stand-in for SillyTavern's separate classifier
+/// model: a weak local setup pays no extra generation for expression
+/// sprites, and the worst case of a miss is "no sprite / neutral", never
+/// wrong story state.
+const EMOTION_CUES: &[(Emotion, &[&str])] = &[
+    (
+        Emotion::Happy,
+        &[
+            "기쁘",
+            "즐거",
+            "행복",
+            "환한 미소",
+            "방긋",
+            "신나",
+            "웃음",
+            "smiles",
+        ],
+    ),
+    (
+        Emotion::Sad,
+        &[
+            "슬프",
+            "슬픈",
+            "눈물",
+            "울먹",
+            "씁쓸",
+            "가라앉",
+            "서러",
+            "먹먹",
+            "흐느",
+            "tears",
+        ],
+    ),
+    (
+        Emotion::Angry,
+        &[
+            "분노",
+            "노기",
+            "성난",
+            "화를 내",
+            "화가 나",
+            "째려",
+            "이를 갈",
+            "snaps",
+        ],
+    ),
+    (
+        Emotion::Anxious,
+        &[
+            "불안",
+            "초조",
+            "긴장",
+            "걱정",
+            "조마조마",
+            "떨리는 숨",
+            "restless",
+        ],
+    ),
+    (
+        Emotion::Surprised,
+        &["놀라", "깜짝", "벌떡", "숨을 삼키", "눈을 동그랗", "gasps"],
+    ),
+    (
+        Emotion::Affectionate,
+        &[
+            "다정",
+            "애정",
+            "사랑",
+            "설렘",
+            "껴안",
+            "살갑",
+            "살며시 안",
+            "hugs",
+        ],
+    ),
+    (
+        Emotion::Cold,
+        &["차갑", "차가", "싸늘", "무심", "서늘", "냉랭", "coldly"],
+    ),
+    (
+        Emotion::Embarrassed,
+        &["붉어", "빨개", "부끄", "머쓱", "당황", "허둥", "blushes"],
+    ),
+    (
+        Emotion::Guilty,
+        &["죄책", "미안", "참회", "고개를 숙", "apolog"],
+    ),
+];
+
+/// Classify the dominant emotion of one narration passage. Pure keyword
+/// counting — no model call, fully deterministic. Highest hit count wins;
+/// equal scores resolve to the earlier table entry; no hits are `Neutral`.
+/// English cues must be lowercase (the haystack is lowercased once).
+pub fn classify_emotion(narration: &str) -> Emotion {
+    let haystack = narration.to_lowercase();
+    let mut best = (Emotion::Neutral, 0usize);
+    for (emotion, cues) in EMOTION_CUES {
+        let hits: usize = cues.iter().map(|cue| haystack.matches(cue).count()).sum();
+        if hits > best.1 {
+            best = (*emotion, hits);
+        }
+    }
+    best.0
+}
+
+/// Per-entry emotion after classifying each turn's narration in order.
+///
+/// Mirrors [`location_timeline`]: a pure function of the history, so the same
+/// fold reproduces the timeline after a save load. The opening turn is not
+/// part of the history — classify `App::view.narration` separately there.
+pub fn emotion_timeline(history: &[story_model::HistoryEntry]) -> Vec<Emotion> {
+    history
+        .iter()
+        .map(|entry| classify_emotion(&entry.narration))
+        .collect()
+}
+
+/// Korean label for a relationship stage (cast roster rows).
+fn relationship_stage_label(stage: RelationshipStage) -> &'static str {
+    match stage {
+        RelationshipStage::Stranger => "낯선 사이",
+        RelationshipStage::Acquaintance => "지인",
+        RelationshipStage::Friend => "친구",
+        RelationshipStage::CloseFriend => "절친",
+        RelationshipStage::RomanticInterest => "호감",
+        RelationshipStage::Partner => "연인",
+        RelationshipStage::Estranged => "소원",
+    }
+}
+
+/// Korean label for a dominant emotion (cast roster rows).
+fn emotion_label(emotion: Emotion) -> &'static str {
+    match emotion {
+        Emotion::Neutral => "중립",
+        Emotion::Happy => "기쁨",
+        Emotion::Sad => "슬픔",
+        Emotion::Angry => "분노",
+        Emotion::Anxious => "불안",
+        Emotion::Surprised => "놀람",
+        Emotion::Affectionate => "애정",
+        Emotion::Cold => "냉담",
+        Emotion::Embarrassed => "당황",
+        Emotion::Guilty => "죄책감",
+    }
+}
+
+/// Char-wise case-insensitive prefix check. Char-based (not byte-based) so a
+/// latin name matches regardless of case without any multi-byte slicing.
+fn starts_with_case_insensitive(text: &str, prefix: &str) -> bool {
+    text.chars().count() >= prefix.chars().count()
+        && text
+            .chars()
+            .zip(prefix.chars())
+            .all(|(a, b)| a.to_lowercase().eq(b.to_lowercase()))
+}
+
+/// Join keys for the keys-editor prefill: commas and backslashes inside a
+/// key are escaped, so the only bare commas in the edited string separate
+/// keys and `\,` round-trips a literal comma.
+fn join_lorebook_keys(keys: &[String]) -> String {
+    keys.iter()
+        .map(|key| key.replace('\\', "\\\\").replace(',', "\\,"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Parse the keys-editor text into keys: split on UNESCAPED commas only and
+/// unescape on submit — `\,` is a literal comma, `\\` one backslash, any
+/// other `\x` stays as typed. Items are trimmed; empty ones dropped. This is
+/// what lets a key like `카페, 뒷문` survive the modal.
+fn parse_lorebook_keys(text: &str) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut escaped = false;
+    for ch in text.chars() {
+        if escaped {
+            escaped = false;
+            match ch {
+                ',' | '\\' => current.push(ch),
+                _ => {
+                    current.push('\\');
+                    current.push(ch);
+                }
+            }
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == ',' {
+            let key = current.trim().to_string();
+            if !key.is_empty() {
+                keys.push(key);
+            }
+            current.clear();
+        } else {
+            current.push(ch);
+        }
+    }
+    if escaped {
+        // A dangling trailing backslash is kept literally.
+        current.push('\\');
+    }
+    let key = current.trim().to_string();
+    if !key.is_empty() {
+        keys.push(key);
+    }
+    keys
+}
+
+/// Append the recycled-turn variant badge ("변형 2/3") as one subtle line
+/// closing the narration blocks. `None` renders nothing — no badge, no row.
+fn push_variant_badge(blocks: &mut Vec<StoryBlock<'_>>, label: Option<&str>) {
+    if let Some(label) = label {
+        blocks.push(StoryBlock::Text(std::borrow::Cow::Owned(vec![Line::from(
+            Span::styled(label.to_string(), Styles::subtle()),
+        )])));
+    }
+}
+
+/// Append the host automation notice ("이전 세션을 이어요", "✎ 이어씀", …) as
+/// one subtle tail line, reusing the variant-badge surface. `None` renders
+/// nothing — no row, no layout shift.
+fn push_story_notice(blocks: &mut Vec<StoryBlock<'_>>, notice: Option<&str>) {
+    if let Some(notice) = notice {
+        blocks.push(StoryBlock::Text(std::borrow::Cow::Owned(vec![Line::from(
+            Span::styled(notice.to_string(), Styles::subtle()),
+        )])));
+    }
+}
+
 fn save_load_copy(state: &SaveLoadState) -> (&'static str, &'static str) {
     match (state.mode, state.overwrite_confirmation) {
         (SaveLoadMode::Save, true) => (
@@ -2125,7 +3516,10 @@ fn save_load_copy(state: &SaveLoadState) -> (&'static str, &'static str) {
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
-    use story_model::{ChoiceView, RiskLevel, Screen, StatusLine, TimeSlot};
+    use story_model::{
+        CharacterId, CharacterStatusView, ChoiceView, LoadingState, RelationshipStage, RiskLevel,
+        Screen, StatusLine, TimeSlot,
+    };
 
     fn sample_view(choices: usize) -> AppViewModel {
         AppViewModel {
@@ -2152,6 +3546,11 @@ mod tests {
             },
             loading: None,
             error: None,
+            undo_checkpoint_id: None,
+            variant_label: None,
+            cast: Vec::new(),
+            truncation: story_model::TruncationStatus::None,
+            empty_side_result: false,
         }
     }
 
@@ -2369,9 +3768,9 @@ mod tests {
         );
         let blocks = app.story_blocks();
         let streaming_visible = blocks.iter().any(|b| match b {
-            StoryBlock::Text(lines) => {
-                lines.iter().any(|l| l.to_string().contains("비가 조금씩 그쳤다."))
-            }
+            StoryBlock::Text(lines) => lines
+                .iter()
+                .any(|l| l.to_string().contains("비가 조금씩 그쳤다.")),
             _ => false,
         });
         assert!(
@@ -2465,7 +3864,7 @@ mod tests {
         app.set_lists(&history, &[], &initial);
 
         let picker = ratatui_image::picker::Picker::halfblocks();
-        app.set_image_picker(Some(picker));
+        app.set_image_picker(Some(picker), false);
         app.set_location_image(
             "cafe",
             Some((
@@ -2496,6 +3895,1110 @@ mod tests {
         assert_eq!(image_block_count(&mut app), 1, "re-enable is instant");
     }
 
+    #[test]
+    fn expression_sprite_inserts_on_emotion_change_and_dedupes() {
+        let mut app = halfblocks_app(1);
+        app.set_expression_image(
+            Emotion::Happy,
+            Some((
+                std::path::PathBuf::from("/pack/expressions/happy.png"),
+                image::DynamicImage::new_rgb8(16, 16),
+            )),
+        );
+        app.set_expression_image(
+            Emotion::Sad,
+            Some((
+                std::path::PathBuf::from("/pack/expressions/sad.png"),
+                image::DynamicImage::new_rgb8(16, 16),
+            )),
+        );
+
+        // Three turns: happy → sad → sad again. The repeat must not re-insert.
+        let mut first = history_entry(1, None);
+        first.narration = "유나는 환한 미소를 지었다.".to_string();
+        let mut second = history_entry(2, None);
+        second.narration = "그녀의 눈에 눈물이 맺혔다.".to_string();
+        let mut third = history_entry(3, None);
+        third.narration = "또다시 눈물이 맺혔다.".to_string();
+        app.set_lists(&[first, second, third], &[], &default_location());
+
+        assert_eq!(
+            image_block_count(&mut app),
+            2,
+            "happy + sad only; the consecutive sad dedupes"
+        );
+
+        // The `f` toggle hides sprite blocks but keeps the map warm.
+        app.set_expressions_enabled(false);
+        assert_eq!(image_block_count(&mut app), 0, "disabled hides sprites");
+        app.set_expressions_enabled(true);
+        assert_eq!(image_block_count(&mut app), 2, "re-enable is instant");
+    }
+
+    #[test]
+    fn expression_sprite_shares_the_scene_dedupe_key() {
+        let mut app = halfblocks_app(1);
+        // Portrait fallback: the scene boundary AND the happy sprite resolve
+        // to the SAME file — only one may render.
+        let portrait = std::path::PathBuf::from("/pack/characters/yuna.png");
+        app.set_location_image(
+            "cafe",
+            Some((portrait.clone(), image::DynamicImage::new_rgb8(16, 16))),
+        );
+        app.set_expression_image(
+            Emotion::Happy,
+            Some((portrait, image::DynamicImage::new_rgb8(16, 16))),
+        );
+
+        let mut turn = history_entry(1, Some("cafe"));
+        turn.narration = "유나는 환한 미소를 지었다.".to_string();
+        app.set_lists(&[turn], &[], &default_location());
+
+        assert_eq!(
+            image_block_count(&mut app),
+            1,
+            "the portrait-fallback sprite must not repeat the scene image"
+        );
+    }
+
+    #[test]
+    fn opening_narration_drives_the_first_expression_beat() {
+        let mut app = halfblocks_app(1);
+        app.set_expression_image(
+            Emotion::Sad,
+            Some((
+                std::path::PathBuf::from("/pack/expressions/sad.png"),
+                image::DynamicImage::new_rgb8(16, 16),
+            )),
+        );
+        app.view.narration = "그녀의 눈에 눈물이 맺혔다.".to_string();
+        assert_eq!(
+            image_block_count(&mut app),
+            1,
+            "the empty-stack opening classifies its narration"
+        );
+    }
+
+    #[test]
+    fn settings_f_key_requests_the_expression_toggle_once() {
+        let mut app = halfblocks_app(1);
+        app.handle_key(key(KeyCode::Char('o')), None);
+        app.handle_key(key(KeyCode::Char('f')), None);
+        assert!(app.take_expressions_toggle_request(), "toggle requested");
+        assert!(
+            !app.take_expressions_toggle_request(),
+            "request is consumed"
+        );
+
+        // Korean 2-beolsik ㄹ hits the same physical key branch.
+        app.handle_key(key(KeyCode::Char('ㄹ')), None);
+        assert!(app.take_expressions_toggle_request());
+    }
+
+    #[test]
+    fn settings_b_key_requests_the_backend_cycle_once() {
+        let mut app = halfblocks_app(1);
+        app.handle_key(key(KeyCode::Char('o')), None);
+        app.handle_key(key(KeyCode::Char('b')), None);
+        assert!(app.take_image_backend_cycle_request(), "cycle requested");
+        assert!(
+            !app.take_image_backend_cycle_request(),
+            "request is consumed"
+        );
+
+        // Korean 2-beolsik ㅠ hits the same physical key branch.
+        app.handle_key(key(KeyCode::Char('ㅠ')), None);
+        assert!(app.take_image_backend_cycle_request());
+    }
+
+    #[test]
+    fn settings_screen_renders_the_forced_backend_marker() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use unicode_width::UnicodeWidthStr;
+
+        let mut app = halfblocks_app(1);
+        // Player-forced protocol (Settings `b` cycle): the marker must reach
+        // the screen through the real App → SettingsView projection, not a
+        // hand-built view.
+        app.set_image_picker(Some(ratatui_image::picker::Picker::halfblocks()), true);
+        app.set_settings(
+            ProviderConfigSafe {
+                base_url: "http://127.0.0.1:8000".to_string(),
+                model: "a".to_string(),
+                director_model: None,
+                choice_model: None,
+                writer_model: None,
+                structured_output: "auto".to_string(),
+                request_timeout_ms: 1_000,
+                connect_timeout_ms: 1_000,
+                max_retries: 0,
+                is_loopback: true,
+            },
+            ProviderHealth::Ready,
+            0.8,
+            0.9,
+            40,
+            1_800,
+            TtsDisplay {
+                enabled: true,
+                backend: "say".to_string(),
+                voice: None,
+            },
+            true,
+            app.image_backend_label(),
+            false,
+            true,
+            "자동".to_string(),
+            "없음".to_string(),
+            String::new(),
+            String::new(),
+        );
+        app.settings_visible = true;
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).expect("terminal");
+        terminal
+            .draw(|frame| app.render(frame, frame.area()))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buffer.area.height {
+            let mut previous_was_wide = false;
+            for x in 0..buffer.area.width {
+                let symbol = buffer[(x, y)].symbol();
+                if previous_was_wide && symbol == " " {
+                    previous_was_wide = false;
+                    continue;
+                }
+                previous_was_wide = symbol.width() == 2;
+                out.push_str(symbol);
+            }
+            out.push('\n');
+        }
+        assert!(
+            out.contains("halfblocks (수동)"),
+            "forced-protocol marker missing from the settings screen:\n{out}"
+        );
+    }
+
+    /// An App with a settings projection in place, so the settings key
+    /// branch (and the persona modal prefill) has data to work with.
+    fn settings_app() -> App {
+        let mut app = halfblocks_app(1);
+        app.set_settings(
+            ProviderConfigSafe {
+                base_url: "http://127.0.0.1:8000".to_string(),
+                model: "a".to_string(),
+                director_model: None,
+                choice_model: None,
+                writer_model: None,
+                structured_output: "auto".to_string(),
+                request_timeout_ms: 1_000,
+                connect_timeout_ms: 1_000,
+                max_retries: 0,
+                is_loopback: true,
+            },
+            ProviderHealth::Ready,
+            0.85,
+            0.92,
+            40,
+            1_800,
+            TtsDisplay {
+                enabled: false,
+                backend: "say".to_string(),
+                voice: None,
+            },
+            true,
+            app.image_backend_label(),
+            false,
+            true,
+            "자동".to_string(),
+            "없음".to_string(),
+            "민준".to_string(),
+            String::new(),
+        );
+        app.settings_visible = true;
+        app
+    }
+
+    #[test]
+    fn display_rules_rewrite_transcript_display_only() {
+        let mut app = App::new(sample_view(1));
+        app.set_display_rules(vec![(
+            regex::Regex::new(r"\d+").expect("pattern"),
+            "N".to_string(),
+        )]);
+
+        // The direct text path (opening turn / streaming) applies the rules.
+        assert_eq!(app.display_text("42개의 숫자 7"), "N개의 숫자 N");
+        // No rules = borrowed passthrough.
+        let bare = App::new(sample_view(1));
+        assert!(matches!(
+            bare.display_text("그대로"),
+            std::borrow::Cow::Borrowed("그대로")
+        ));
+
+        // The cached transcript path applies them too — but the stack entry
+        // itself stays authoritative.
+        app.replace_story_stack(vec![StoryStackEntry {
+            turn: 1,
+            scene_id: "scene-1".to_string(),
+            model: None,
+            generation_secs: None,
+            player_action: Some("문을 연다".to_string()),
+            narration: "온도는 21도였다.".to_string(),
+            location: Some("교실".to_string()),
+            emotion: Emotion::Neutral,
+        }]);
+        app.fill_block_cache();
+        let cache = &app.stack_lines_cache.as_ref().expect("cache").1;
+        let rendered: String = cache[0]
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<String>();
+        assert!(
+            rendered.contains("온도는 N도였다"),
+            "rules applied: {rendered}"
+        );
+        assert!(!rendered.contains("21"));
+        assert_eq!(app.story_stack[0].narration, "온도는 21도였다.");
+    }
+
+    #[test]
+    fn history_items_get_display_rules_applied() {
+        let mut app = App::new(sample_view(1));
+        app.set_display_rules(vec![(
+            regex::Regex::new("유나").expect("pattern"),
+            "주인공".to_string(),
+        )]);
+        let mut entry = history_entry(1, None);
+        entry.narration = "유나는 창가에 앉았다.".to_string();
+        app.set_lists(&[entry], &[], &default_location());
+
+        // The `h` list row goes through the same display boundary.
+        assert!(
+            app.history_items[0].contains("주인공는 창가에 앉았다"),
+            "rules applied to the history row: {:?}",
+            app.history_items[0]
+        );
+        assert!(!app.history_items[0].contains("유나"));
+        // The transcript stack keeps the raw narration — rules are display
+        // only.
+        assert_eq!(app.story_stack[0].narration, "유나는 창가에 앉았다.");
+    }
+
+    #[test]
+    fn lorebook_edits_wait_out_a_generation_before_reaching_the_host() {
+        let mut app = settings_app();
+        app.set_lorebook_data(&[lore_entry("e1", &["카페"], "오래된 피아노")], false);
+        app.handle_key(key(KeyCode::Char('w')), None);
+        app.handle_key(key(KeyCode::Char(' ')), None);
+        app.handle_key(key(KeyCode::Esc), None);
+
+        // While a turn generates, the engine would drop the hot-swap — the
+        // host must not see the edit yet, and it must not be lost either.
+        let mut view = sample_view(1);
+        view.loading = Some(LoadingState {
+            generation_id: Uuid::nil(),
+            message_ko: "생성 중".to_string(),
+        });
+        app.view = view;
+        assert!(
+            app.take_lorebook_request().is_none(),
+            "loading holds the edit"
+        );
+
+        // Settled: the same edit reaches the host exactly once.
+        app.view = sample_view(1);
+        let entries = app.take_lorebook_request().expect("edit survives loading");
+        assert!(!entries[0].enabled);
+        assert!(app.take_lorebook_request().is_none(), "consumed once");
+    }
+
+    #[test]
+    fn display_rules_cover_choice_labels_and_previews() {
+        let mut app = App::new(sample_view(1));
+        app.set_display_rules(vec![(
+            regex::Regex::new(r"\d+").expect("pattern"),
+            "N".to_string(),
+        )]);
+        let mut view = sample_view(2);
+        view.choices[1].preview = Some("3번 문으로".to_string());
+        app.set_view(view);
+        assert_eq!(app.view.choices[0].label, "선택 N");
+        assert_eq!(app.view.choices[1].label, "선택 N");
+        assert_eq!(app.view.choices[1].preview.as_deref(), Some("N번 문으로"));
+    }
+
+    #[test]
+    fn prompt_viewer_scroll_clamp_counts_wrapped_rows() {
+        let mut app = App::new(sample_view(1));
+        // One long user line that wraps far beyond the popup width.
+        let long = "긴 문장이 이어집니다 ".repeat(200);
+        app.set_prompt_preview("시스템 지침", &long);
+        app.open_prompt_viewer();
+        assert!(app.prompt_viewer.is_some());
+        // The clamp reads the last render area for the popup geometry — the
+        // standard 80×24 screen here.
+        app.last_render_area
+            .set(ratatui::layout::Rect::new(0, 0, 80, 24));
+
+        for _ in 0..60 {
+            app.scroll_prompt_viewer(10);
+        }
+        let (width, height) =
+            crate::screens::settings::prompt_viewer_frame(ratatui::layout::Rect::new(0, 0, 80, 24));
+        let lines = crate::screens::settings::prompt_viewer_body_lines("시스템 지침", &long);
+        let total_rows =
+            crate::screens::story::wrapped_line_count(&lines, width.saturating_sub(2)) as i32;
+        let expected_max = total_rows.saturating_sub(height.saturating_sub(2) as i32);
+        assert!(
+            expected_max > lines.len() as i32,
+            "wrapped rows exceed logical rows in this scenario"
+        );
+        assert_eq!(
+            app.prompt_viewer.unwrap(),
+            expected_max as u16,
+            "scrolling reaches the wrapped tail, not the logical-line count"
+        );
+        // Scrolling back up still bottoms out at zero.
+        for _ in 0..60 {
+            app.scroll_prompt_viewer(-30);
+        }
+        assert_eq!(app.prompt_viewer.unwrap(), 0);
+    }
+
+    #[test]
+    fn settings_x_cycles_the_sampling_style_request() {
+        let mut app = settings_app();
+        app.handle_key(key(KeyCode::Char('x')), None);
+        assert!(
+            app.take_sampling_style_cycle_request(),
+            "x requests a cycle"
+        );
+        assert!(
+            !app.take_sampling_style_cycle_request(),
+            "request is consumed"
+        );
+
+        // Korean 2-beolsik ㅌ hits the same physical key branch.
+        app.handle_key(key(KeyCode::Char('ㅌ')), None);
+        assert!(app.take_sampling_style_cycle_request());
+    }
+
+    #[test]
+    fn settings_a_opens_the_persona_dialog_prefilled() {
+        let mut app = settings_app();
+        app.handle_key(key(KeyCode::Char('a')), None);
+        // The modal prefill comes from the effective identity, not blanks.
+        app.handle_key(key(KeyCode::Enter), None);
+        assert_eq!(
+            app.take_persona_submit_request(),
+            Some(("민준".to_string(), String::new())),
+            "submitting untouched keeps the shown identity"
+        );
+
+        app.handle_key(key(KeyCode::Char('a')), None);
+        app.handle_key(key(KeyCode::Esc), None);
+        assert_eq!(app.take_persona_submit_request(), None, "Esc cancels");
+    }
+
+    #[test]
+    fn persona_dialog_edits_focuses_and_submits_raw_text() {
+        let mut app = settings_app();
+        app.handle_key(key(KeyCode::Char('a')), None);
+        // Replace the prefilled name: backspace it away, then type a new one.
+        app.handle_key(key(KeyCode::Backspace), None);
+        app.handle_key(key(KeyCode::Backspace), None);
+        app.handle_key(key(KeyCode::Char('레')), None);
+        app.handle_key(key(KeyCode::Char('오')), None);
+        app.handle_key(key(KeyCode::Tab), None);
+        app.handle_key(key(KeyCode::Char('조')), None);
+        app.handle_key(key(KeyCode::Char('용')), None);
+        app.handle_key(key(KeyCode::Enter), None);
+        assert_eq!(
+            app.take_persona_submit_request(),
+            Some(("레오".to_string(), "조용".to_string())),
+        );
+        assert!(
+            app.persona_dialog.is_none(),
+            "the modal closes after a submit"
+        );
+    }
+
+    #[test]
+    fn persona_dialog_absorbs_other_settings_keys_and_paste() {
+        let mut app = settings_app();
+        app.handle_key(key(KeyCode::Char('a')), None);
+        // While the modal is open, settings shortcuts must not fire — their
+        // characters land in the focused text field instead.
+        app.handle_key(key(KeyCode::Char('i')), None);
+        assert!(!app.take_images_toggle_request());
+        app.handle_key(key(KeyCode::Char('x')), None);
+        assert!(!app.take_sampling_style_cycle_request());
+        // Paste lands in the focused field too.
+        app.handle_paste("관찰자");
+        app.handle_key(key(KeyCode::Tab), None);
+        app.handle_key(key(KeyCode::Enter), None);
+        assert_eq!(
+            app.take_persona_submit_request(),
+            Some(("민준ix관찰자".to_string(), String::new())),
+        );
+    }
+
+    #[test]
+    fn persona_modal_renders_over_the_settings_screen() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use unicode_width::UnicodeWidthStr;
+
+        let mut app = settings_app();
+        app.handle_key(key(KeyCode::Char('a')), None);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+        terminal
+            .draw(|frame| app.render(frame, frame.area()))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buffer.area.height {
+            let mut previous_was_wide = false;
+            for x in 0..buffer.area.width {
+                let symbol = buffer[(x, y)].symbol();
+                if previous_was_wide && symbol == " " {
+                    previous_was_wide = false;
+                    continue;
+                }
+                previous_was_wide = symbol.width() == 2;
+                out.push_str(symbol);
+            }
+            out.push('\n');
+        }
+        assert!(
+            out.contains("페르소나") && out.contains("이름"),
+            "modal labels missing:\n{out}"
+        );
+        assert!(out.contains("▌"), "focused cursor cell missing:\n{out}");
+    }
+
+    /// Render the current app state at 80×24 into a plain string (wide-char
+    /// aware), for modal render assertions.
+    fn render_to_string(app: &mut App) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use unicode_width::UnicodeWidthStr;
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+        terminal
+            .draw(|frame| app.render(frame, frame.area()))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buffer.area.height {
+            let mut previous_was_wide = false;
+            for x in 0..buffer.area.width {
+                let symbol = buffer[(x, y)].symbol();
+                if previous_was_wide && symbol == " " {
+                    previous_was_wide = false;
+                    continue;
+                }
+                previous_was_wide = symbol.width() == 2;
+                out.push_str(symbol);
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// A minimal lorebook entry for dialog tests — only the edited fields
+    /// (keys/content/enabled) carry meaningful values.
+    fn lore_entry(id: &str, keys: &[&str], content: &str) -> story_model::LorebookEntry {
+        story_model::LorebookEntry {
+            id: id.to_string(),
+            keys: keys.iter().map(|key| key.to_string()).collect(),
+            secondary_keys: Vec::new(),
+            logic: story_model::LorebookLogic::AndAny,
+            content: content.to_string(),
+            constant: false,
+            enabled: true,
+            insertion_order: 100,
+            position: story_model::LorebookPosition::BeforeChar,
+            case_sensitive: false,
+            probability: 100,
+            priority: None,
+            comment: None,
+            prevent_recursion: false,
+            exclude_recursion: false,
+            sticky: 0,
+            cooldown: 0,
+            delay: 0,
+            vectorized: false,
+        }
+    }
+
+    #[test]
+    fn story_w_requests_continue_when_idle_and_is_absorbed_while_loading() {
+        let mut app = App::new(sample_view(2));
+        app.handle_key(key(KeyCode::Char('w')), None);
+        assert!(app.take_continue_request(), "w requests a continue");
+        assert!(!app.take_continue_request(), "request is consumed");
+        // Korean 2-beolsik ㅈ hits the same physical key branch.
+        app.handle_key(key(KeyCode::Char('ㅈ')), None);
+        assert!(app.take_continue_request());
+
+        // While a turn is in flight the key must be absorbed, not queued.
+        let mut view = sample_view(2);
+        view.loading = Some(LoadingState {
+            generation_id: Uuid::nil(),
+            message_ko: "생성 중".to_string(),
+        });
+        let mut app = App::new(view);
+        app.handle_key(key(KeyCode::Char('w')), None);
+        assert!(!app.take_continue_request(), "loading absorbs w");
+    }
+
+    #[test]
+    fn story_z_and_alt_digit_request_suggest_and_quick_actions() {
+        let mut app = App::new(sample_view(3));
+        app.handle_key(key(KeyCode::Char('z')), None);
+        assert!(app.take_suggest_action_request(), "z requests a suggest");
+        // Korean 2-beolsik ㅋ hits the same physical key branch.
+        app.handle_key(key(KeyCode::Char('ㅋ')), None);
+        assert!(app.take_suggest_action_request());
+
+        // Alt+1 names quick-action slot 1 for the host to fill.
+        let alt_one = KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT);
+        app.handle_key(alt_one, None);
+        assert_eq!(app.take_quick_action_request().as_deref(), Some("1"));
+        assert_eq!(app.take_quick_action_request(), None, "consumed once");
+
+        // A bare digit stays a direct choice confirm — no quick action.
+        let command = app.handle_key(key(KeyCode::Char('1')), None);
+        assert!(matches!(command, Some(EngineCommand::SubmitChoice { .. })));
+        assert_eq!(app.take_quick_action_request(), None);
+    }
+
+    fn cast_member(id: &str, name: &str) -> CharacterStatusView {
+        CharacterStatusView {
+            id: CharacterId(id.to_string()),
+            name: name.to_string(),
+            relationship_stage: RelationshipStage::Acquaintance,
+            current_emotion: Emotion::Neutral,
+            affection: 5,
+            trust: 1,
+            tension: 8,
+        }
+    }
+
+    #[test]
+    fn story_g_requests_group_scene_when_idle_and_is_absorbed_while_loading() {
+        let mut app = App::new(sample_view(2));
+        app.handle_key(key(KeyCode::Char('g')), None);
+        assert!(app.take_group_scene_request(), "g requests a group scene");
+        assert!(!app.take_group_scene_request(), "request is consumed once");
+        // Korean 2-beolsik ㅎ hits the same physical key branch.
+        app.handle_key(key(KeyCode::Char('ㅎ')), None);
+        assert!(app.take_group_scene_request());
+
+        // While a turn is in flight the key must be absorbed, not queued.
+        let mut view = sample_view(2);
+        view.loading = Some(LoadingState {
+            generation_id: Uuid::nil(),
+            message_ko: "생성 중".to_string(),
+        });
+        let mut app = App::new(view);
+        app.handle_key(key(KeyCode::Char('g')), None);
+        assert!(!app.take_group_scene_request(), "loading absorbs g");
+    }
+
+    #[test]
+    fn story_p_opens_the_cast_roster_overlay_and_esc_closes_it() {
+        let mut app = App::new(sample_view(2));
+        app.view.cast = vec![cast_member("yuna", "한유나"), cast_member("namu", "나무")];
+
+        app.handle_key(key(KeyCode::Char('p')), None);
+        assert_eq!(app.list_mode, Some(ListMode::Cast));
+        let rows = app.cast_roster_rows();
+        assert_eq!(
+            rows[0], "한유나 · 지인 · 중립 · 호감 5 / 신뢰 1 / 긴장 8",
+            "roster rows are 이름 · 관계단계 · 감정 · 호감/신뢰/긴장: {rows:?}"
+        );
+
+        app.handle_key(key(KeyCode::Esc), None);
+        assert_eq!(app.list_mode, None, "Esc closes the roster");
+
+        // Korean 2-beolsik ㅔ hits the same physical key branch.
+        app.handle_key(key(KeyCode::Char('ㅔ')), None);
+        assert_eq!(app.list_mode, Some(ListMode::Cast));
+
+        // While a turn is in flight the key is absorbed, like w/z.
+        let mut view = sample_view(2);
+        view.loading = Some(LoadingState {
+            generation_id: Uuid::nil(),
+            message_ko: "생성 중".to_string(),
+        });
+        let mut app = App::new(view);
+        app.handle_key(key(KeyCode::Char('p')), None);
+        assert_eq!(app.list_mode, None, "loading absorbs p");
+    }
+
+    #[test]
+    fn at_mention_free_input_pins_the_longest_cast_target_and_preserves_the_original_text() {
+        let mut app = App::new(sample_view(2));
+        app.view.cast = vec![
+            cast_member("yuna", "한유나"),
+            cast_member("short", "유나"),
+            cast_member("namu", "나무"),
+            cast_member("rin", "Rin"),
+        ];
+
+        // Submit `@한유나 안녕` via Enter in input mode.
+        app.input_mode = true;
+        app.input.clear();
+        app.input.insert_str("@한유나 안녕");
+        let command = app.handle_key(key(KeyCode::Enter), None);
+        let Some(EngineCommand::SubmitFreeAction { action }) = command else {
+            panic!("expected SubmitFreeAction, got {command:?}");
+        };
+        assert_eq!(
+            action.target.as_ref().map(|t| t.0.as_str()),
+            Some("yuna"),
+            "the longest matching cast member wins (한유나 over 유나)"
+        );
+        assert_eq!(action.original_text, "@한유나 안녕", "verbatim input");
+        assert_eq!(
+            action.content, "안녕",
+            "the mention is stripped from content"
+        );
+
+        // A shorter mention targets the shorter member.
+        app.input_mode = true;
+        app.input.clear();
+        app.input.insert_str("@유나 안녕");
+        let command = app.handle_key(key(KeyCode::Enter), None);
+        let Some(EngineCommand::SubmitFreeAction { action }) = command else {
+            panic!("expected SubmitFreeAction, got {command:?}");
+        };
+        assert_eq!(action.target.as_ref().map(|t| t.0.as_str()), Some("short"));
+
+        // Latin names match case-insensitively.
+        app.input_mode = true;
+        app.input.clear();
+        app.input.insert_str("@rin 앉아");
+        let command = app.handle_key(key(KeyCode::Enter), None);
+        let Some(EngineCommand::SubmitFreeAction { action }) = command else {
+            panic!("expected SubmitFreeAction, got {command:?}");
+        };
+        assert_eq!(action.target.as_ref().map(|t| t.0.as_str()), Some("rin"));
+        assert_eq!(action.original_text, "@rin 앉아");
+
+        // No match keeps today's shape: target None, content = trimmed text.
+        app.input_mode = true;
+        app.input.clear();
+        app.input.insert_str("@없는이 안녕");
+        let command = app.handle_key(key(KeyCode::Enter), None);
+        let Some(EngineCommand::SubmitFreeAction { action }) = command else {
+            panic!("expected SubmitFreeAction, got {command:?}");
+        };
+        assert!(action.target.is_none(), "unknown @name has no target");
+        assert_eq!(action.original_text, "@없는이 안녕");
+        assert_eq!(action.content, "@없는이 안녕");
+
+        // Plain free input without @ is unchanged too.
+        app.input_mode = true;
+        app.input.clear();
+        app.input.insert_str("기다려 본다");
+        let command = app.handle_key(key(KeyCode::Enter), None);
+        let Some(EngineCommand::SubmitFreeAction { action }) = command else {
+            panic!("expected SubmitFreeAction, got {command:?}");
+        };
+        assert!(action.target.is_none());
+        assert_eq!(action.original_text, "기다려 본다");
+        assert_eq!(action.content, "기다려 본다");
+    }
+
+    #[test]
+    fn story_brackets_request_variant_cycles_only_while_idle() {
+        let mut app = App::new(sample_view(2));
+        app.handle_key(key(KeyCode::Char('[')), None);
+        assert!(
+            app.take_cycle_variant_back_request(),
+            "[ requests the previous variant"
+        );
+        assert!(
+            !app.take_cycle_variant_back_request(),
+            "request is consumed"
+        );
+        app.handle_key(key(KeyCode::Char(']')), None);
+        assert!(
+            app.take_cycle_variant_forward_request(),
+            "] requests the next variant"
+        );
+        assert!(
+            !app.take_cycle_variant_forward_request(),
+            "request is consumed"
+        );
+
+        // While a turn is in flight the keys are absorbed, like w/z — the
+        // engine would reject a cycle mid-generation anyway.
+        let mut view = sample_view(2);
+        view.loading = Some(LoadingState {
+            generation_id: Uuid::nil(),
+            message_ko: "생성 중".to_string(),
+        });
+        let mut app = App::new(view);
+        app.handle_key(key(KeyCode::Char('[')), None);
+        app.handle_key(key(KeyCode::Char(']')), None);
+        assert!(!app.take_cycle_variant_back_request(), "loading absorbs [");
+        assert!(
+            !app.take_cycle_variant_forward_request(),
+            "loading absorbs ]"
+        );
+    }
+
+    #[test]
+    fn variant_badge_renders_from_the_view_label_and_vanishes_without_it() {
+        let mut app = App::new(sample_view(1));
+        assert!(
+            !blocks_text(&app).contains("변형"),
+            "no label, no badge row"
+        );
+
+        // The engine labels the recycled attempt now on display; the badge
+        // must show it verbatim.
+        app.view.variant_label = Some("변형 2/3".to_string());
+        assert!(
+            blocks_text(&app).contains("변형 2/3"),
+            "badge missing with a label set: {}",
+            blocks_text(&app)
+        );
+
+        // A committed canonical turn clears the label and the badge.
+        app.view.variant_label = None;
+        assert!(!blocks_text(&app).contains("변형"));
+    }
+
+    #[test]
+    fn story_notice_renders_at_80x24_without_clipping() {
+        // The full automation guide must survive the minimum size — it is
+        // the only feedback the auto-resume/auto-retry paths give.
+        let notices = [
+            "이전 세션을 이어요 — Alt+Home 홈",
+            "자동 재시도…(1/1)",
+            "잘림 — w로 이어쓰기",
+            "✎ 이어씀",
+            "빈 결과 — 다시 시도",
+        ];
+        for notice in notices {
+            let mut app = App::new(sample_view(1));
+            app.set_story_notice(Some(notice));
+            let out = render_to_string(&mut app);
+            assert!(
+                out.contains(notice),
+                "notice '{notice}' clipped or missing at 80x24:\n{out}"
+            );
+            assert_eq!(app.story_notice(), Some(notice));
+        }
+        // Cleared notice renders nothing.
+        let mut app = App::new(sample_view(1));
+        app.set_story_notice(Some("이전 세션을 이어요 — Alt+Home 홈"));
+        app.set_story_notice(None);
+        assert!(
+            !blocks_text(&app).contains("이전 세션"),
+            "no notice, no row"
+        );
+    }
+
+    #[test]
+    fn story_notice_coexists_with_the_variant_badge_and_clears_on_new_turn() {
+        let mut app = App::new(sample_view(1));
+        app.view.variant_label = Some("변형 2/3".to_string());
+        app.set_story_notice(Some("✎ 이어씀"));
+        let text = blocks_text(&app);
+        assert!(text.contains("변형 2/3"), "{text}");
+        assert!(text.contains("✎ 이어씀"), "{text}");
+
+        // A later committed turn retires the notice (set_view contract).
+        let mut next = sample_view(1);
+        next.status.turn = 2;
+        app.set_view(next);
+        assert_eq!(app.story_notice(), None);
+        assert!(!blocks_text(&app).contains("✎ 이어씀"));
+    }
+
+    #[test]
+    fn settings_t_opens_the_author_note_dialog_prefilled() {
+        let mut app = settings_app();
+        app.set_author_note("차분한 분위기를 유지한다");
+        app.handle_key(key(KeyCode::Char('t')), None);
+        // Enter on the untouched modal keeps the shown note.
+        app.handle_key(key(KeyCode::Enter), None);
+        assert_eq!(
+            app.take_author_note_submit(),
+            Some("차분한 분위기를 유지한다".to_string()),
+            "submitting untouched keeps the shown note"
+        );
+
+        // Korean 2-beolsik ㅅ opens the same modal; typed text is submitted
+        // trimmed. The prefill still mirrors the host-side note until the
+        // host applies the submission.
+        app.set_author_note("");
+        app.handle_key(key(KeyCode::Char('ㅅ')), None);
+        assert!(app.author_note_dialog.is_some(), "ㅅ opens the modal");
+        app.handle_key(key(KeyCode::Char('밤')), None);
+        app.handle_key(key(KeyCode::Enter), None);
+        assert_eq!(app.take_author_note_submit(), Some("밤".to_string()));
+
+        // An empty submit means "clear the note".
+        app.handle_key(key(KeyCode::Char('t')), None);
+        app.handle_key(key(KeyCode::Enter), None);
+        assert_eq!(
+            app.take_author_note_submit(),
+            Some(String::new()),
+            "empty submit clears the note"
+        );
+
+        // Esc cancels.
+        app.handle_key(key(KeyCode::Char('t')), None);
+        app.handle_key(key(KeyCode::Esc), None);
+        assert_eq!(app.take_author_note_submit(), None, "Esc cancels");
+    }
+
+    #[test]
+    fn settings_w_opens_the_lorebook_dialog_and_submits_dirty_edits() {
+        let mut app = settings_app();
+        // Before the host supplies data, `w` is a no-op.
+        app.handle_key(key(KeyCode::Char('w')), None);
+        assert!(app.lorebook_dialog.is_none(), "no data, no dialog");
+
+        app.set_lorebook_data(
+            &[
+                lore_entry("e1", &["성별", "gender"], "플레이어는 여성이다"),
+                lore_entry("e2", &["카페"], "카페에는 오래된 피아노가 있다"),
+            ],
+            false,
+        );
+        app.handle_key(key(KeyCode::Char('w')), None);
+        assert!(app.lorebook_dialog.is_some());
+
+        // Space toggles the first entry off; Enter opens the content editor
+        // for the (moved) second entry and submits an edit into it.
+        app.handle_key(key(KeyCode::Char(' ')), None);
+        app.handle_key(key(KeyCode::Down), None);
+        app.handle_key(key(KeyCode::Enter), None);
+        assert!(
+            app.lorebook_dialog
+                .as_ref()
+                .is_some_and(|d| d.edit.is_some())
+        );
+        app.handle_key(key(KeyCode::End), None);
+        app.handle_key(key(KeyCode::Char('수')), None);
+        app.handle_key(key(KeyCode::Char('정')), None);
+        app.handle_key(key(KeyCode::Enter), None);
+        assert!(
+            app.lorebook_dialog
+                .as_ref()
+                .is_some_and(|d| d.edit.is_none())
+        );
+
+        // Leaving the list while dirty hands over the FULL updated list.
+        app.handle_key(key(KeyCode::Esc), None);
+        assert!(app.lorebook_dialog.is_none(), "Esc closes the list");
+        let request = app.take_lorebook_request().expect("dirty close submits");
+        assert_eq!(request.len(), 2, "the full list is returned");
+        assert!(!request[0].enabled, "Space toggled enabled off");
+        assert_eq!(request[0].content, "플레이어는 여성이다");
+        assert_eq!(request[1].content, "카페에는 오래된 피아노가 있다수정");
+        assert_eq!(app.take_lorebook_request(), None, "consumed once");
+
+        // A clean close (no edits) submits nothing.
+        app.handle_key(key(KeyCode::Char('w')), None);
+        app.handle_key(key(KeyCode::Esc), None);
+        assert_eq!(app.take_lorebook_request(), None, "clean close is silent");
+    }
+
+    #[test]
+    fn lorebook_keys_edit_splits_on_commas_and_keeps_other_fields() {
+        let mut entry = lore_entry("e1", &["성별", "gender"], "플레이어는 여성이다");
+        entry.constant = true;
+        entry.insertion_order = 42;
+        let mut app = settings_app();
+        app.set_lorebook_data(&[entry], true);
+        app.handle_key(key(KeyCode::Char('w')), None);
+        app.handle_key(key(KeyCode::Char('k')), None);
+        // Clear the prefilled keys, then type a comma-separated list with
+        // stray spaces and an empty item.
+        for _ in 0.."성별, gender".chars().count() {
+            app.handle_key(key(KeyCode::Backspace), None);
+        }
+        for ch in "이름, 소속 ,".chars() {
+            app.handle_key(key(KeyCode::Char(ch)), None);
+        }
+        app.handle_key(key(KeyCode::Enter), None);
+        app.handle_key(key(KeyCode::Esc), None);
+        let request = app.take_lorebook_request().expect("keys edit is dirty");
+        assert_eq!(request.len(), 1);
+        assert_eq!(
+            request[0].keys,
+            vec!["이름".to_string(), "소속".to_string()]
+        );
+        // Untouched fields ride along unchanged.
+        assert!(request[0].constant);
+        assert_eq!(request[0].insertion_order, 42);
+        assert_eq!(request[0].content, "플레이어는 여성이다");
+        assert!(request[0].enabled);
+    }
+
+    #[test]
+    fn lorebook_keys_edit_round_trips_literal_commas() {
+        // A key CONTAINING a comma must survive open → submit untouched.
+        let entry = lore_entry("e1", &["카페, 뒷문", "정원"], "숨은 통로");
+        let mut app = settings_app();
+        app.set_lorebook_data(&[entry], true);
+        app.handle_key(key(KeyCode::Char('w')), None);
+        app.handle_key(key(KeyCode::Char('k')), None);
+        // The prefill escapes the embedded comma so it is not a separator.
+        assert!(
+            app.lorebook_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.edit.as_ref().is_some_and(|edit| matches!(
+                    edit,
+                    LorebookEdit::Keys { buffer }
+                        if buffer.text() == "카페\\, 뒷문, 정원"
+                ))),
+            "prefill escapes the literal comma"
+        );
+        app.handle_key(key(KeyCode::Enter), None);
+        app.handle_key(key(KeyCode::Esc), None);
+        let request = app.take_lorebook_request().expect("untouched submit");
+        assert_eq!(
+            request[0].keys,
+            vec!["카페, 뒷문".to_string(), "정원".to_string()],
+            "the comma key survives the modal"
+        );
+
+        // Typed escapes: `\,` stays inside its key, a bare comma separates.
+        let mut app = settings_app();
+        app.set_lorebook_data(&[lore_entry("e1", &["기존"], "교체 대상")], true);
+        app.handle_key(key(KeyCode::Char('w')), None);
+        app.handle_key(key(KeyCode::Char('k')), None);
+        for _ in 0.."기존".chars().count() {
+            app.handle_key(key(KeyCode::Backspace), None);
+        }
+        for ch in "뒷문\\, 지하\\, B1 , 창고".chars() {
+            app.handle_key(key(KeyCode::Char(ch)), None);
+        }
+        app.handle_key(key(KeyCode::Enter), None);
+        app.handle_key(key(KeyCode::Esc), None);
+        let request = app.take_lorebook_request().expect("typed escape submits");
+        assert_eq!(
+            request[0].keys,
+            vec!["뒷문, 지하, B1".to_string(), "창고".to_string()]
+        );
+    }
+
+    #[test]
+    fn lorebook_c_toggles_constant_and_p_cycles_probability_as_dirty_edits() {
+        let mut app = settings_app();
+        app.set_lorebook_data(&[lore_entry("e1", &["카페"], "오래된 피아노")], true);
+        app.handle_key(key(KeyCode::Char('w')), None);
+
+        // `p` walks the ladder 100 → 75, `c` pins the entry; the Korean
+        // 2-beolsik aliases hit the same arms.
+        app.handle_key(key(KeyCode::Char('p')), None);
+        app.handle_key(key(KeyCode::Char('c')), None);
+        app.handle_key(key(KeyCode::Char('ㅔ')), None);
+        app.handle_key(key(KeyCode::Char('ㅊ')), None);
+        app.handle_key(key(KeyCode::Esc), None);
+        let request = app.take_lorebook_request().expect("c/p edits are dirty");
+        assert_eq!(request[0].probability, 50, "100 → 75 → 50");
+        assert!(!request[0].constant, "c toggled the constant pin back off");
+        assert_eq!(app.take_lorebook_request(), None, "consumed once");
+
+        // The ladder wraps at its tail and an off-ladder value joins at 75.
+        let starts = [25, 100, 75, 50, 25, 100, 60, 75];
+        let expected = [100, 75, 50, 25, 100, 75, 75, 50];
+        for (probability, want) in starts.iter().zip(expected.iter()) {
+            let mut app = settings_app();
+            let mut entry = lore_entry("e1", &["카페"], "오래된 피아노");
+            entry.probability = *probability;
+            app.set_lorebook_data(&[entry], true);
+            app.handle_key(key(KeyCode::Char('w')), None);
+            app.handle_key(key(KeyCode::Char('p')), None);
+            app.handle_key(key(KeyCode::Esc), None);
+            let request = app.take_lorebook_request().expect("p edit is dirty");
+            assert_eq!(request[0].probability, *want, "cycle from {probability}");
+        }
+    }
+
+    #[test]
+    fn lorebook_modal_renders_entries_notices_and_empty_line() {
+        let mut app = settings_app();
+        app.set_lorebook_data(
+            &[
+                lore_entry("e1", &["성별", "gender"], "플레이어는 여성이다"),
+                lore_entry("e2", &["카페"], "카페에는 오래된 피아노가 있다"),
+            ],
+            false,
+        );
+        app.handle_key(key(KeyCode::Char('w')), None);
+        let out = render_to_string(&mut app);
+        assert!(out.contains("로어북"), "modal title missing:\n{out}");
+        assert!(
+            out.contains("세션 전용"),
+            "session-only notice missing:\n{out}"
+        );
+        assert!(out.contains("성별|gender"), "keys column missing:\n{out}");
+        assert!(out.contains("✔"), "enabled marker missing:\n{out}");
+        assert!(
+            out.contains("플레이어는 여성이다"),
+            "content missing:\n{out}"
+        );
+
+        // Empty data still opens, with the explicit "no entries" line.
+        let mut app = settings_app();
+        app.set_lorebook_data(&[], true);
+        app.handle_key(key(KeyCode::Char('w')), None);
+        let out = render_to_string(&mut app);
+        assert!(out.contains("엔트리 없음"), "empty line missing:\n{out}");
+    }
+
+    #[test]
+    fn settings_r_opens_the_prompt_viewer_only_after_capture() {
+        let mut app = settings_app();
+        app.handle_key(key(KeyCode::Char('r')), None);
+        assert!(app.prompt_viewer.is_none(), "no capture, no viewer");
+
+        app.set_prompt_preview("너는 감독이다.", "플레이어: 문을 두드린다");
+        app.handle_key(key(KeyCode::Char('r')), None);
+        assert!(app.prompt_viewer.is_some(), "capture opens the viewer");
+        // Esc closes; Korean 2-beolsik ㄱ reopens the same viewer.
+        app.handle_key(key(KeyCode::Esc), None);
+        assert!(app.prompt_viewer.is_none());
+        app.handle_key(key(KeyCode::Char('ㄱ')), None);
+        assert!(app.prompt_viewer.is_some());
+    }
+
+    #[test]
+    fn set_input_text_fills_the_input_and_opens_input_mode() {
+        let mut app = App::new(sample_view(2));
+        assert!(!app.input_mode);
+        app.set_input_text("문을 두드린다");
+        assert!(app.input_mode);
+        assert_eq!(app.input.text(), "문을 두드린다");
+        // The player sends it themselves — Enter goes through the normal
+        // free-action path, never an automatic submit.
+        let command = app.handle_key(key(KeyCode::Enter), None);
+        assert!(matches!(
+            command,
+            Some(EngineCommand::SubmitFreeAction { .. })
+        ));
+    }
+
     /// Count Image blocks the story pane would render for the current state.
     fn image_block_count(app: &mut App) -> usize {
         app.fill_block_cache();
@@ -2503,6 +5006,26 @@ mod tests {
             .iter()
             .filter(|block| matches!(block, StoryBlock::Image(_)))
             .count()
+    }
+
+    /// Concatenate the text of every story block (images contribute
+    /// nothing) — the narration pane's visible text, for assertions.
+    fn blocks_text(app: &App) -> String {
+        app.story_blocks()
+            .iter()
+            .map(|block| match block {
+                StoryBlock::Text(lines) => lines
+                    .iter()
+                    .map(|line| {
+                        line.spans
+                            .iter()
+                            .map(|span| span.content.as_ref())
+                            .collect::<String>()
+                    })
+                    .collect::<String>(),
+                StoryBlock::Image(_) => String::new(),
+            })
+            .collect()
     }
 
     fn default_location() -> story_model::LocationId {
@@ -2532,7 +5055,7 @@ mod tests {
 
     fn halfblocks_app(view_choices: usize) -> App {
         let mut app = App::new(sample_view(view_choices));
-        app.set_image_picker(Some(ratatui_image::picker::Picker::halfblocks()));
+        app.set_image_picker(Some(ratatui_image::picker::Picker::halfblocks()), false);
         app
     }
 
@@ -2555,6 +5078,56 @@ mod tests {
         );
         // Empty history → empty timeline; the opening comes from the seed.
         assert!(location_timeline(&[], &initial).is_empty());
+    }
+
+    #[test]
+    fn classify_emotion_maps_narration_keywords_to_emotions() {
+        let cases: &[(&str, Emotion)] = &[
+            ("유나는 환한 미소를 지으며 커피를 내밀었다.", Emotion::Happy),
+            ("그녀의 눈에 눈물이 맺혔다.", Emotion::Sad),
+            ("그는 화를 내며 책상을 쳤다.", Emotion::Angry),
+            ("불안한 마음을 감추려 앞만 보았다.", Emotion::Anxious),
+            ("깜짝 놀라 한 걸음 물러섰다.", Emotion::Surprised),
+            ("다정한 목소리로 이름을 불러주었다.", Emotion::Affectionate),
+            ("차가운 시선이 스쳐 지나갔다.", Emotion::Cold),
+            (
+                "볼이 붉어지고 부끄러워 고개를 돌렸다.",
+                Emotion::Embarrassed,
+            ),
+            ("죄책감에 미안하다는 말이 목에 걸렸다.", Emotion::Guilty),
+            // English cues match against the lowercased narration.
+            ("She smiles at the joke.", Emotion::Happy),
+            ("He hugs her tightly.", Emotion::Affectionate),
+            ("그녀는 조용히 창밖을 바라보았다.", Emotion::Neutral),
+        ];
+        for (text, want) in cases {
+            assert_eq!(classify_emotion(text), *want, "narration: {text}");
+        }
+    }
+
+    #[test]
+    fn classify_emotion_counts_hits_and_breaks_ties_by_table_order() {
+        // Sad scores 2 against Happy's 1 — majority wins.
+        assert_eq!(
+            classify_emotion("슬픈 눈물을 닦으며 억지 웃음을 지었다."),
+            Emotion::Sad
+        );
+        // Equal scores resolve to the earlier table entry (Happy precedes Sad).
+        assert_eq!(classify_emotion("웃음과 눈물"), Emotion::Happy);
+    }
+
+    #[test]
+    fn emotion_timeline_classifies_each_turn_narration() {
+        let mut first = history_entry(1, None);
+        first.narration = "그녀의 눈에 눈물이 맺혔다.".to_string();
+        let mut second = history_entry(2, None);
+        second.narration = "유나는 환한 미소를 지었다.".to_string();
+        let history = vec![first, second];
+        assert_eq!(
+            emotion_timeline(&history),
+            vec![Emotion::Sad, Emotion::Happy]
+        );
+        assert!(emotion_timeline(&[]).is_empty());
     }
 
     #[test]
@@ -2816,18 +5389,47 @@ mod tests {
     }
 
     #[test]
-    fn home_menu_emits_start_and_continue_requests() {
+    fn home_menu_defaults_to_continue_and_keeps_new_game_explicit() {
         let mut app = App::new(sample_view(0));
+        app.view.status.turn = 0;
         app.set_can_continue(true);
+        app.show_home();
+
+        // AC-2: with an autosave the default cursor is the 이어하기 row.
+        assert!(app.can_continue);
+        app.handle_key(key(KeyCode::Enter), None);
+        assert_eq!(app.take_home_request(), Some(HomeRequest::Continue));
+
+        // 새 게임 stays an explicit selection: Up to row 0, then Enter.
+        app.show_home();
+        app.handle_key(key(KeyCode::Up), None);
+        app.handle_key(key(KeyCode::Enter), None);
+        assert_eq!(app.take_home_request(), Some(HomeRequest::StartNew));
+    }
+
+    #[test]
+    fn home_without_a_resume_keeps_the_new_game_default_cursor() {
+        let mut app = App::new(sample_view(0));
+        app.view.status.turn = 0;
+        app.set_can_continue(false);
         app.show_home();
 
         app.handle_key(key(KeyCode::Enter), None);
         assert_eq!(app.take_home_request(), Some(HomeRequest::StartNew));
+    }
 
+    #[test]
+    fn losing_the_resume_demotes_the_cursor_off_the_continue_row() {
+        let mut app = App::new(sample_view(0));
+        app.view.status.turn = 0;
+        app.set_can_continue(true);
+        assert!(app.can_continue);
+        // A pack switch (host-side set_can_continue(false)) must not leave
+        // the cursor on a row that no longer exists.
+        app.set_can_continue(false);
         app.show_home();
-        app.handle_key(key(KeyCode::Down), None);
         app.handle_key(key(KeyCode::Enter), None);
-        assert_eq!(app.take_home_request(), Some(HomeRequest::Continue));
+        assert_eq!(app.take_home_request(), Some(HomeRequest::StartNew));
     }
 
     #[test]
@@ -2867,6 +5469,12 @@ mod tests {
             },
             true,
             Some("halfblocks".to_string()),
+            false,
+            false,
+            "자동".to_string(),
+            "없음".to_string(),
+            String::new(),
+            String::new(),
         );
         app.show_home();
         app.handle_key(key(KeyCode::Down), None);
@@ -2943,6 +5551,12 @@ mod tests {
             },
             true,
             Some("halfblocks".to_string()),
+            false,
+            false,
+            "자동".to_string(),
+            "없음".to_string(),
+            String::new(),
+            String::new(),
         );
         app.show_home();
         app.handle_key(key(KeyCode::Down), None);
@@ -2956,6 +5570,265 @@ mod tests {
         app.handle_key(key(KeyCode::Down), None);
         app.handle_key(key(KeyCode::Enter), None);
         assert_eq!(app.take_selected_model().as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn u_key_resolves_the_view_undo_checkpoint() {
+        let mut app = App::new(sample_view(3));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('u')), None),
+            None,
+            "no undo target in the view: the key is a no-op"
+        );
+        let checkpoint_id = Uuid::new_v4();
+        app.view.undo_checkpoint_id = Some(checkpoint_id);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('u')), None),
+            Some(EngineCommand::RestoreCheckpoint { checkpoint_id })
+        );
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('ㅕ')), None),
+            Some(EngineCommand::RestoreCheckpoint { checkpoint_id }),
+            "korean layout resolves the same checkpoint"
+        );
+    }
+
+    #[test]
+    fn loading_and_error_block_the_undo_key() {
+        let mut app = App::new(sample_view(3));
+        app.view.undo_checkpoint_id = Some(Uuid::new_v4());
+        app.view.loading = Some(story_model::LoadingState {
+            generation_id: Uuid::nil(),
+            message_ko: "생성 중...".to_string(),
+        });
+        assert_eq!(app.handle_key(key(KeyCode::Char('u')), None), None);
+        app.view.loading = None;
+        app.view.error = Some(story_model::DomainErrorView {
+            code: "test".to_string(),
+            title_ko: "오류".to_string(),
+            message_ko: "재시도 필요".to_string(),
+            recoverable: true,
+        });
+        assert_eq!(app.handle_key(key(KeyCode::Char('u')), None), None);
+    }
+
+    #[test]
+    fn u_key_survives_a_resolved_ending_with_no_choices() {
+        // D1 regression: after an ending resolves, the engine clears the
+        // choices but the undo target (the pre-ending turn) stays offered.
+        // The keyboard path must match the footer/[U] click path here.
+        let mut app = App::new(sample_view(0));
+        let checkpoint_id = Uuid::new_v4();
+        app.view.choices = Vec::new();
+        app.view.undo_checkpoint_id = Some(checkpoint_id);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('u')), None),
+            Some(EngineCommand::RestoreCheckpoint { checkpoint_id })
+        );
+        // No target in the view (fresh game, save restore): the nil sentinel
+        // is dropped instead of reaching the engine.
+        app.view.undo_checkpoint_id = None;
+        assert_eq!(app.handle_key(key(KeyCode::Char('u')), None), None);
+    }
+
+    #[test]
+    fn n_key_asks_before_resetting_progress() {
+        let mut app = App::new(sample_view(3));
+        assert_eq!(app.view.status.turn, 1);
+        assert_eq!(app.handle_key(key(KeyCode::Char('n')), None), None);
+        assert!(app.new_game_confirm, "the confirm modal intercepts n");
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter), None),
+            Some(EngineCommand::StartNewGame),
+            "only an explicit Enter resets"
+        );
+        assert!(!app.new_game_confirm);
+
+        // Esc (or a repeated n) backs out without touching anything.
+        app.handle_key(key(KeyCode::Char('ㅜ')), None);
+        assert!(app.new_game_confirm);
+        assert_eq!(app.handle_key(key(KeyCode::Esc), None), None);
+        assert!(!app.new_game_confirm);
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn n_key_at_turn_zero_starts_immediately() {
+        let mut app = App::new(sample_view(3));
+        app.view.status.turn = 0;
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('n')), None),
+            Some(EngineCommand::StartNewGame),
+            "nothing to lose before the opening: no modal"
+        );
+        assert!(!app.new_game_confirm);
+    }
+
+    #[test]
+    fn r_key_rerolls_the_in_flight_turn_through_the_app_gate() {
+        // D1 regression: the loading key gate must pass `r`/`ㄱ` through to
+        // map_key, or the advertised [R] 다시 만들기 is a dead key.
+        let mut app = App::new(sample_view(3));
+        app.view.loading = Some(story_model::LoadingState {
+            generation_id: Uuid::nil(),
+            message_ko: "생성 중...".to_string(),
+        });
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Char('r')), Some(Uuid::nil())),
+            Some(EngineCommand::RegenerateCurrentTurn)
+        ));
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Char('ㄱ')), Some(Uuid::nil())),
+            Some(EngineCommand::RegenerateCurrentTurn)
+        ));
+        // The gate still absorbs unrelated keys while loading.
+        assert_eq!(app.handle_key(key(KeyCode::Char('h')), None), None);
+        assert!(app.list_mode.is_none());
+    }
+
+    #[test]
+    fn modal_blocks_mouse_behind_the_new_game_confirm() {
+        // D2 regression: clicks must not drive the story from behind the
+        // confirm modal (footer [U]/[Home]/... live underneath it).
+        let mut app = App::new(sample_view(3));
+        app.handle_key(key(KeyCode::Char('n')), None);
+        assert!(app.new_game_confirm);
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.new_game_confirm, "the modal stays up");
+        assert!(
+            app.take_mouse_command().is_none(),
+            "no engine command leaks from a click behind the modal"
+        );
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn home_new_game_asks_when_progress_exists() {
+        let mut app = App::new(sample_view(3));
+        assert_eq!(app.view.status.turn, 1);
+        app.home_visible = true;
+        app.home_selected = 0;
+        // Stray Enter on the destructive default row opens the confirm.
+        assert_eq!(app.handle_key(key(KeyCode::Enter), None), None);
+        assert!(app.new_game_confirm);
+        assert!(app.new_game_confirm_from_home);
+        assert!(app.home_request.is_none(), "no reset before confirmation");
+        // Esc closes only the modal; the home menu stays for the original
+        // purpose (pack picking, import, ...).
+        assert_eq!(app.handle_key(key(KeyCode::Esc), None), None);
+        assert!(!app.new_game_confirm);
+        assert!(app.home_visible);
+        assert!(app.home_request.is_none());
+
+        // Confirm replays the home arm (no greetings → home_request), the
+        // same flow a deliberate selection would have taken.
+        app.handle_key(key(KeyCode::Enter), None);
+        assert!(app.new_game_confirm);
+        assert_eq!(app.handle_key(key(KeyCode::Enter), None), None);
+        assert_eq!(app.home_request, Some(HomeRequest::StartNew));
+        assert!(!app.new_game_confirm);
+        assert!(!app.home_visible);
+    }
+
+    #[test]
+    fn home_new_game_at_turn_zero_starts_immediately() {
+        let mut app = App::new(sample_view(3));
+        app.view.status.turn = 0;
+        app.home_visible = true;
+        app.home_selected = 0;
+        assert_eq!(app.handle_key(key(KeyCode::Enter), None), None);
+        assert!(!app.new_game_confirm, "nothing to lose before the opening");
+        assert_eq!(app.home_request, Some(HomeRequest::StartNew));
+    }
+
+    #[test]
+    fn home_new_game_confirm_replays_the_greeting_picker() {
+        // With progress and multiple greetings, confirming the home guard
+        // must replay the original arm: picker opens (not a silent start),
+        // the pick gates StartNew, and a cancelled pick re-asks the guard.
+        let mut app = App::new(sample_view(3));
+        app.home_visible = true;
+        app.set_greetings(vec![
+            "기본 오프닝".to_string(),
+            "비 오는 날의 인사".to_string(),
+        ]);
+        app.handle_key(key(KeyCode::Enter), None);
+        assert!(app.new_game_confirm, "progress exists: confirm first");
+        assert!(app.greeting_picker.is_none(), "picker waits for confirm");
+
+        assert_eq!(app.handle_key(key(KeyCode::Enter), None), None);
+        assert!(
+            app.greeting_picker.is_some(),
+            "confirm replays the greeting picker arm"
+        );
+        assert!(app.take_home_request().is_none(), "picker gates the start");
+
+        // Esc cancels the pick; choosing 새 게임 again asks again.
+        app.handle_key(key(KeyCode::Esc), None);
+        assert!(app.greeting_picker.is_none());
+        assert!(app.home_visible);
+        assert_eq!(app.handle_key(key(KeyCode::Enter), None), None);
+        assert!(
+            app.new_game_confirm,
+            "the guard re-arms after a cancelled pick"
+        );
+    }
+
+    #[test]
+    fn settings_g_key_requests_the_generation_toggle_once() {
+        let mut app = App::new(sample_view(0));
+        app.set_settings(
+            ProviderConfigSafe {
+                base_url: "http://127.0.0.1:8000".to_string(),
+                model: "a".to_string(),
+                director_model: None,
+                choice_model: None,
+                writer_model: None,
+                structured_output: "auto".to_string(),
+                request_timeout_ms: 1_000,
+                connect_timeout_ms: 1_000,
+                max_retries: 0,
+                is_loopback: true,
+            },
+            ProviderHealth::Ready,
+            0.7,
+            0.9,
+            40,
+            1_200,
+            TtsDisplay {
+                enabled: false,
+                backend: "say".to_string(),
+                voice: None,
+            },
+            true,
+            Some("halfblocks".to_string()),
+            false,
+            false,
+            "자동".to_string(),
+            "없음".to_string(),
+            String::new(),
+            String::new(),
+        );
+        assert!(!app.use_director_writer(), "mirrors the seeded value");
+
+        // Open Settings (`o`), then `g` (2-beolsik ㅎ) requests the toggle;
+        // the Korean variant hits the same branch.
+        app.handle_key(key(KeyCode::Char('o')), None);
+        app.handle_key(key(KeyCode::Char('g')), None);
+        assert!(app.take_generation_toggle_request());
+        assert!(!app.take_generation_toggle_request(), "request is consumed");
+
+        app.handle_key(key(KeyCode::Char('ㅎ')), None);
+        assert!(app.take_generation_toggle_request());
+
+        // The host flips the session value, then patches the display.
+        app.update_settings_generation(true);
+        assert!(app.use_director_writer());
     }
 
     #[test]
@@ -3303,6 +6176,7 @@ mod tests {
     #[test]
     fn greetings_gate_new_game_and_picker_requests_start() {
         let mut app = App::new(sample_view(0));
+        app.view.status.turn = 0;
         app.show_home();
         app.set_greetings(vec![
             "기본 오프닝".to_string(),
@@ -3333,6 +6207,7 @@ mod tests {
     #[test]
     fn greeting_picker_esc_cancels_the_start() {
         let mut app = App::new(sample_view(0));
+        app.view.status.turn = 0;
         app.show_home();
         app.set_greetings(vec!["기본 오프닝".to_string(), "다른 인사".to_string()]);
         app.handle_key(key(KeyCode::Enter), None);
@@ -3351,6 +6226,7 @@ mod tests {
     #[test]
     fn no_greetings_starts_immediately() {
         let mut app = App::new(sample_view(0));
+        app.view.status.turn = 0;
         app.show_home();
         app.handle_key(key(KeyCode::Enter), None);
         assert!(app.greeting_picker.is_none(), "no picker without greetings");

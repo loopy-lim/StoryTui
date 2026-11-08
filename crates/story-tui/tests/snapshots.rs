@@ -58,6 +58,11 @@ fn base_view() -> AppViewModel {
         },
         loading: None,
         error: None,
+        undo_checkpoint_id: None,
+        variant_label: None,
+        cast: Vec::new(),
+        truncation: story_model::TruncationStatus::None,
+        empty_side_result: false,
     }
 }
 
@@ -193,4 +198,15 @@ fn snapshot_story_error_overlay() {
 fn snapshot_story_below_min_size() {
     // 30×8 is well under MIN_WIDTH×MIN_HEIGHT; the warning fires.
     insta::assert_snapshot!(render_to_string(base_view(), 30, 8));
+}
+
+#[test]
+fn snapshot_story_undo_available_shows_footer_hint() {
+    // With a previous committed turn to rewind to, the footer advertises
+    // `[U] 되돌리기` (AC-3 of the 2026-10-22 undo cycle). Tier-1 hints need
+    // a wider footer than 80 columns — the same width-adaptive rule that
+    // hides `[O] 설정` there; the `?` keymap documents `u` at any width.
+    let mut v = base_view();
+    v.undo_checkpoint_id = Some(Uuid::nil());
+    insta::assert_snapshot!(render_to_string(v, 120, 24));
 }

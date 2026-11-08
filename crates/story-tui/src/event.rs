@@ -43,9 +43,15 @@ pub fn map_key(key: KeyEvent, choice_count: usize, loading: bool, has_error: boo
         // Accept the same physical shortcuts while a Korean 2-beolsik layout
         // is active: q=ㅂ, r=ㄱ, c=ㅊ, j=ㅓ, k=ㅏ, n=ㅜ.
         KeyCode::Char('q' | 'ㅂ') => KeyAction::Quit,
-        KeyCode::Char('n' | 'ㅜ') => KeyAction::Command(EngineCommand::StartNewGame),
+        KeyCode::Char('n' | 'ㅜ') if !loading => KeyAction::Command(EngineCommand::StartNewGame),
         KeyCode::Char('r' | 'ㄱ') if !loading && choice_count > 0 => {
             KeyAction::Command(EngineCommand::RegenerateChoices)
+        }
+        KeyCode::Char('r' | 'ㄱ') if loading => {
+            // Same checkpoint, same choice, fresh generation id: re-roll the
+            // turn in flight without cancelling down to choice re-picking
+            // (the AI Dungeon retry / SillyTavern swipe half of recovery).
+            KeyAction::Command(EngineCommand::RegenerateCurrentTurn)
         }
         KeyCode::Char('j' | 'ㅓ') | KeyCode::Down => KeyAction::MoveSelection(1),
         KeyCode::Char('k' | 'ㅏ') | KeyCode::Up => KeyAction::MoveSelection(-1),
@@ -71,6 +77,16 @@ pub fn map_key(key: KeyEvent, choice_count: usize, loading: bool, has_error: boo
                 // The host fills in the pending generation id from the view's
                 // loading state; nil here, resolved by the App.
                 generation_id: story_model::uuid::Uuid::nil(),
+            })
+        }
+        KeyCode::Char('u' | 'ㅕ') if !loading => {
+            KeyAction::Command(EngineCommand::RestoreCheckpoint {
+                // The App rewrites the nil id into the view's undo target
+                // (previous committed turn) and drops the command when there
+                // is nothing to undo. No choice-count guard: after a resolved
+                // ending the choices are cleared but the undo target (the
+                // pre-ending turn) is exactly what the player wants back.
+                checkpoint_id: story_model::uuid::Uuid::nil(),
             })
         }
         KeyCode::Esc => KeyAction::Command(EngineCommand::DismissError),
@@ -173,6 +189,11 @@ mod tests {
             map_key(key(KeyCode::Char('ㅜ')), 0, false, false),
             KeyAction::Command(EngineCommand::StartNewGame)
         );
+        assert_eq!(
+            map_key(key(KeyCode::Char('n')), 0, true, false),
+            KeyAction::None,
+            "a stray n during generation must not reset the game"
+        );
     }
 
     #[test]
@@ -188,15 +209,22 @@ mod tests {
     }
 
     #[test]
-    fn r_refreshes_choices_idle_and_retries_turn_when_error_is_visible() {
+    fn r_refreshes_choices_idle_and_rerolls_while_loading_or_errored() {
         assert_eq!(
             map_key(key(KeyCode::Char('r')), 3, false, false),
             KeyAction::Command(EngineCommand::RegenerateChoices)
         );
+        assert!(
+            matches!(
+                map_key(key(KeyCode::Char('r')), 0, true, false),
+                KeyAction::Command(EngineCommand::RegenerateCurrentTurn)
+            ),
+            "loading: re-roll the turn in flight from the same checkpoint"
+        );
         assert_eq!(
-            map_key(key(KeyCode::Char('r')), 3, true, false),
-            KeyAction::None,
-            "an in-flight generation cannot start a second choice refresh"
+            map_key(key(KeyCode::Char('ㄱ')), 0, true, false),
+            map_key(key(KeyCode::Char('r')), 0, true, false),
+            "korean layout hits the same re-roll"
         );
         assert_eq!(
             map_key(key(KeyCode::Char('r')), 3, false, true),
@@ -217,6 +245,39 @@ mod tests {
         assert_eq!(
             map_key(key(KeyCode::Esc), 3, false, true),
             KeyAction::Command(EngineCommand::DismissError)
+        );
+    }
+
+    #[test]
+    fn u_requests_undo_when_idle_and_leaves_target_resolution_to_the_app() {
+        let idle = map_key(key(KeyCode::Char('u')), 3, false, false);
+        assert!(matches!(
+            &idle,
+            KeyAction::Command(EngineCommand::RestoreCheckpoint { checkpoint_id })
+                if checkpoint_id.is_nil()
+        ));
+        assert_eq!(
+            map_key(key(KeyCode::Char('ㅕ')), 3, false, false),
+            idle,
+            "korean layout hits the same command"
+        );
+        assert_eq!(
+            map_key(key(KeyCode::Char('u')), 3, true, false),
+            KeyAction::None,
+            "an in-flight generation cannot be undone"
+        );
+        // Zero choices (a resolved ending cleared them) must still request the
+        // undo — the App drops the nil command when the view has no target.
+        // This is the D1 fix: undoing out of an ending is the primary use.
+        assert_eq!(
+            map_key(key(KeyCode::Char('u')), 0, false, false),
+            idle,
+            "empty choices (resolved ending) must not kill the undo key"
+        );
+        assert_eq!(
+            map_key(key(KeyCode::Char('u')), 3, false, true),
+            KeyAction::None,
+            "the error overlay stays modal"
         );
     }
 }

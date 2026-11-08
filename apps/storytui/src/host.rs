@@ -1,5 +1,6 @@
 use std::io::{self, Stdout};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyEventKind, MouseEventKind,
@@ -11,8 +12,9 @@ use crossterm::terminal::{
 use futures_util::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use story_core::engine::{EngineState, build_view, reduce};
+use story_core::engine::{EngineState, SideGenerationKind, build_view, reduce};
 use story_core::engine_cmd::{EngineCommand, EngineEffect};
+use story_model::TruncationStatus;
 use story_model::{DomainErrorView, ProviderError, ProviderHealth, StoryPack};
 use story_persistence::{PackLoader, SaveStore};
 use story_provider::{LlmProvider, OpenAiCompatibleProvider};
@@ -21,23 +23,33 @@ use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio_util::sync::CancellationToken;
 
 use story_tts::TtsService;
-use storytui::config::{RuntimeConfig, UserSettings, load_user_settings, save_user_settings};
+use storytui::config::{
+    PlayerProfile, RuntimeConfig, StageModels, UserSettings, effective_player_profile,
+    load_user_settings, save_user_settings,
+};
 
 mod diagnostics;
 mod images;
 mod packs;
-pub(crate) mod saves;
-mod settings;
+/// Save/load + autosave host operations. Public because the export
+/// subcommand reuses [`saves::save_engine_snapshot`].
+pub mod saves;
+/// Provider/settings projection operations (AC-4 reprobe lives here).
+pub mod settings;
 
 type UiTerminal = Terminal<CrosstermBackend<Stdout>>;
 
 /// Summary of a finished card import (dialog report content).
-struct ImportOutcome {
-    pack_dir: String,
-    lines: Vec<String>,
+#[derive(Debug)]
+pub struct ImportOutcome {
+    pub pack_dir: String,
+    pub lines: Vec<String>,
 }
 
-enum HostMessage {
+/// Messages the provider/engine tasks send back to the polling loop. Public
+/// because the host automation handlers in the lib surface take them.
+#[derive(Debug)]
+pub enum HostMessage {
     ImportFinished {
         path: String,
         result: Result<ImportOutcome, String>,
@@ -60,6 +72,148 @@ enum HostMessage {
         generation_id: story_model::uuid::Uuid,
         text: String,
     },
+}
+
+/// Delay before the single automatic generation retry (AC-3): long enough to
+/// read the status line, short enough that the app never feels stopped.
+pub const AUTO_RETRY_DELAY: Duration = Duration::from_millis(1_500);
+/// Periodic provider reprobe interval while the server is unavailable (AC-4).
+pub const PROBE_INTERVAL: Duration = Duration::from_secs(15);
+/// How often the idle loop wakes to check the reprobe schedule.
+const PROBE_TICK: Duration = Duration::from_secs(1);
+
+/// Story-screen notice surfaces (no new keys — the subtle tail row reuses the
+/// variant-badge convention).
+pub const AUTO_RESUME_NOTICE: &str = "이전 세션을 이어요 — Alt+Home 홈";
+pub const AUTO_RETRY_NOTICE: &str = "자동 재시도…(1/1)";
+pub const MANUAL_CONTINUE_NOTICE: &str = "잘림 — w로 이어쓰기";
+pub const CONTINUE_BADGE: &str = "✎ 이어씀";
+pub const EMPTY_SIDE_NOTICE: &str = "빈 결과 — 다시 시도";
+
+/// Per-turn automation budget (AC-3/5/6/8): every automatic model re-call —
+/// generation retry, truncation continue, side-command re-dispatch — happens
+/// at most once per turn. A second failure hands control back to the player's
+/// [R] overlay instead of looping against a weak model.
+#[derive(Default)]
+pub struct TurnAutomation {
+    /// The failed generation awaiting its one automatic retry, with the
+    /// instant it fires. `None` while nothing is scheduled.
+    retry_due: Option<(story_model::uuid::Uuid, Instant)>,
+    /// This turn's automatic retry is spent (armed, fired, or refused).
+    retry_spent: bool,
+    /// This turn's automatic truncation continue is spent.
+    auto_continue_spent: bool,
+    /// This turn's side-command re-dispatch is spent.
+    side_retry_spent: bool,
+    /// The most recent side command the host issued (AC-6 re-dispatch target).
+    last_side_command: Option<EngineCommand>,
+}
+
+impl TurnAutomation {
+    /// Arm the single automatic retry for this turn. Fails when the budget is
+    /// spent or a retry is already scheduled.
+    pub fn arm_retry(&mut self, generation_id: story_model::uuid::Uuid, now: Instant) -> bool {
+        if self.retry_spent || self.retry_due.is_some() {
+            return false;
+        }
+        self.retry_spent = true;
+        self.retry_due = Some((generation_id, now + AUTO_RETRY_DELAY));
+        true
+    }
+
+    /// Pop the armed retry once it is due.
+    pub fn take_due_retry(&mut self, now: Instant) -> bool {
+        match self.retry_due {
+            Some((_, due)) if now >= due => {
+                self.retry_due = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Drop an armed retry (the turn ended another way — a player cancel, a
+    /// settings-driven cancel).
+    pub fn cancel_retry(&mut self) {
+        self.retry_due = None;
+    }
+
+    /// Whether a retry is currently scheduled.
+    pub fn retry_armed(&self) -> bool {
+        self.retry_due.is_some()
+    }
+
+    /// Whether this turn's automatic retry budget is spent.
+    pub fn retry_spent(&self) -> bool {
+        self.retry_spent
+    }
+
+    /// Whether this turn's automatic truncation continue is spent.
+    pub fn auto_continue_spent(&self) -> bool {
+        self.auto_continue_spent
+    }
+
+    /// Whether this turn's side-command re-dispatch is spent.
+    pub fn side_retry_spent(&self) -> bool {
+        self.side_retry_spent
+    }
+
+    /// A fresh turn request (or a committed turn) refills the budget.
+    pub fn reset_turn(&mut self) {
+        self.retry_due = None;
+        self.retry_spent = false;
+        self.auto_continue_spent = false;
+        self.side_retry_spent = false;
+    }
+
+    /// Record the side command the host just issued — the AC-6 re-dispatch
+    /// target when its result comes back empty.
+    pub fn note_side_command(&mut self, command: EngineCommand) {
+        self.last_side_command = Some(command);
+    }
+
+    /// The most recent side command, if any.
+    pub fn last_side_command(&self) -> Option<&EngineCommand> {
+        self.last_side_command.as_ref()
+    }
+}
+
+/// AC-1 startup entry decision: resume immediately only when the setting is
+/// on AND an autosave exists. A fresh install (no autosave) always sees the
+/// home menu — the learning path stays intact.
+pub fn should_auto_resume(auto_resume: bool, resume_available: bool) -> bool {
+    auto_resume && resume_available
+}
+
+/// Apply the restored autosave to the session — the home 이어하기 body.
+/// Shared by the home menu request and the AC-1 startup auto-resume, so the
+/// two entries can never diverge.
+pub fn apply_resume(
+    app: &mut App,
+    engine: &mut EngineState,
+    pack: &StoryPack,
+    resume_engine: &mut Option<EngineState>,
+    scene_images: &mut SceneImageStores,
+    use_director_writer: bool,
+) {
+    if let Some(mut restored) = resume_engine.take() {
+        restored.use_director_writer = use_director_writer;
+        *engine = restored;
+        app.set_view(build_view(engine, pack, None, None));
+        app.set_lists(
+            &engine.game.history,
+            &engine.game.memories,
+            &pack.metadata.initial_state.location,
+        );
+        app.follow_story_end();
+        app.set_can_continue(false);
+        refresh_scene_images(app, pack, engine, scene_images);
+    }
+}
+
+/// AC-4 gate: probe while idle, at most every [`PROBE_INTERVAL`].
+pub fn probe_due(now: Instant, last_probe: Instant, loading: bool) -> bool {
+    !loading && now.duration_since(last_probe) >= PROBE_INTERVAL
 }
 
 struct TerminalGuard;
@@ -99,10 +253,11 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
     let mut config = config;
     let mut pack = PackLoader::load(&config.pack_dir)
         .map_err(|e| format!("Story Pack을 불러오지 못했습니다: {e}"))?;
-    apply_player_profile(&mut pack, &config.player);
     let mut provider_config = config.provider.clone();
     let mut repaired_main_model = false;
-    let mut repaired_stage_models = false;
+    // Which stages the preflight repairs — only those are pinned to the
+    // profile below, so untouched stages keep inheriting their defaults.
+    let mut repaired_stages = settings::StageRepairs::default();
     // First-run auto-setup: with no model selected yet (a fresh clone — the
     // checked-in template intentionally carries no model id), find a local
     // OpenAI-compatible server and adopt it for this session. The model is
@@ -149,11 +304,7 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                         .map_err(|e| format!("대체 provider를 만들지 못했습니다: {e}"))?,
                 );
             }
-            for stage_model in [
-                &mut config.director_model,
-                &mut config.choice_model,
-                &mut config.writer_model,
-            ] {
+            let repair_stage = |repaired: &mut bool, stage_model: &mut Option<String>| {
                 if let Some(current) = stage_model.clone()
                     && !advertised.iter().any(|model| model == &current)
                 {
@@ -163,9 +314,12 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                         "stage model is not advertised; using the active model"
                     );
                     *stage_model = Some(provider_config.model.clone());
-                    repaired_stage_models = true;
+                    *repaired = true;
                 }
-            }
+            };
+            repair_stage(&mut repaired_stages.director, &mut config.director_model);
+            repair_stage(&mut repaired_stages.choice, &mut config.choice_model);
+            repair_stage(&mut repaired_stages.writer, &mut config.writer_model);
         }
         Ok(_) => tracing::warn!("provider advertised an empty model list"),
         Err(error) => tracing::warn!(%error, "provider model preflight failed"),
@@ -189,7 +343,9 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
         TerminalGuard::enter().map_err(|e| format!("터미널을 초기화하지 못했습니다: {e}"))?;
     // Terminal graphics query must happen before the input EventStream starts
     // reading stdin. Failure just means text-only rendering.
-    let image_picker = match ratatui_image::picker::Picker::from_query_stdio() {
+    // Kept for the whole session: the Settings `b` cycle rebuilds the
+    // effective picker from this detected base.
+    let base_image_picker = match ratatui_image::picker::Picker::from_query_stdio() {
         Ok(picker) => Some(picker),
         Err(error) => {
             tracing::info!(
@@ -199,16 +355,39 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
             None
         }
     };
+    // Player-owned overrides decide the effective generation path BEFORE any
+    // engine/resume stamping: every later reader (resume restore, pack swap,
+    // new game, saves) reads `config.use_director_writer`.
+    let mut user_settings = load_user_settings(&config.save_dir)?;
+    user_settings.fold_legacy_stage_models(&config.provider.name);
+    // Player identity + author's note: the user-settings overrides win over
+    // the base `[player]` profile; the sections are (re)written idempotently,
+    // so later persona/note edits just replace them.
+    settings::apply_prompt_overlays(
+        &mut pack.prompts.system,
+        &effective_player_profile(&user_settings, &config.player),
+        user_settings.effective_author_note(),
+    );
+    config.use_director_writer = user_settings
+        .use_director_writer
+        .unwrap_or(config.use_director_writer);
     let mut resume_engine = saves::restore_autosave(&save_store, &pack);
     let mut engine = EngineState::initial(&pack);
     engine.use_director_writer = config.use_director_writer;
     if let Some(restored) = resume_engine.as_mut() {
         restored.use_director_writer = config.use_director_writer;
     }
-    let mut scene_images = images::LocationImageStore::default();
+    let mut scene_images = SceneImageStores::default();
     let mut app = App::new(build_view(&engine, &pack, None, None));
-    app.set_image_picker(image_picker);
-    refresh_location_images(&mut app, &pack, &engine, &mut scene_images);
+    app.set_display_rules(compile_display_rules(&user_settings.display_rules));
+    // A persisted protocol override (Settings `b` cycle) rides on top of the
+    // detected capability; an unrecognized value behaves as auto.
+    let (picker, manual) = build_image_picker(
+        base_image_picker.as_ref(),
+        user_settings.image_protocol.as_deref(),
+    );
+    app.set_image_picker(picker, manual);
+    refresh_scene_images(&mut app, &pack, &engine, &mut scene_images);
     app.set_lists(
         &engine.game.history,
         &engine.game.memories,
@@ -228,18 +407,19 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
             .collect();
         app.set_providers(&roster, &provider_config.name);
     }
-    let mut user_settings = load_user_settings(&config.save_dir)?;
     // The `v` toggle persists an explicit preference; absent means the [tts]
     // profile's `enabled` default decides.
     let tts_enabled = user_settings.tts_enabled.unwrap_or(config.tts.enabled);
     config.tts.enabled = tts_enabled;
     let images_enabled = user_settings.images_enabled.unwrap_or(true);
     app.set_images_enabled(images_enabled);
+    app.set_expressions_enabled(user_settings.expressions_enabled.unwrap_or(true));
     let tts = Arc::new(TtsService::new(config.tts.clone()));
     {
         let status = tts.status().await;
         let images_enabled = app.images_enabled();
         let image_backend = app.image_backend_label();
+        let expressions_enabled = app.expressions_enabled();
         settings::refresh_view(
             &mut app,
             &provider_config,
@@ -250,6 +430,10 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
             &status,
             images_enabled,
             image_backend,
+            config.use_director_writer,
+            expressions_enabled,
+            &user_settings,
+            &config.player,
         );
     }
     // Start-menu status line: guide an unconfigured first run, and note a
@@ -265,24 +449,56 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
     } else {
         None
     });
-    app.show_home();
+    // AC-1: with an autosave to resume and auto_resume on (default), skip the
+    // home menu and land directly in the restored story — one status line
+    // tells the player where they are and how back is home. A fresh install
+    // (no autosave) or `auto_resume = false` keeps the home-first flow.
+    if should_auto_resume(user_settings.auto_resume, resume_engine.is_some()) {
+        apply_resume(
+            &mut app,
+            &mut engine,
+            &pack,
+            &mut resume_engine,
+            &mut scene_images,
+            config.use_director_writer,
+        );
+        app.set_story_notice(Some(AUTO_RESUME_NOTICE));
+    } else {
+        app.show_home();
+    }
     if repaired_main_model {
         user_settings.model = Some(provider_config.model.clone());
     }
-    if repaired_stage_models {
-        user_settings.director_model = config.director_model.clone();
-        user_settings.choice_model = config.choice_model.clone();
-        user_settings.writer_model = config.writer_model.clone();
+    // Pin only the stages the preflight repaired: a stage this run merely
+    // kept inheriting stays unrecorded, so later `[[providers]]` default
+    // edits keep applying.
+    if repaired_stages.any() {
+        settings::record_repaired_stages(
+            &mut user_settings.stage_models,
+            &config.provider.name,
+            repaired_stages,
+            &StageModels {
+                director: config.director_model.clone(),
+                choice: config.choice_model.clone(),
+                writer: config.writer_model.clone(),
+            },
+        );
     }
-    if repaired_main_model || repaired_stage_models {
+    if repaired_main_model || repaired_stages.any() {
         save_user_settings(&config.save_dir, &user_settings)?;
     }
     let (tx, mut rx) = unbounded_channel();
     let mut cancellation: Option<(story_model::uuid::Uuid, CancellationToken)> = None;
+    // Per-turn automation budget (AC-3/5/6) and the AC-4 reprobe schedule.
+    let mut automation = TurnAutomation::default();
+    // The health probe ran at startup; the schedule counts from there.
+    let mut last_probe = Instant::now();
 
     let mut event_stream = EventStream::new();
     let mut frame_tick = tokio::time::interval(std::time::Duration::from_millis(16));
     frame_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut probe_tick = tokio::time::interval(PROBE_TICK);
+    probe_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut needs_redraw = true;
     // Last elapsed-second value the loading overlay was drawn with (1 Hz gate).
     let mut drawn_loading_second: Option<u64> = None;
@@ -295,18 +511,21 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
                         let pending = app.view.loading.as_ref().map(|v| v.generation_id);
                         if let Some(command) = app.handle_key(key, pending) {
+                            note_player_turn_command(&command, &mut automation);
                             dispatch(command, &mut engine, &mut app, &pack, &provider, &config, &save_store, &tts, &mut scene_images, &tx, &mut cancellation).await?;
                         }
                         handle_ui_requests(
                             &mut app, &mut engine, &mut pack, &mut provider_config,
                             &mut provider, &mut user_settings, &mut config,
-                            &save_store, &tts, &mut scene_images, &tx, &mut cancellation, &mut resume_engine,
+                            &save_store, &tts, &mut scene_images, base_image_picker.as_ref(),
+                            &tx, &mut cancellation, &mut resume_engine, &mut automation,
                         ).await?;
                         needs_redraw = true;
                     }
                     Event::Mouse(mouse) => {
                         app.handle_mouse(mouse);
                         if let Some(command) = app.take_mouse_command() {
+                            note_player_turn_command(&command, &mut automation);
                             dispatch(
                                 command,
                                 &mut engine,
@@ -325,7 +544,8 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                         handle_ui_requests(
                             &mut app, &mut engine, &mut pack, &mut provider_config,
                             &mut provider, &mut user_settings, &mut config,
-                            &save_store, &tts, &mut scene_images, &tx, &mut cancellation, &mut resume_engine,
+                            &save_store, &tts, &mut scene_images, base_image_picker.as_ref(),
+                            &tx, &mut cancellation, &mut resume_engine, &mut automation,
                         ).await?;
                         // Movement carries no render state (hover is not
                         // rendered): a full frame per move event starved the
@@ -351,85 +571,10 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                 if app.should_quit { break; }
             }
             Some(message) = rx.recv() => {
-                match message {
-                    HostMessage::Generation { generation_id, model, result } => {
-                        let command = match result {
-                            Ok(draft) => {
-                                app.record_generation_model(generation_id, model);
-                                app.record_generation_duration(generation_id);
-                                EngineCommand::AcceptGeneration { draft: Box::new(draft) }
-                            }
-                            Err(error) => {
-                                diagnostics::record_provider_failure(&config.save_dir, generation_id, &error);
-                                tracing::warn!(
-                                    %generation_id,
-                                    stage = provider_failure_stage(&error),
-                                    %error,
-                                    "turn generation rejected"
-                                );
-                                EngineCommand::ProviderFailed {
-                                    generation_id,
-                                    error: provider_error_view(error),
-                                }
-                            }
-                        };
-                        dispatch(command, &mut engine, &mut app, &pack, &provider, &config, &save_store, &tts, &mut scene_images, &tx, &mut cancellation).await?;
-                        needs_redraw = true;
-                    }
-                    HostMessage::Director { generation_id, result } => {
-                        let command = match result {
-                            Ok(plan) => EngineCommand::AcceptDirectorPlan { generation_id, plan: Box::new(plan) },
-                            Err(error) => {
-                                diagnostics::record_provider_failure(&config.save_dir, generation_id, &error);
-                                // A plan-shape failure (model could not emit valid
-                                // JSON) degrades gracefully to a single-pass turn
-                                // so a weak Director model never blocks the player.
-                                // Transport/timeout failures still surface an error.
-                                if matches!(error, ProviderError::InvalidGeneration(_)) {
-                                    tracing::warn!(
-                                        %generation_id,
-                                        "Director could not produce a plan; falling back to single-pass generation"
-                                    );
-                                    EngineCommand::FallbackToSinglePass { generation_id }
-                                } else {
-                                    EngineCommand::ProviderFailed { generation_id, error: provider_error_view(error) }
-                                }
-                            }
-                        };
-                        dispatch(command, &mut engine, &mut app, &pack, &provider, &config, &save_store, &tts, &mut scene_images, &tx, &mut cancellation).await?;
-                        needs_redraw = true;
-                    }
-                    HostMessage::Writer { generation_id, model, result } => {
-                        let command = match result {
-                            Ok(finish) => {
-                                app.record_generation_model(generation_id, model);
-                                app.record_generation_duration(generation_id);
-                                EngineCommand::AcceptWriterFinish { finish: Box::new(finish) }
-                            }
-                            Err(error) => {
-                                diagnostics::record_provider_failure(&config.save_dir, generation_id, &error);
-                                EngineCommand::ProviderFailed { generation_id, error: provider_error_view(error) }
-                            }
-                        };
-                        dispatch(command, &mut engine, &mut app, &pack, &provider, &config, &save_store, &tts, &mut scene_images, &tx, &mut cancellation).await?;
-                        needs_redraw = true;
-                    }
-                    HostMessage::ImportFinished { path, result } => {
-                        match result {
-                            Ok(outcome) => {
-                                app.show_import_report(&path, outcome.lines, Some(outcome.pack_dir))
-                            }
-                            Err(error) => {
-                                app.show_import_report(&path, vec![format!("임포트 실패: {error}")], None)
-                            }
-                        }
-                        needs_redraw = true;
-                    }
-                    HostMessage::WriterChunk { generation_id, text } => {
-                        app.push_writer_chunk(generation_id, &text);
-                        needs_redraw = true;
-                    }
-                }
+                needs_redraw = handle_host_message(
+                    message, &mut engine, &mut app, &pack, &provider, &config, &save_store,
+                    &tts, &mut scene_images, &tx, &mut cancellation, &mut automation,
+                ).await?;
             }
             _ = frame_tick.tick(), if needs_redraw || app.view.loading.is_some() => {
                 // While a generation is pending, the only thing that changes
@@ -438,6 +583,13 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                 // a measurable slice of a core (probe: 6.9 ms/frame on a
                 // 120-turn stack) and starved the terminal. Streaming chunks
                 // and events keep their own `needs_redraw`.
+                if handle_frame_automation(
+                    &mut engine, &mut app, &pack, &mut provider_config, &mut provider,
+                    &mut user_settings, &mut config, &save_store, &tts, &mut scene_images,
+                    &tx, &mut cancellation, &mut automation, &mut last_probe, Instant::now(),
+                ).await? {
+                    needs_redraw = true;
+                }
                 let loading_second = app
                     .view
                     .loading
@@ -451,6 +603,19 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                 }
                 needs_redraw = false;
             }
+            _ = probe_tick.tick() => {
+                // AC-4: the idle loop still checks the reprobe schedule once
+                // a second — the redraw-gated frame arm above is disabled
+                // while nothing changes, so a server coming back would
+                // otherwise go unnoticed until the next keypress.
+                if handle_frame_automation(
+                    &mut engine, &mut app, &pack, &mut provider_config, &mut provider,
+                    &mut user_settings, &mut config, &save_store, &tts, &mut scene_images,
+                    &tx, &mut cancellation, &mut automation, &mut last_probe, Instant::now(),
+                ).await? {
+                    needs_redraw = true;
+                }
+            }
         }
     }
 
@@ -458,6 +623,438 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
         token.cancel();
     }
     Ok(())
+}
+
+/// Per-turn automation budget bookkeeping for a player-initiated command: a
+/// turn-starting request refills the budget, a cancel drops any armed retry.
+/// Manual [R] regenerates deliberately do NOT refill — the overlay retry is
+/// player sovereignty, and its failures stay manual.
+pub fn note_player_turn_command(command: &EngineCommand, automation: &mut TurnAutomation) {
+    match command {
+        EngineCommand::SubmitChoice { .. }
+        | EngineCommand::SubmitFreeAction { .. }
+        | EngineCommand::StartNewGame => automation.reset_turn(),
+        EngineCommand::CancelGeneration { .. } => {
+            automation.cancel_retry();
+        }
+        _ => {}
+    }
+}
+
+/// Handle one provider/engine message from the polling channel. Shared by the
+/// interactive loop and the host automation tests, so the AC-3/5/6 behavior
+/// is proven against the exact code the loop runs. Returns whether the frame
+/// needs a redraw.
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_host_message(
+    message: HostMessage,
+    engine: &mut EngineState,
+    app: &mut App,
+    pack: &StoryPack,
+    provider: &Arc<OpenAiCompatibleProvider>,
+    config: &RuntimeConfig,
+    save_store: &SaveStore,
+    tts: &TtsService,
+    scene_images: &mut SceneImageStores,
+    tx: &UnboundedSender<HostMessage>,
+    cancellation: &mut Option<(story_model::uuid::Uuid, CancellationToken)>,
+    automation: &mut TurnAutomation,
+) -> Result<bool, String> {
+    match message {
+        HostMessage::Generation {
+            generation_id,
+            model,
+            result,
+        } => {
+            let command = match result {
+                Ok(draft) => {
+                    app.record_generation_model(generation_id, model);
+                    app.record_generation_duration(generation_id);
+                    EngineCommand::AcceptGeneration {
+                        draft: Box::new(draft),
+                    }
+                }
+                Err(error) => {
+                    diagnostics::record_provider_failure(&config.save_dir, generation_id, &error);
+                    // AC-3: one automatic retry per turn — unless the player
+                    // cancelled, which is a decision, not a failure (the
+                    // provider surfaces cancellation as an Err).
+                    let cancelled = matches!(error, ProviderError::Cancelled);
+                    if !cancelled && automation.arm_retry(generation_id, Instant::now()) {
+                        tracing::info!(
+                            %generation_id,
+                            stage = provider_failure_stage(&error),
+                            %error,
+                            "generation failed; arming the single automatic retry"
+                        );
+                        app.set_story_notice(Some(AUTO_RETRY_NOTICE));
+                        return Ok(true);
+                    }
+                    tracing::warn!(
+                        %generation_id,
+                        stage = provider_failure_stage(&error),
+                        %error,
+                        "turn generation rejected"
+                    );
+                    EngineCommand::ProviderFailed {
+                        generation_id,
+                        error: provider_error_view(error),
+                    }
+                }
+            };
+            // The 이어씀 badge: an accept for a side-continue pending that
+            // actually appended (the engine demotes Auto → ManualOnly only on
+            // a non-empty continuation).
+            let side_continue_accept = matches!(command, EngineCommand::AcceptGeneration { .. })
+                && engine
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.side_kind == Some(SideGenerationKind::Continue));
+            let previous_turn = app.view.status.turn;
+            dispatch(
+                command,
+                engine,
+                app,
+                pack,
+                provider,
+                config,
+                save_store,
+                tts,
+                scene_images,
+                tx,
+                cancellation,
+            )
+            .await?;
+            if app.view.status.turn > previous_turn {
+                // A committed turn refills the automation budget.
+                automation.reset_turn();
+            }
+            if side_continue_accept && !app.view.empty_side_result {
+                app.set_story_notice(Some(CONTINUE_BADGE));
+            }
+            post_accept_automation(
+                engine,
+                app,
+                pack,
+                provider,
+                config,
+                save_store,
+                tts,
+                scene_images,
+                tx,
+                cancellation,
+                automation,
+                // The badge above is the fresher surface for a manual or
+                // automatic continue that just appended.
+                !side_continue_accept,
+            )
+            .await?;
+        }
+        HostMessage::Director {
+            generation_id,
+            result,
+        } => {
+            let command = match result {
+                Ok(plan) => EngineCommand::AcceptDirectorPlan {
+                    generation_id,
+                    plan: Box::new(plan),
+                },
+                Err(error) => {
+                    diagnostics::record_provider_failure(&config.save_dir, generation_id, &error);
+                    // A plan-shape failure (model could not emit valid
+                    // JSON) degrades gracefully to a single-pass turn
+                    // so a weak Director model never blocks the player.
+                    // Transport/timeout failures still surface an error.
+                    if matches!(error, ProviderError::InvalidGeneration(_)) {
+                        tracing::warn!(
+                            %generation_id,
+                            "Director could not produce a plan; falling back to single-pass generation"
+                        );
+                        EngineCommand::FallbackToSinglePass { generation_id }
+                    } else {
+                        // AC-3: a transport/timeout failure gets the same one
+                        // automatic retry per turn as a single-pass generation
+                        // — unless the player cancelled, which is a decision,
+                        // not a failure.
+                        let cancelled = matches!(error, ProviderError::Cancelled);
+                        if !cancelled && automation.arm_retry(generation_id, Instant::now()) {
+                            tracing::info!(
+                                %generation_id,
+                                stage = provider_failure_stage(&error),
+                                %error,
+                                "director stage failed; arming the single automatic retry"
+                            );
+                            app.set_story_notice(Some(AUTO_RETRY_NOTICE));
+                            return Ok(true);
+                        }
+                        tracing::warn!(
+                            %generation_id,
+                            stage = provider_failure_stage(&error),
+                            %error,
+                            "director stage rejected"
+                        );
+                        EngineCommand::ProviderFailed {
+                            generation_id,
+                            error: provider_error_view(error),
+                        }
+                    }
+                }
+            };
+            dispatch(
+                command,
+                engine,
+                app,
+                pack,
+                provider,
+                config,
+                save_store,
+                tts,
+                scene_images,
+                tx,
+                cancellation,
+            )
+            .await?;
+        }
+        HostMessage::Writer {
+            generation_id,
+            model,
+            result,
+        } => {
+            let command = match result {
+                Ok(finish) => {
+                    app.record_generation_model(generation_id, model);
+                    app.record_generation_duration(generation_id);
+                    EngineCommand::AcceptWriterFinish {
+                        finish: Box::new(finish),
+                    }
+                }
+                Err(error) => {
+                    diagnostics::record_provider_failure(&config.save_dir, generation_id, &error);
+                    // AC-3: a Writer-stage transport/timeout failure gets the
+                    // same one automatic retry per turn as a single-pass
+                    // generation — unless the player cancelled, which is a
+                    // decision, not a failure.
+                    let cancelled = matches!(error, ProviderError::Cancelled);
+                    if !cancelled && automation.arm_retry(generation_id, Instant::now()) {
+                        tracing::info!(
+                            %generation_id,
+                            stage = provider_failure_stage(&error),
+                            %error,
+                            "writer stage failed; arming the single automatic retry"
+                        );
+                        app.set_story_notice(Some(AUTO_RETRY_NOTICE));
+                        return Ok(true);
+                    }
+                    tracing::warn!(
+                        %generation_id,
+                        stage = provider_failure_stage(&error),
+                        %error,
+                        "writer stage rejected"
+                    );
+                    EngineCommand::ProviderFailed {
+                        generation_id,
+                        error: provider_error_view(error),
+                    }
+                }
+            };
+            let previous_turn = app.view.status.turn;
+            dispatch(
+                command,
+                engine,
+                app,
+                pack,
+                provider,
+                config,
+                save_store,
+                tts,
+                scene_images,
+                tx,
+                cancellation,
+            )
+            .await?;
+            if app.view.status.turn > previous_turn {
+                automation.reset_turn();
+            }
+            // AC-5/AC-8: react to the Writer path's truncation flag.
+            post_accept_automation(
+                engine,
+                app,
+                pack,
+                provider,
+                config,
+                save_store,
+                tts,
+                scene_images,
+                tx,
+                cancellation,
+                automation,
+                true,
+            )
+            .await?;
+        }
+        HostMessage::ImportFinished { path, result } => match result {
+            Ok(outcome) => app.show_import_report(&path, outcome.lines, Some(outcome.pack_dir)),
+            Err(error) => {
+                app.show_import_report(&path, vec![format!("임포트 실패: {error}")], None)
+            }
+        },
+        HostMessage::WriterChunk {
+            generation_id,
+            text,
+        } => {
+            app.push_writer_chunk(generation_id, &text);
+        }
+    }
+    Ok(true)
+}
+
+/// AC-5/6/8 post-accept automation: react to the just-published view —
+/// auto-continue a truncated turn once, re-dispatch a side command whose
+/// result came back empty once, and surface the manual-only guide. Each
+/// action is capped once per turn by [`TurnAutomation`].
+#[allow(clippy::too_many_arguments)]
+pub async fn post_accept_automation(
+    engine: &mut EngineState,
+    app: &mut App,
+    pack: &StoryPack,
+    provider: &Arc<OpenAiCompatibleProvider>,
+    config: &RuntimeConfig,
+    save_store: &SaveStore,
+    tts: &TtsService,
+    scene_images: &mut SceneImageStores,
+    tx: &UnboundedSender<HostMessage>,
+    cancellation: &mut Option<(story_model::uuid::Uuid, CancellationToken)>,
+    automation: &mut TurnAutomation,
+    allow_manual_guide: bool,
+) -> Result<(), String> {
+    // AC-6: an empty side result applied nothing — re-issue the same side
+    // command once; if the re-run is empty too, guide only.
+    if app.view.empty_side_result {
+        if !automation.side_retry_spent
+            && let Some(command) = automation.last_side_command().cloned()
+        {
+            automation.side_retry_spent = true;
+            app.set_story_notice(Some(EMPTY_SIDE_NOTICE));
+            dispatch(
+                command,
+                engine,
+                app,
+                pack,
+                provider,
+                config,
+                save_store,
+                tts,
+                scene_images,
+                tx,
+                cancellation,
+            )
+            .await?;
+            return Ok(());
+        }
+        app.set_story_notice(Some(EMPTY_SIDE_NOTICE));
+        return Ok(());
+    }
+    match app.view.truncation {
+        TruncationStatus::Auto
+            if !automation.auto_continue_spent
+                && engine.pending.is_none()
+                && engine.retry_pending.is_none() =>
+        {
+            // AC-5: one automatic continue per truncated turn. The engine
+            // demotes Auto → ManualOnly after a non-empty append; this flag
+            // additionally keeps an empty-accept from re-firing.
+            automation.auto_continue_spent = true;
+            automation.note_side_command(EngineCommand::ContinueNarration);
+            dispatch(
+                EngineCommand::ContinueNarration,
+                engine,
+                app,
+                pack,
+                provider,
+                config,
+                save_store,
+                tts,
+                scene_images,
+                tx,
+                cancellation,
+            )
+            .await?;
+        }
+        // AC-8: the repair budget was spent — never auto-continue; the
+        // shortest manual guide instead.
+        TruncationStatus::ManualOnly if allow_manual_guide => {
+            app.set_story_notice(Some(MANUAL_CONTINUE_NOTICE));
+        }
+        TruncationStatus::ManualOnly | TruncationStatus::Auto | TruncationStatus::None => {}
+    }
+    Ok(())
+}
+
+/// AC-3/AC-4 frame-time automation: fire the due automatic retry and run the
+/// periodic reprobe schedule. `now` is injected so tests can cross the delay
+/// without sleeping. Returns whether a redraw is needed.
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_frame_automation(
+    engine: &mut EngineState,
+    app: &mut App,
+    pack: &StoryPack,
+    provider_config: &mut story_provider::ProviderConfig,
+    provider: &mut Arc<OpenAiCompatibleProvider>,
+    user_settings: &mut UserSettings,
+    config: &mut RuntimeConfig,
+    save_store: &SaveStore,
+    tts: &TtsService,
+    scene_images: &mut SceneImageStores,
+    tx: &UnboundedSender<HostMessage>,
+    cancellation: &mut Option<(story_model::uuid::Uuid, CancellationToken)>,
+    automation: &mut TurnAutomation,
+    last_probe: &mut Instant,
+    now: Instant,
+) -> Result<bool, String> {
+    let mut needs_redraw = false;
+    if automation.take_due_retry(now) {
+        // A cancel between arming and firing left nothing to regenerate.
+        if engine.pending.is_some() || engine.retry_pending.is_some() {
+            tracing::info!("automatic retry firing");
+            dispatch(
+                EngineCommand::RegenerateCurrentTurn,
+                engine,
+                app,
+                pack,
+                provider,
+                config,
+                save_store,
+                tts,
+                scene_images,
+                tx,
+                cancellation,
+            )
+            .await?;
+        }
+        app.set_story_notice(None);
+        needs_redraw = true;
+    }
+    if probe_due(now, *last_probe, app.view.loading.is_some())
+        && (provider_config.model.trim().is_empty()
+            || app
+                .provider_health()
+                .is_none_or(|health| health == ProviderHealth::Unavailable))
+    {
+        *last_probe = now;
+        if settings::reprobe_availability(
+            app,
+            provider_config,
+            provider,
+            user_settings,
+            config,
+            tts,
+        )
+        .await
+        {
+            needs_redraw = true;
+        }
+    }
+    Ok(needs_redraw)
 }
 
 /// Switch the session to the pack at `pack_dir`: reset the engine, drop the
@@ -469,8 +1066,10 @@ fn swap_pack(
     pack_dir: &str,
     pack: &mut StoryPack,
     engine: &mut EngineState,
-    scene_images: &mut images::LocationImageStore,
+    scene_images: &mut SceneImageStores,
     config: &RuntimeConfig,
+    player: &PlayerProfile,
+    author_note: Option<&str>,
     cancellation: &mut Option<(story_model::uuid::Uuid, CancellationToken)>,
     resume_engine: &mut Option<EngineState>,
 ) {
@@ -491,7 +1090,7 @@ fn swap_pack(
         token.cancel();
     }
     *pack = new_pack;
-    apply_player_profile(pack, &config.player);
+    settings::apply_prompt_overlays(&mut pack.prompts.system, player, author_note);
     *engine = EngineState::initial(pack);
     engine.use_director_writer = config.use_director_writer;
     *resume_engine = None;
@@ -508,7 +1107,7 @@ fn swap_pack(
     app.set_can_continue(false);
     app.set_greetings(greeting_labels(pack));
     app.set_current_pack_dir(pack_dir);
-    refresh_location_images(app, pack, engine, scene_images);
+    refresh_scene_images(app, pack, engine, scene_images);
     tracing::info!(pack = %pack_dir, "switched to the imported pack");
 }
 
@@ -542,19 +1141,39 @@ fn read_greeting(pack: &StoryPack, index: usize) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
-/// Refresh the per-location image store and push newly resolved images into
-/// the view. Runs on every publish; a location decodes at most once per pack
-/// session, so the common case is a no-op scan of visited locations.
+/// Both resolved-image caches the host owns — location art and expression
+/// sprites. One bundle so every dispatch/reset/refresh signature threads a
+/// single handle and the pack-switch lockstep cannot forget one side.
+#[derive(Default)]
+pub struct SceneImageStores {
+    pub locations: images::LocationImageStore,
+    pub expressions: images::ExpressionImageStore,
+}
+
+/// Refresh both image stores and push newly resolved images into the view.
+/// Runs on every publish; a location or emotion decodes at most once per
+/// pack session, so the common case is a no-op scan.
+fn refresh_scene_images(
+    app: &mut App,
+    pack: &StoryPack,
+    engine: &EngineState,
+    stores: &mut SceneImageStores,
+) {
+    refresh_location_images(app, pack, engine, stores);
+    refresh_expression_images(app, pack, engine, stores);
+}
+
+/// Refresh the per-location image store. The opening location is always in
+/// play (the empty-stack opening shows its image).
 fn refresh_location_images(
     app: &mut App,
     pack: &StoryPack,
     engine: &EngineState,
-    store: &mut images::LocationImageStore,
+    stores: &mut SceneImageStores,
 ) {
     let primary = engine.game.characters.keys().next().map(|id| id.0.clone());
     let initial = &pack.metadata.initial_state.location;
-    // Distinct locations in play, order-preserving; the opening location is
-    // always in play (the empty-stack opening shows its image).
+    // Distinct locations in play, order-preserving.
     let mut seen = std::collections::HashSet::new();
     let mut locations = vec![initial.0.clone()];
     seen.insert(initial.0.clone());
@@ -566,20 +1185,107 @@ fn refresh_location_images(
             locations.push(location);
         }
     }
-    for (location, resolved) in store.load_missing(pack, &locations, primary.as_deref()) {
+    for (location, resolved) in stores
+        .locations
+        .load_missing(pack, &locations, primary.as_deref())
+    {
         app.set_location_image(&location, resolved);
     }
 }
 
-/// Clear the per-location images on BOTH sides in lockstep.
+/// Refresh the per-emotion sprite store. Zero inference: the emotions come
+/// from `classify_emotion` over the opening narration and the history, so a
+/// weak local setup pays no extra generation for expression sprites.
+/// Skipped entirely while the player keeps sprites off (`f`).
+fn refresh_expression_images(
+    app: &mut App,
+    pack: &StoryPack,
+    engine: &EngineState,
+    stores: &mut SceneImageStores,
+) {
+    if !app.expressions_enabled() {
+        return;
+    }
+    let Some(character) = engine.game.characters.keys().next().map(|id| id.0.clone()) else {
+        return;
+    };
+    // Distinct emotions in play, order-preserving; the opening narration is
+    // the transcript's first beat and is classified exactly like the App's
+    // empty-stack branch classifies it.
+    let mut seen = std::collections::HashSet::new();
+    let mut emotions = Vec::new();
+    for emotion in std::iter::once(story_tui::classify_emotion(&app.view.narration))
+        .chain(story_tui::emotion_timeline(&engine.game.history))
+    {
+        if seen.insert(emotion) {
+            emotions.push(emotion);
+        }
+    }
+    for (emotion, resolved) in stores.expressions.load_missing(pack, &character, &emotions) {
+        app.set_expression_image(emotion, resolved);
+    }
+}
+
+/// Clear the per-location AND per-emotion images on BOTH sides in lockstep.
 ///
-/// Invariant: the host's decode store and the app's encoded image map must be
-/// reset together. Clearing only one side lets the previous pack's images
+/// Invariant: the host's decode stores and the app's encoded image maps must
+/// be reset together. Clearing only one side lets the previous pack's images
 /// survive a pack switch — the stale-portrait bug fixed 2026-10-19 (a fresh
 /// cache that answered `Unchanged` instead of `Clear` for an imageless pack).
-fn reset_scene_images(app: &mut App, store: &mut images::LocationImageStore) {
-    store.clear();
+fn reset_scene_images(app: &mut App, stores: &mut SceneImageStores) {
+    stores.locations.clear();
+    stores.expressions.clear();
     app.reset_location_images();
+    app.reset_expression_images();
+}
+
+/// Recognized `image_protocol` values in cycle order after auto.
+const IMAGE_PROTOCOL_CYCLE: [&str; 4] = ["kitty", "sixel", "iterm2", "halfblocks"];
+
+/// Next value for the Settings `b` cycle: auto (`None`) first, then each
+/// recognized protocol in [`IMAGE_PROTOCOL_CYCLE`] order, wrapping back to
+/// auto. An unrecognized stored value is treated as auto. Without a detected
+/// picker (`base_available = false`) the cell size is unknown, so only
+/// halfblocks — which needs no cell query — can be forced.
+fn next_image_protocol_setting(current: Option<&str>, base_available: bool) -> Option<String> {
+    let position = current.and_then(|value| {
+        IMAGE_PROTOCOL_CYCLE
+            .iter()
+            .position(|candidate| *candidate == value)
+    });
+    let start = position.map_or(0, |index| index + 1);
+    IMAGE_PROTOCOL_CYCLE[start..]
+        .iter()
+        .find(|candidate| base_available || **candidate == "halfblocks")
+        .map(|candidate| candidate.to_string()) // empty slice = back to auto
+}
+
+/// Build the effective picker for an `image_protocol` setting. Auto keeps the
+/// detected picker; halfblocks is always buildable; the other protocols ride
+/// on the detected picker's cell size, so they require a base. Unrecognized
+/// values behave as auto. Returns the picker plus whether it is player-forced.
+fn build_image_picker(
+    base: Option<&ratatui_image::picker::Picker>,
+    setting: Option<&str>,
+) -> (Option<ratatui_image::picker::Picker>, bool) {
+    let forced = match (setting, base.is_some()) {
+        (Some("kitty"), true) => Some(ratatui_image::picker::ProtocolType::Kitty),
+        (Some("sixel"), true) => Some(ratatui_image::picker::ProtocolType::Sixel),
+        (Some("iterm2"), true) => Some(ratatui_image::picker::ProtocolType::Iterm2),
+        (Some("halfblocks"), _) => Some(ratatui_image::picker::ProtocolType::Halfblocks),
+        _ => None,
+    };
+    match forced {
+        Some(protocol) => {
+            let mut picker = match base {
+                Some(base) => base.clone(),
+                None => ratatui_image::picker::Picker::halfblocks(),
+            };
+            picker.set_protocol_type(protocol);
+            (Some(picker), true)
+        }
+        None => (base.cloned(), false),
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // consumes all host-owned UI requests in one place
@@ -593,14 +1299,18 @@ async fn handle_ui_requests(
     config: &mut RuntimeConfig,
     save_store: &SaveStore,
     tts: &TtsService,
-    scene_images: &mut images::LocationImageStore,
+    scene_images: &mut SceneImageStores,
+    base_image_picker: Option<&ratatui_image::picker::Picker>,
     tx: &UnboundedSender<HostMessage>,
     cancellation: &mut Option<(story_model::uuid::Uuid, CancellationToken)>,
     resume_engine: &mut Option<EngineState>,
+    automation: &mut TurnAutomation,
 ) -> Result<(), String> {
     if app.take_settings_opened() {
         if let Some((generation_id, token)) = cancellation.take() {
             token.cancel();
+            automation.cancel_retry();
+            app.set_story_notice(None);
             dispatch(
                 EngineCommand::CancelGeneration { generation_id },
                 engine,
@@ -635,6 +1345,13 @@ async fn handle_ui_requests(
             }
             None => settings::refresh_model_list(app, provider, provider_config, false).await,
         }
+        // Push the host-owned data the new settings modals edit: the note
+        // prefill and the pack's lorebook (edits hot-swap via the engine and
+        // persist only when the pack ships its lorebook as a file).
+        app.set_author_note(user_settings.effective_author_note().unwrap_or_default());
+        let persisted =
+            story_persistence::lorebook_path(std::path::Path::new(app.current_pack_dir())).exists();
+        app.set_lorebook_data(&pack.lorebook.entries, persisted);
     }
     if app.take_model_reload_requested() {
         settings::refresh_model_list(app, provider, provider_config, true).await;
@@ -659,6 +1376,7 @@ async fn handle_ui_requests(
         settings::apply_model(
             app,
             model,
+            config,
             provider_config,
             provider,
             user_settings,
@@ -726,7 +1444,9 @@ async fn handle_ui_requests(
                 );
                 app.follow_story_end();
                 app.close_home();
-                refresh_location_images(app, pack, engine, scene_images);
+                refresh_scene_images(app, pack, engine, scene_images);
+                // A fresh run refills the per-turn automation budget.
+                automation.reset_turn();
                 dispatch(
                     EngineCommand::StartNewGame,
                     engine,
@@ -743,19 +1463,14 @@ async fn handle_ui_requests(
                 .await?;
             }
             HomeRequest::Continue => {
-                if let Some(mut restored) = resume_engine.take() {
-                    restored.use_director_writer = config.use_director_writer;
-                    *engine = restored;
-                    app.set_view(build_view(engine, pack, None, None));
-                    app.set_lists(
-                        &engine.game.history,
-                        &engine.game.memories,
-                        &pack.metadata.initial_state.location,
-                    );
-                    app.follow_story_end();
-                    app.set_can_continue(false);
-                    refresh_location_images(app, pack, engine, scene_images);
-                }
+                apply_resume(
+                    app,
+                    engine,
+                    pack,
+                    resume_engine,
+                    scene_images,
+                    config.use_director_writer,
+                );
             }
             HomeRequest::PickPack => {
                 let current = app.current_pack_dir().to_string();
@@ -777,6 +1492,35 @@ async fn handle_ui_requests(
         save_user_settings(&config.save_dir, user_settings)?;
         app.update_settings_images(enabled, app.image_backend_label());
     }
+    if app.take_image_backend_cycle_request() {
+        let next = next_image_protocol_setting(
+            user_settings.image_protocol.as_deref(),
+            base_image_picker.is_some(),
+        );
+        user_settings.image_protocol = next.clone();
+        save_user_settings(&config.save_dir, user_settings)?;
+        let (picker, manual) = build_image_picker(base_image_picker, next.as_deref());
+        app.set_image_picker(picker, manual);
+        app.update_settings_images(app.images_enabled(), app.image_backend_label());
+        // Encoded images still carry the previous protocol — resolve every
+        // location/emotion again so the transcript reflects the new one
+        // immediately (same lockstep as a pack switch).
+        reset_scene_images(app, scene_images);
+        refresh_scene_images(app, pack, engine, scene_images);
+    }
+    if app.take_expressions_toggle_request() {
+        let enabled = !app.expressions_enabled();
+        app.set_expressions_enabled(enabled);
+        user_settings.expressions_enabled = Some(enabled);
+        save_user_settings(&config.save_dir, user_settings)?;
+        app.update_settings_expressions(enabled);
+        if enabled {
+            // A session that STARTED with sprites off has a cold sprite
+            // store — resolve the beats in play now instead of waiting for
+            // the next publish, so re-enabling really is instant.
+            refresh_scene_images(app, pack, engine, scene_images);
+        }
+    }
     if app.take_tts_toggle_request() {
         let enabled = !tts.enabled().await;
         tts.set_enabled(enabled).await;
@@ -788,6 +1532,164 @@ async fn handle_ui_requests(
             backend: status.backend.as_str().to_string(),
             voice: status.voice.clone(),
         });
+    }
+    if app.take_generation_toggle_request() {
+        // Flip the session value AND the live engine: the next
+        // SubmitChoice/SubmitFreeAction reads the engine flag, while saves
+        // and new games read the config. An in-flight generation (cancelled
+        // when Settings opened) is unaffected — accept commands never
+        // consult the flag.
+        let two_stage = !config.use_director_writer;
+        config.use_director_writer = two_stage;
+        engine.use_director_writer = two_stage;
+        user_settings.use_director_writer = Some(two_stage);
+        save_user_settings(&config.save_dir, user_settings)?;
+        app.update_settings_generation(two_stage);
+    }
+    if app.take_sampling_style_cycle_request() {
+        // The preset rides the request config, so the next turn generates
+        // with the new triple; the provider rebuild makes that certain.
+        settings::cycle_sampling_style(app, provider_config, provider, user_settings, config)
+            .await?;
+    }
+    if let Some((name, persona)) = app.take_persona_submit_request() {
+        // The pack's system prompt is re-read on every turn build, so the
+        // rewritten profile section applies from the next turn on.
+        let (label, name_text, persona_text) =
+            settings::activate_persona(name, persona, pack, user_settings, &config.player, config)?;
+        app.update_settings_persona(label, name_text, persona_text);
+    }
+    if let Some(note) = app.take_author_note_submit() {
+        // Same next-turn semantics as the persona: the pack's system prompt
+        // is re-read on every turn build.
+        let effective =
+            settings::activate_author_note(note, pack, user_settings, &config.player, config)?;
+        app.set_author_note(&effective);
+    }
+    if let Some(entries) = app.take_lorebook_request() {
+        // Hot-swap the session first (the very next turn matches against the
+        // new entries), then persist when the pack ships lorebook.toml —
+        // otherwise the edit stays session-only, matching the dialog notice.
+        dispatch(
+            EngineCommand::SetLorebookEntries {
+                entries: entries.clone(),
+            },
+            engine,
+            app,
+            pack,
+            provider,
+            config,
+            save_store,
+            tts,
+            scene_images,
+            tx,
+            cancellation,
+        )
+        .await?;
+        pack.lorebook.entries = entries;
+        let pack_dir = std::path::Path::new(app.current_pack_dir());
+        if let Err(message) = story_persistence::save_lorebook(pack_dir, &pack.lorebook) {
+            tracing::info!(%message, "lorebook edit stays session-only");
+        }
+    }
+    if app.take_continue_request() {
+        // Side generation: appends to the last narration without a new turn.
+        automation.note_side_command(EngineCommand::ContinueNarration);
+        dispatch(
+            EngineCommand::ContinueNarration,
+            engine,
+            app,
+            pack,
+            provider,
+            config,
+            save_store,
+            tts,
+            scene_images,
+            tx,
+            cancellation,
+        )
+        .await?;
+    }
+    if app.take_group_scene_request() {
+        // Side generation: a cast group-conversation scene bit attaches to
+        // the last committed narration (choices/state stay untouched).
+        automation.note_side_command(EngineCommand::GroupScene);
+        dispatch(
+            EngineCommand::GroupScene,
+            engine,
+            app,
+            pack,
+            provider,
+            config,
+            save_store,
+            tts,
+            scene_images,
+            tx,
+            cancellation,
+        )
+        .await?;
+    }
+    if app.take_suggest_action_request() {
+        // Side generation: the suggested action lands in the input buffer.
+        automation.note_side_command(EngineCommand::SuggestAction);
+        dispatch(
+            EngineCommand::SuggestAction,
+            engine,
+            app,
+            pack,
+            provider,
+            config,
+            save_store,
+            tts,
+            scene_images,
+            tx,
+            cancellation,
+        )
+        .await?;
+    }
+    if app.take_cycle_variant_back_request() {
+        // Swap the last committed turn's narration to the previous kept
+        // variant (engine rewrites + autosaves; the view carries the badge).
+        dispatch(
+            EngineCommand::CycleTurnVariant { delta: -1 },
+            engine,
+            app,
+            pack,
+            provider,
+            config,
+            save_store,
+            tts,
+            scene_images,
+            tx,
+            cancellation,
+        )
+        .await?;
+    }
+    if app.take_cycle_variant_forward_request() {
+        dispatch(
+            EngineCommand::CycleTurnVariant { delta: 1 },
+            engine,
+            app,
+            pack,
+            provider,
+            config,
+            save_store,
+            tts,
+            scene_images,
+            tx,
+            cancellation,
+        )
+        .await?;
+    }
+    if let Some(digit) = app.take_quick_action_request()
+        && let Some(text) = user_settings.quick_action(&digit)
+    {
+        app.set_input_text(text);
+    }
+    // A completed suggest generation leaves its text for the input buffer;
+    // the player edits and sends it themselves.
+    if let Some(suggestion) = engine.take_suggested_action() {
+        app.set_input_text(&suggestion);
     }
     if let Some(path) = app.take_import_request() {
         // ADR-003: the host owns all file I/O. The importer runs off the UI
@@ -829,6 +1731,7 @@ async fn handle_ui_requests(
         });
     }
     if let Some(pack_dir) = app.take_pack_swap_request() {
+        let player = effective_player_profile(user_settings, &config.player);
         swap_pack(
             app,
             &pack_dir,
@@ -836,6 +1739,8 @@ async fn handle_ui_requests(
             engine,
             scene_images,
             config,
+            &player,
+            user_settings.effective_author_note(),
             cancellation,
             resume_engine,
         );
@@ -895,36 +1800,53 @@ async fn handle_ui_requests(
             config.use_director_writer,
             cancellation,
         );
-        refresh_location_images(app, pack, engine, scene_images);
+        refresh_scene_images(app, pack, engine, scene_images);
     }
     Ok(())
 }
 
-fn apply_player_profile(pack: &mut StoryPack, profile: &storytui::config::PlayerProfile) {
-    let name = profile
-        .name
-        .as_deref()
-        .map(str::trim)
-        .filter(|name| !name.is_empty());
-    let persona = profile
-        .persona
-        .as_deref()
-        .map(str::trim)
-        .filter(|persona| !persona.is_empty());
-    if name.is_none() && persona.is_none() {
-        return;
+/// Compile the TOML-only display rules (`[[display_rules]]`) for the
+/// transcript renderer: capped at [`storytui::config::MAX_DISPLAY_RULES`],
+/// disabled rules are kept out, and an invalid pattern is skipped with a
+/// warning rather than failing the session. Pure.
+fn compile_display_rules(rules: &[storytui::config::DisplayRule]) -> Vec<(regex::Regex, String)> {
+    let mut compiled = Vec::new();
+    // The cap counts APPLIED rules: neither a disabled rule nor an invalid
+    // pattern may eat a slot a later valid rule could use.
+    for rule in rules.iter().filter(|rule| rule.enabled) {
+        if compiled.len() >= storytui::config::MAX_DISPLAY_RULES {
+            break;
+        }
+        match regex::Regex::new(&rule.pattern) {
+            Ok(pattern) => compiled.push((pattern, rule.replacement.clone())),
+            Err(error) => {
+                tracing::warn!(pattern = %rule.pattern, %error, "invalid display rule skipped");
+            }
+        }
     }
-    pack.prompts.system.push_str("\n\n# Player profile\n");
-    if let Some(name) = name {
-        pack.prompts.system.push_str(&format!(
-            "플레이어의 이름은 `{name}`이다. 다른 이름이나 '이름 씨' 같은 임시 호칭을 만들지 말고, 필요한 호칭에는 `{name} 씨`를 사용한다.\n"
-        ));
+    compiled
+}
+
+/// Capture the final sent prompt for the Settings `r` viewer: system-role
+/// messages form the system section, everything else the user section.
+/// Takes the message slice directly — the single-pass, Director, and Writer
+/// requests all carry the same `messages` shape. Session memory only — never
+/// persisted, never logged.
+fn capture_prompt_preview(app: &mut App, messages: &[story_model::ChatMessage]) {
+    let mut system = String::new();
+    let mut user = String::new();
+    for message in messages {
+        if message.role == "system" {
+            system.push_str(&message.content);
+            system.push('\n');
+        } else {
+            if !user.is_empty() {
+                user.push_str("\n---\n");
+            }
+            user.push_str(&message.content);
+        }
     }
-    if let Some(persona) = persona {
-        pack.prompts.system.push_str(&format!(
-            "플레이어 페르소나: {persona}\n플레이어가 직접 입력하지 않은 행동·감정은 이 페르소나만으로 확정하지 않는다.\n"
-        ));
-    }
+    app.set_prompt_preview(&system, &user);
 }
 
 /// Pump a provider streaming call's writer events to the UI while awaiting
@@ -958,7 +1880,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)] // host adapter keeps all effect-owned handles explicit
-async fn dispatch(
+pub async fn dispatch(
     command: EngineCommand,
     engine: &mut EngineState,
     app: &mut App,
@@ -967,7 +1889,7 @@ async fn dispatch(
     config: &RuntimeConfig,
     save_store: &SaveStore,
     tts: &TtsService,
-    scene_images: &mut images::LocationImageStore,
+    scene_images: &mut SceneImageStores,
     tx: &UnboundedSender<HostMessage>,
     cancellation: &mut Option<(story_model::uuid::Uuid, CancellationToken)>,
 ) -> Result<(), String> {
@@ -1004,7 +1926,7 @@ async fn dispatch(
                 if turn_completed && !narration.trim().is_empty() {
                     tts.speak(narration).await;
                 }
-                refresh_location_images(app, pack, engine, scene_images);
+                refresh_scene_images(app, pack, engine, scene_images);
             }
             EngineEffect::ShowRecoverableError(error) => app.view.error = Some(error),
             // No model selected yet (first run before auto-setup succeeded):
@@ -1044,6 +1966,7 @@ async fn dispatch(
                 } else {
                     request.model.clone()
                 };
+                capture_prompt_preview(app, &request.messages);
                 tracing::info!(
                     %generation_id,
                     %model,
@@ -1062,8 +1985,8 @@ async fn dispatch(
                 // best-effort — the completion message is identical either
                 // way (ADR-003: streaming render state lives in host/TUI,
                 // the engine is untouched).
-                let use_stream = config.provider.stream_turns
-                    && provider.capabilities().supports_streaming;
+                let use_stream =
+                    config.provider.stream_turns && provider.capabilities().supports_streaming;
                 tokio::spawn(async move {
                     let result = if use_stream {
                         let (events, events_rx) = tokio::sync::mpsc::channel(32);
@@ -1109,6 +2032,7 @@ async fn dispatch(
                 } else {
                     provider.model_name().to_string()
                 };
+                capture_prompt_preview(app, &request.messages);
                 tracing::info!(%generation_id, model = %director_model, "invoking Director stage");
                 tokio::spawn(async move {
                     let result = provider.direct(request, token).await;
@@ -1140,6 +2064,7 @@ async fn dispatch(
                 } else {
                     provider.model_name().to_string()
                 };
+                capture_prompt_preview(app, &request.messages);
                 tracing::info!(%generation_id, model = %model, "invoking Writer stage");
                 tokio::spawn(async move {
                     let (writer_events, writer_events_rx) = tokio::sync::mpsc::channel(32);
@@ -1222,8 +2147,137 @@ fn provider_failure_stage(error: &ProviderError) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{provider_error_view, provider_failure_stage};
+    use super::{
+        build_image_picker, compile_display_rules, next_image_protocol_setting,
+        provider_error_view, provider_failure_stage,
+    };
     use story_model::ProviderError;
+    use storytui::config::DisplayRule;
+
+    #[test]
+    fn display_rule_compilation_caps_skips_and_preserves_order() {
+        let rules: Vec<DisplayRule> = (0..storytui::config::MAX_DISPLAY_RULES + 4)
+            .map(|index| DisplayRule {
+                pattern: format!("패턴{index}"),
+                replacement: format!("치환{index}"),
+                enabled: index != 1, // one disabled rule in the middle
+            })
+            .collect();
+        let compiled = compile_display_rules(&rules);
+        // The cap holds, disabled rules are out, order is preserved.
+        assert_eq!(compiled.len(), storytui::config::MAX_DISPLAY_RULES);
+        assert!(
+            !compiled
+                .iter()
+                .any(|(_, replacement)| replacement == "치환1"),
+            "disabled rule is skipped"
+        );
+        assert_eq!(compiled[0].1, "치환0");
+        assert_eq!(compiled[1].1, "치환2");
+
+        // An invalid pattern is skipped with the rest intact.
+        let rules = vec![
+            DisplayRule {
+                pattern: "(unbalanced".to_string(),
+                replacement: "x".to_string(),
+                enabled: true,
+            },
+            DisplayRule {
+                pattern: "숫자".to_string(),
+                replacement: "N".to_string(),
+                enabled: true,
+            },
+        ];
+        let compiled = compile_display_rules(&rules);
+        assert_eq!(compiled.len(), 1);
+        assert!(compiled[0].0.is_match("한 숫자"));
+
+        // An invalid pattern must not consume a capped slot: twice as many
+        // rules as the cap with every other one invalid still fills the cap
+        // with valid rules only.
+        let rules: Vec<DisplayRule> = (0..storytui::config::MAX_DISPLAY_RULES * 4)
+            .map(|index| DisplayRule {
+                pattern: if index % 2 == 0 {
+                    "(bad".to_string()
+                } else {
+                    format!("좋은{index}")
+                },
+                replacement: format!("r{index}"),
+                enabled: true,
+            })
+            .collect();
+        let compiled = compile_display_rules(&rules);
+        assert_eq!(compiled.len(), storytui::config::MAX_DISPLAY_RULES);
+        assert!(
+            compiled
+                .iter()
+                .all(|(pattern, _)| pattern.as_str().starts_with("좋은")),
+            "only valid rules fill the cap"
+        );
+    }
+
+    #[test]
+    fn image_protocol_cycle_skips_unavailable_protocols() {
+        // With a detected picker: auto → kitty → sixel → iterm2 → halfblocks → auto.
+        assert_eq!(
+            next_image_protocol_setting(None, true).as_deref(),
+            Some("kitty")
+        );
+        assert_eq!(
+            next_image_protocol_setting(Some("kitty"), true).as_deref(),
+            Some("sixel")
+        );
+        assert_eq!(
+            next_image_protocol_setting(Some("iterm2"), true).as_deref(),
+            Some("halfblocks")
+        );
+        assert_eq!(next_image_protocol_setting(Some("halfblocks"), true), None);
+        // Without a detected picker only halfblocks is reachable.
+        assert_eq!(
+            next_image_protocol_setting(None, false).as_deref(),
+            Some("halfblocks")
+        );
+        assert_eq!(next_image_protocol_setting(Some("halfblocks"), false), None);
+        // An unrecognized stored value is treated as auto.
+        assert_eq!(
+            next_image_protocol_setting(Some("kity"), true).as_deref(),
+            Some("kitty")
+        );
+    }
+
+    #[test]
+    fn build_image_picker_forces_only_recognized_values() {
+        let base = ratatui_image::picker::Picker::halfblocks();
+        // Auto keeps the detected picker and is never manual.
+        let (picker, manual) = build_image_picker(Some(&base), None);
+        assert_eq!(
+            picker.as_ref().map(|p| p.protocol_type()),
+            Some(ratatui_image::picker::ProtocolType::Halfblocks)
+        );
+        assert!(!manual);
+        // A forced protocol rides on the base picker's cell size.
+        let (picker, manual) = build_image_picker(Some(&base), Some("sixel"));
+        assert_eq!(
+            picker.as_ref().map(|p| p.protocol_type()),
+            Some(ratatui_image::picker::ProtocolType::Sixel)
+        );
+        assert!(manual);
+        // Halfblocks can be forced even without a detected picker.
+        let (picker, manual) = build_image_picker(None, Some("halfblocks"));
+        assert_eq!(
+            picker.as_ref().map(|p| p.protocol_type()),
+            Some(ratatui_image::picker::ProtocolType::Halfblocks)
+        );
+        assert!(manual);
+        // kitty/sixel/iterm2 without a base fall back to auto.
+        let (picker, manual) = build_image_picker(None, Some("kitty"));
+        assert!(picker.is_none());
+        assert!(!manual);
+        // Unrecognized values behave as auto.
+        let (picker, manual) = build_image_picker(Some(&base), Some("kity"));
+        assert!(picker.is_some());
+        assert!(!manual);
+    }
 
     #[test]
     fn invalid_generation_hides_parser_internals_from_player() {
@@ -1269,6 +2323,36 @@ mod tests {
                 "schema: UUID parsing failed".to_string()
             )),
             "assistant_schema"
+        );
+    }
+    #[test]
+    fn enabling_expressions_mid_session_resolves_sprites_immediately() {
+        use super::{SceneImageStores, images, refresh_expression_images};
+        use story_core::engine::{EngineState, build_view};
+        use story_tui::App;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pack = images::tests::pack_at(dir.path());
+        let sprite = dir.path().join("images/expressions/yuna/neutral.png");
+        images::tests::write_png(&sprite);
+
+        let engine = EngineState::initial(&pack);
+        let mut app = App::new(build_view(&engine, &pack, None, None));
+        let mut stores = SceneImageStores::default();
+
+        // Off: the refresh is skipped entirely — nothing resolves.
+        app.set_expressions_enabled(false);
+        refresh_expression_images(&mut app, &pack, &engine, &mut stores);
+        assert_eq!(app.expression_sprite_count(), 0);
+
+        // A session that STARTED off must not wait for the next publish:
+        // turning ON resolves the beats in play right away (F-1).
+        app.set_expressions_enabled(true);
+        refresh_expression_images(&mut app, &pack, &engine, &mut stores);
+        assert_eq!(
+            app.expression_sprite_count(),
+            1,
+            "cold toggle-on resolves the opening emotion immediately"
         );
     }
 }

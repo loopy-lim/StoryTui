@@ -193,9 +193,8 @@ impl NarrationStreamExtractor {
             }
             0xDC00..=0xDFFF => {
                 if let Some(high) = self.pending_high_surrogate.take() {
-                    let c = 0x10000
-                        + ((u32::from(high) - 0xD800) << 10)
-                        + (u32::from(code) - 0xDC00);
+                    let c =
+                        0x10000 + ((u32::from(high) - 0xD800) << 10) + (u32::from(code) - 0xDC00);
                     if let Some(emoji) = char::from_u32(c) {
                         out.push(emoji);
                         return;
@@ -207,9 +206,7 @@ impl NarrationStreamExtractor {
                 if self.pending_high_surrogate.take().is_some() {
                     out.push(char::REPLACEMENT_CHARACTER);
                 }
-                out.push(
-                    char::from_u32(u32::from(code)).unwrap_or(char::REPLACEMENT_CHARACTER),
-                );
+                out.push(char::from_u32(u32::from(code)).unwrap_or(char::REPLACEMENT_CHARACTER));
             }
         }
     }
@@ -368,11 +365,8 @@ mod tests {
         for byte in sse.as_bytes() {
             for ev in parser.feed(std::slice::from_ref(byte)) {
                 if let SseEvent::Data(payload) = ev
-                    && let Ok(v) = story_model::serde_json::from_str::<
-                        serde_json::Value,
-                    >(&payload)
-                    && let Some(text) =
-                        v["choices"][0]["delta"]["content"].as_str()
+                    && let Ok(v) = story_model::serde_json::from_str::<serde_json::Value>(&payload)
+                    && let Some(text) = v["choices"][0]["delta"]["content"].as_str()
                 {
                     streamed.push_str(&extractor.feed(text));
                 }

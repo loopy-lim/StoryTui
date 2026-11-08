@@ -10,6 +10,7 @@
 
 pub mod dto;
 pub mod loader;
+pub mod lorebook_store;
 pub mod migrate;
 pub mod validate;
 

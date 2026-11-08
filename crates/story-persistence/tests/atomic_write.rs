@@ -61,6 +61,7 @@ fn sample_payload(turn: u32) -> SavePayload {
         stable_state: state,
         memories: Vec::new(),
         history: Vec::new(),
+        undo_stack: Vec::new(),
         audit_tail: Vec::new(),
     }
 }

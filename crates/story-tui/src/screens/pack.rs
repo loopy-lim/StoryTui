@@ -4,9 +4,11 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+
+use crate::theme::{BORDER_TYPE, Palette, Styles};
 
 use super::popup::{POPUP_WIDTH_MEDIUM, centered_rect};
 
@@ -57,14 +59,16 @@ pub fn render_pack_picker(
     if let Some(notice) = notice {
         lines.push(Line::from(Span::styled(
             format!("! {notice}"),
-            Style::default().fg(Color::Red),
+            Style::default()
+                .fg(Palette::DANGER)
+                .add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(""));
     }
     if labels.is_empty() {
         lines.push(Line::from(Span::styled(
             "불러올 수 있는 팩이 없습니다.",
-            Style::default().fg(Color::DarkGray),
+            Styles::muted(),
         )));
     } else {
         let active = selected.min(labels.len().saturating_sub(1));
@@ -72,11 +76,9 @@ pub fn render_pack_picker(
             let is_active = index == active;
             let prefix = if is_active { "▶ " } else { "  " };
             let style = if is_active {
-                Style::default()
-                    .fg(crate::theme::Palette::SELECTED)
-                    .add_modifier(Modifier::BOLD)
+                Styles::item_selected()
             } else {
-                Style::default().fg(crate::theme::Palette::PROSE)
+                Styles::item_normal()
             };
             lines.push(Line::from(Span::styled(format!("{prefix}{label}"), style)));
         }
@@ -84,14 +86,14 @@ pub fn render_pack_picker(
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "💡 마우스 클릭 · ↑↓ 이동 · Enter 이 팩 불러오기 · d 팩 삭제 · Esc 취소",
-        Style::default().fg(crate::theme::Palette::MUTED),
+        Styles::muted(),
     )));
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(crate::theme::BORDER_TYPE)
-        .border_style(crate::theme::Styles::border_primary())
-        .title(Span::styled(" ✦ 팩 선택 ✦ ", crate::theme::Styles::title()));
+        .border_type(BORDER_TYPE)
+        .border_style(Styles::border_primary())
+        .title(Span::styled(" ✦ 팩 선택 ✦ ", Styles::title()));
     frame.render_widget(
         Paragraph::new(lines)
             .block(block)
@@ -106,23 +108,26 @@ pub fn render_pack_delete_confirm(frame: &mut Frame, area: Rect, title: &str) {
     frame.render_widget(Clear, popup);
 
     let lines = vec![
-        Line::from(format!("「{title}」 팩 디렉터리를 삭제합니다.")),
-        Line::from(""),
-        Line::from("이 작업은 되돌릴 수 없습니다. 세이브는 유지됩니다."),
+        Line::from(Span::styled(
+            format!("「{title}」 팩 디렉터리를 삭제합니다."),
+            Styles::item_normal(),
+        )),
         Line::from(""),
         Line::from(Span::styled(
-            "Enter 삭제 · Esc 취소",
-            Style::default().fg(crate::theme::Palette::MUTED),
+            "이 작업은 되돌릴 수 없습니다. 세이브는 유지됩니다.",
+            Style::default().fg(Palette::CAUTION),
         )),
+        Line::from(""),
+        Line::from(Span::styled("Enter 삭제 · Esc 취소", Styles::muted())),
     ];
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(crate::theme::BORDER_TYPE)
-        .border_style(Style::default().fg(crate::theme::Palette::DANGER))
+        .border_type(BORDER_TYPE)
+        .border_style(Styles::border_danger())
         .title(Span::styled(
-            " 팩 삭제 ",
+            " ⚠ 팩 삭제 ",
             Style::default()
-                .fg(crate::theme::Palette::DANGER)
+                .fg(Palette::DANGER)
                 .add_modifier(Modifier::BOLD),
         ));
     frame.render_widget(Paragraph::new(lines).block(block), popup);

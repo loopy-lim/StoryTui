@@ -39,6 +39,15 @@ pub struct SavePayload {
     /// Tail of the field-level audit log (most recent entries). Bounded by
     /// the engine to keep saves compact.
     pub audit_tail: Vec<StateChangeLog>,
+    /// Committed-state snapshots of the engine's in-memory undo ring (oldest
+    /// first, capped at 8 by the engine). Lives on the payload — not the
+    /// envelope — so it is covered by `payload_checksum` and flows through
+    /// the existing `snapshot_payload` / `from_snapshot_payload` boundary
+    /// without extra host wiring. `default` keeps old saves loadable (empty
+    /// ring) and `skip_serializing_if` keeps their re-serialized bytes (and
+    /// therefore their checksums) unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub undo_stack: Vec<GameState>,
 }
 
 /// The on-disk envelope wrapping a [`SavePayload`] with the metadata the
@@ -144,6 +153,7 @@ mod tests {
             memories: Vec::new(),
             history: Vec::new(),
             audit_tail: Vec::new(),
+            undo_stack: Vec::new(),
         };
         let envelope = SaveEnvelope {
             save_schema_version: crate::SAVE_SCHEMA_VERSION,
@@ -166,5 +176,40 @@ mod tests {
         let back: SaveEnvelope = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.slot_id, envelope.slot_id);
         assert_eq!(back.payload.stable_state.story_id, "rainy-reunion");
+    }
+
+    #[test]
+    fn empty_undo_stack_is_omitted_and_absent_field_defaults_to_empty() {
+        let state = sample_state();
+        let payload = SavePayload {
+            stable_state: state,
+            memories: Vec::new(),
+            history: Vec::new(),
+            audit_tail: Vec::new(),
+            undo_stack: Vec::new(),
+        };
+        let json = serde_json::to_string(&payload).expect("serialize");
+        // Skip-on-empty keeps legacy save bytes (and their checksums) stable.
+        assert!(
+            !json.contains("undo_stack"),
+            "empty ring must not appear in serialized saves: {json}"
+        );
+
+        // An old save written before the field existed loads with an empty
+        // ring instead of failing.
+        let legacy: SavePayload =
+            serde_json::from_str(&json).expect("legacy payload without undo_stack loads");
+        assert!(legacy.undo_stack.is_empty());
+
+        // Present fields round-trip (this is the new-save shape).
+        let mut ringed = legacy;
+        ringed.undo_stack.push(ringed.stable_state.clone());
+        let bytes = serde_json::to_string(&ringed).expect("serialize");
+        let back: SavePayload = serde_json::from_str(&bytes).expect("deserialize");
+        assert_eq!(back.undo_stack.len(), 1);
+        assert_eq!(
+            serde_json::to_vec(&back.undo_stack[0]).unwrap(),
+            serde_json::to_vec(&ringed.stable_state).unwrap()
+        );
     }
 }

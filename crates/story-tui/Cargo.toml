@@ -13,6 +13,7 @@ crossterm.workspace = true
 tokio.workspace = true
 unicode-width.workspace = true
 unicode-segmentation.workspace = true
+regex.workspace = true
 story-model.workspace = true
 story-core.workspace = true
 story-persistence.workspace = true

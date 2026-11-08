@@ -90,4 +90,7 @@ pub use rules::{
 pub use save::{SaveEnvelope, SavePayload};
 pub use state::{CharacterState, ChoiceRef, GameState};
 pub use turn::{GeneratedTurn, GenerationWarning, ParsedAction, TokenUsage, TurnSummary};
-pub use view::{AppViewModel, ChoiceView, DomainErrorView, LoadingState, Screen, StatusLine};
+pub use view::{
+    AppViewModel, CharacterStatusView, ChoiceView, DomainErrorView, LoadingState, Screen,
+    StatusLine, TruncationStatus,
+};
