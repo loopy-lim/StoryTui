@@ -1185,9 +1185,12 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
     /// transport break (the streamed text is display-only and is replaced by
     /// the committed view). Timeout surfaces instead of falling back (a
     /// non-streaming re-ask would just re-wait the deadline), and
-    /// cancellation is player intent. A `stream:true`-rejecting 4xx is
-    /// retried exactly once in non-streaming form — a fallback to a different
-    /// request shape, not an ADR-002 4xx retry.
+    /// cancellation is player intent. An `HTTP 400` rejecting `stream:true` +
+    /// `response_format` together is retried exactly once as a stream WITHOUT
+    /// `response_format` (issue #11 — a stream-only rejection must not demote
+    /// the session's structured output; other 4xx codes skip this retry);
+    /// any remaining 4xx falls back to non-streaming form — a fallback to a
+    /// different request shape, not an ADR-002 4xx retry.
     async fn generate_turn_stream(
         &self,
         request: TurnRequest,
@@ -1200,9 +1203,33 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
         // a single deadline instead of doubling.
         let started = std::time::Instant::now();
         let mut emitted = false;
-        let result = self
-            .do_generate_turn_stream(&request, &sink, &cancel, &mut emitted)
+        let mut result = self
+            .do_generate_turn_stream(&request, &sink, &cancel, false, &mut emitted)
             .await;
+        // Issue #11: a 400 on a request carrying BOTH `stream:true` and
+        // `response_format` is ambiguous — the schema may be rejected, or the
+        // server may reject only the combination. Demoting structured output
+        // for the whole session here would over-trigger (a server that
+        // accepts the same schema non-streaming would lose guided decoding
+        // forever), so retry the STREAM once without response_format first.
+        // Only the non-streaming ladder's own 400 arm — where the schema
+        // alone is on trial — may demote.
+        if matches!(
+            result,
+            Err(ProviderError::Protocol(ref detail)) if detail == "HTTP 400"
+        ) && self.config.structured_output == StructuredOutputMode::Auto
+            && request.json_schema.is_some()
+            && self.structured_enabled()
+        {
+            tracing::warn!(
+                target: "story_provider::openai_compatible",
+                generation_id = %request.generation_id,
+                "streaming request with response_format rejected (HTTP 400); retrying the stream without response_format"
+            );
+            result = self
+                .do_generate_turn_stream(&request, &sink, &cancel, true, &mut emitted)
+                .await;
+        }
         match result {
             Ok(draft) => Ok(draft),
             // Cancellation is player intent, not a failure — never retried.
@@ -1411,18 +1438,22 @@ impl OpenAiCompatibleProvider {
     ///
     /// `emitted` is set once a narration chunk has actually been accepted by
     /// the sink, gating the non-streaming fallback in the caller.
+    /// `suppress_rf` omits `response_format` from this attempt (the
+    /// stream-only 400 retry of issue #11 — it does NOT touch the session's
+    /// structured-output flag).
     async fn do_generate_turn_stream(
         &self,
         request: &TurnRequest,
         sink: &Sender<WriterEvent>,
         cancel: &CancellationToken,
+        suppress_rf: bool,
         emitted: &mut bool,
     ) -> Result<GeneratedTurnDraft, ProviderError> {
         // Identical envelope to a normal turn (shared assembly), but SSE.
         // `include_usage` is required for spec-conformant servers (e.g.
         // api.openai.com) to attach a final usage frame — without it token
         // accounting silently disappears on the streamed path.
-        let mut body = self.assemble_turn_body(request, false, None);
+        let mut body = self.assemble_turn_body(request, suppress_rf, None);
         body.stream = true;
         body.stream_options = Some(crate::envelope::StreamOptions {
             include_usage: true,

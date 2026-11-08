@@ -42,6 +42,34 @@ fn turn_request() -> TurnRequest {
     }
 }
 
+/// Same request, but carrying the game contract's JSON schema so the
+/// `auto` structured-output mode attaches `response_format` (issue #11).
+fn turn_request_with_schema() -> TurnRequest {
+    let mut request = turn_request();
+    request.json_schema = Some(serde_json::json!({
+        "type": "object",
+        "properties": {
+            "narration": {"type": "string"},
+            "choices": {"type": "array"},
+            "state_patch": {"type": "object"},
+            "summary": {"type": "object"}
+        }
+    }));
+    request
+}
+
+/// A non-streaming success envelope wrapping a valid turn.
+fn non_streaming_turn_envelope() -> serde_json::Value {
+    serde_json::json!({
+        "id": "chatcmpl-x",
+        "model": "test",
+        "choices": [
+            {"index": 0, "message": {"role": "assistant", "content": serde_json::json!(VALID_TURN)}, "finish_reason": "stop"}
+        ],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+    })
+}
+
 /// A valid `GeneratedTurn` JSON (same shape as the openai_contract fixture).
 const VALID_TURN: &str = r#"{
   "narration": "비가 그쳤다. 노란 우산이 멈춰 섰다.",
@@ -590,5 +618,163 @@ async fn turn_stream_ignores_nested_narration_key_in_state_patch() {
     assert!(
         !narration.contains("메모장면"),
         "the nested set_strings value leaked into the stream: {narration:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// stream:true + response_format interactions (issue #11)
+// ---------------------------------------------------------------------------
+
+fn valid_turn_sse(n_pieces: usize) -> Vec<u8> {
+    let mut sse = String::new();
+    for piece in split_pieces(VALID_TURN, n_pieces) {
+        sse.push_str(&delta_event(&piece));
+    }
+    sse.push_str("data: [DONE]\n\n");
+    sse.into_bytes()
+}
+
+#[tokio::test]
+async fn turn_stream_sends_response_format_when_structured_enabled() {
+    // The default `auto` mode attaches response_format to the streaming
+    // request; a server that accepts the combination streams the turn.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("\"stream\":true"))
+        .and(body_string_contains("response_format"))
+        .respond_with(sse_response(valid_turn_sse(4)))
+        .mount(&server)
+        .await;
+
+    let mut cfg = cfg_for(&server);
+    cfg.structured_output = StructuredOutputMode::Auto;
+    let provider = OpenAiCompatibleProvider::new(cfg).expect("provider");
+    let (tx, _rx) = tokio::sync::mpsc::channel::<WriterEvent>(16);
+    let draft = provider
+        .generate_turn_stream(turn_request_with_schema(), tx, CancellationToken::new())
+        .await
+        .expect("stream with response_format must succeed");
+    assert_eq!(draft.narration, NARRATION);
+    let n = server.received_requests().await.expect("recorded").len();
+    assert_eq!(n, 1, "exactly one streaming request — got {n}");
+}
+
+#[tokio::test]
+async fn turn_stream_rf_400_retries_stream_without_rf_and_never_demotes() {
+    // Issue #11's core scenario: the server rejects `stream:true` +
+    // response_format with 400 but streams fine without it. A stream-ONLY
+    // rejection must NOT demote the session's structured output: the first
+    // call retries the stream without response_format, and the SECOND call
+    // still sends response_format on its first attempt (2 requests per turn,
+    // not 1). Demotion is reserved for the non-streaming 400 arm.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("\"stream\":true"))
+        .and(body_string_contains("response_format"))
+        .respond_with(ResponseTemplate::new(400))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("\"stream\":true"))
+        .respond_with(sse_response(valid_turn_sse(4)))
+        .mount(&server)
+        .await;
+
+    let mut cfg = cfg_for(&server);
+    cfg.structured_output = StructuredOutputMode::Auto;
+    let provider = OpenAiCompatibleProvider::new(cfg).expect("provider");
+
+    for turn in 0..2 {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<WriterEvent>(16);
+        let draft = provider
+            .generate_turn_stream(turn_request_with_schema(), tx, CancellationToken::new())
+            .await
+            .unwrap_or_else(|e| panic!("turn {turn} must succeed via the rf-less stream: {e}"));
+        assert_eq!(draft.narration, NARRATION);
+    }
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        4,
+        "each turn: rf+stream 400 then rf-less stream — got {}",
+        requests.len()
+    );
+    let rf_flags: Vec<bool> = requests
+        .iter()
+        .map(|request| {
+            let body = String::from_utf8_lossy(&request.body).into_owned();
+            body.contains("response_format")
+        })
+        .collect();
+    assert_eq!(
+        rf_flags,
+        vec![true, false, true, false],
+        "the second turn's FIRST attempt must still carry response_format (no demotion): {rf_flags:?}"
+    );
+}
+
+#[tokio::test]
+async fn turn_stream_rf_400_then_norf_400_demotes_via_non_streaming_ladder() {
+    // The full 400 ladder: rf+stream → rf-less stream → non-streaming rf are
+    // all rejected; only then does the session demote structured output and
+    // the rf-less non-streaming request succeeds. This pins that demotion is
+    // decided by the non-streaming 400 arm (schema alone on trial), not by
+    // the streaming rejections.
+    let server = MockServer::start().await;
+    // Both streaming shapes (rf and rf-less) get 400 from one catch-all;
+    // a separate rf+stream mock would be dead code here — the catch-all
+    // matches it too and both answers are the same 400.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("\"stream\":true"))
+        .respond_with(ResponseTemplate::new(400))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("\"stream\":false"))
+        .and(body_string_contains("response_format"))
+        .respond_with(ResponseTemplate::new(400))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("\"stream\":false"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(non_streaming_turn_envelope()))
+        .mount(&server)
+        .await;
+
+    let mut cfg = cfg_for(&server);
+    cfg.structured_output = StructuredOutputMode::Auto;
+    cfg.max_retries = 0;
+    let provider = OpenAiCompatibleProvider::new(cfg).expect("provider");
+    let (tx, _rx) = tokio::sync::mpsc::channel::<WriterEvent>(16);
+    let draft = provider
+        .generate_turn_stream(turn_request_with_schema(), tx, CancellationToken::new())
+        .await
+        .expect("the rf-less non-streaming request must complete the turn");
+    assert_eq!(draft.narration, NARRATION);
+
+    let requests = server.received_requests().await.expect("recorded");
+    let shapes: Vec<(bool, bool)> = requests
+        .iter()
+        .map(|request| {
+            let body = String::from_utf8_lossy(&request.body).into_owned();
+            (
+                body.contains("\"stream\":true"),
+                body.contains("response_format"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        shapes,
+        vec![(true, true), (true, false), (false, true), (false, false)],
+        "rf+stream → rf-less stream → rf non-streaming → rf-less non-streaming: {shapes:?}"
     );
 }
