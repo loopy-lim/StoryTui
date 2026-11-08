@@ -61,14 +61,30 @@ chooses to load. Two principles the code enforces:
    in Korean. A model that ignores this instruction is a model-quality
    issue the engine cannot fully prevent.
 
-## No streaming in the MVP binary path
+## MVP streaming caveats
 
-The `OpenAiCompatibleProvider` implements both `direct` (Director) and
-`write_stream` (Writer SSE) — see W10. The MVP single-call path
-(`generate_turn`) does not stream tokens to the renderer; the loading
-overlay only reflects the start/end of one generation call. The
-`EngineState::use_director_writer` flag toggles the 2-stage path; the
-settings UI does not yet expose it.
+Turn generation streams over SSE by default (`[provider] stream_turns` in
+`config/storytui.toml`, issue #2). Decoded `narration` prose renders
+incrementally through the same chain the Director/Writer path uses; the
+committed turn always comes from the strict full-text parser. Remaining
+limitations:
+
+- The streaming attempt is single-shot. If it fails **before** the first
+  narration chunk (connect error, `stream:true`-rejecting 4xx/5xx), the
+  provider silently falls back to the non-streaming request with its full
+  retry ladder. If it fails **after** a chunk was shown, the error surfaces
+  and the engine restores the checkpoint — no transparent retry, because a
+  retry would visibly duplicate text.
+- If the host's event channel is momentarily full, a narration chunk is
+  dropped from the partial display (same policy as the Writer path); the
+  committed turn is unaffected because it comes from the full text.
+- The `min_narration_chars` rewrite (currently disabled at `0`) only runs on
+  the non-streaming path; a streamed short scene is kept as-is.
+- `request_timeout_ms` is a reqwest client timeout that bounds the whole
+  stream (code default 180 s, shipped profile 600 s) — same condition as the
+  Writer path.
+- The settings UI does not yet expose `stream_turns` (edit the TOML), nor
+  `EngineState::use_director_writer`.
 
 ## Cross-pack runtime evidence is still limited
 

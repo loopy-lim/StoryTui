@@ -1187,6 +1187,217 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
             usage,
         })
     }
+
+    /// Streaming MVP turn path (issue #2): SSE deltas are surfaced as decoded
+    /// `narration` chunks while the full JSON object accumulates; the final
+    /// draft always comes from the existing strict parser on the complete
+    /// text.
+    ///
+    /// Retry policy: single streaming attempt — once a chunk has been
+    /// surfaced a transparent retry would duplicate visible text. A failure
+    /// BEFORE the first chunk falls back to the non-streaming
+    /// [`Self::generate_turn`], which reuses the full retry ladder (HTTP 400
+    /// auto-fallback, envelope repair). A `stream:true`-rejecting 4xx is
+    /// therefore retried exactly once in non-streaming form — a fallback to
+    /// a different request shape, not an ADR-002 4xx retry.
+    async fn generate_turn_stream(
+        &self,
+        request: TurnRequest,
+        sink: Sender<WriterEvent>,
+        cancel: CancellationToken,
+    ) -> Result<GeneratedTurnDraft, ProviderError> {
+        let mut emitted = false;
+        let result = self
+            .do_generate_turn_stream(&request, &sink, &cancel, &mut emitted)
+            .await;
+        match result {
+            Ok(draft) => Ok(draft),
+            // Cancellation is player intent, not a failure — never retried.
+            Err(ProviderError::Cancelled) => Err(ProviderError::Cancelled),
+            // A timeout means the model is slow; re-asking non-streaming
+            // would just re-wait the full deadline (do_generate's timeout
+            // policy), so surface it for the player to act on.
+            Err(error @ ProviderError::Timeout { .. }) => Err(error),
+            Err(error) if !emitted => {
+                tracing::warn!(
+                    target: "story_provider::openai_compatible",
+                    generation_id = %request.generation_id,
+                    error = %error,
+                    "turn streaming failed before any narration chunk; falling back to non-streaming generation"
+                );
+                self.generate_turn(request, cancel).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl OpenAiCompatibleProvider {
+    /// Single-attempt streaming body of [`Self::generate_turn_stream`].
+    ///
+    /// `emitted` is set once a narration chunk has actually been accepted by
+    /// the sink, gating the non-streaming fallback in the caller.
+    async fn do_generate_turn_stream(
+        &self,
+        request: &TurnRequest,
+        sink: &Sender<WriterEvent>,
+        cancel: &CancellationToken,
+        emitted: &mut bool,
+    ) -> Result<GeneratedTurnDraft, ProviderError> {
+        // Mirror `do_generate`'s operator-profile clamps: the engine owns
+        // prompt construction, the provider owns sampling.
+        let mut configured_request = request.clone();
+        configured_request.temperature = self.config.temperature;
+        configured_request.top_p = self.config.top_p;
+        configured_request.top_k = self.config.top_k;
+        configured_request.max_tokens = if request.max_tokens == 0 {
+            self.config.max_tokens
+        } else {
+            request.max_tokens.min(self.config.max_tokens)
+        };
+        let bounded_request = bound_context(&configured_request, self.config.context_budget_tokens);
+        let send_rf = self.structured_enabled() && request.json_schema.is_some();
+        let model_name = if request.model.is_empty() || request.model == "mock" {
+            &self.config.model
+        } else {
+            &request.model
+        };
+        let mut body = ChatCompletionRequest::from_turn(&bounded_request, model_name, send_rf);
+        body.max_tokens_field = self.config.max_tokens_field;
+        // Same envelope as a normal turn, but as SSE.
+        body.stream = true;
+
+        if cancel.is_cancelled() {
+            return Err(ProviderError::Cancelled);
+        }
+
+        // Single attempt (see the method-level retry note). Pre-stream
+        // errors (connect / 4xx / 5xx) either fall back to the
+        // non-streaming path in the caller or surface immediately.
+        let send = self
+            .authorize(self.client.post(self.chat_url()))
+            .json(&body)
+            .send();
+        let resp = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
+            r = send => r.map_err(|e| map_send_error(e, self.config.request_timeout_ms))?,
+        };
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(ProviderError::Protocol(format!("HTTP {}", status.as_u16())));
+        }
+
+        let mut stream = resp.bytes_stream();
+        let mut parser = SseParser::new();
+        let mut full_text = String::new();
+        let mut extractor = crate::narration_stream::NarrationStreamExtractor::new();
+        let mut usage: Option<TokenUsage> = None;
+        let mut saw_done = false;
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    // Cancel discards any buffered / in-flight text.
+                    return Err(ProviderError::Cancelled);
+                }
+                chunk = stream.next() => {
+                    match chunk {
+                        None => break,
+                        Some(Err(e)) => {
+                            return Err(map_send_error(e, self.config.request_timeout_ms));
+                        }
+                        Some(Ok(bytes)) => {
+                            for ev in parser.feed(bytes.as_ref()) {
+                                match ev {
+                                    SseEvent::Data(payload) => {
+                                        if let Some(parsed) = parse_stream_delta(&payload) {
+                                            if let Some(text) = parsed.text
+                                                && !text.is_empty()
+                                            {
+                                                full_text.push_str(&text);
+                                                // Only the decoded narration
+                                                // prose is surfaced; JSON
+                                                // tokens stay invisible.
+                                                let narration = extractor.feed(&text);
+                                                if !narration.is_empty()
+                                                    && sink
+                                                        .try_send(WriterEvent::Chunk {
+                                                            text: narration,
+                                                        })
+                                                        .is_ok()
+                                                {
+                                                    *emitted = true;
+                                                }
+                                            }
+                                            if let Some(u) = parsed.usage {
+                                                usage = Some(u);
+                                            }
+                                        }
+                                        // Unknown payloads (keep-alive
+                                        // comments, unparseable deltas) are
+                                        // ignored.
+                                    }
+                                    SseEvent::Done => {
+                                        saw_done = true;
+                                        break;
+                                    }
+                                    SseEvent::Incomplete => {}
+                                }
+                            }
+                            if saw_done {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !saw_done {
+            // Stream ended without `[DONE]` — protocol error so the host
+            // surfaces a recoverable error and the engine restores the
+            // checkpoint rather than committing partial text.
+            return Err(ProviderError::Protocol(
+                "stream ended without [DONE]".to_string(),
+            ));
+        }
+
+        // Best-effort final notification; a dropped receiver is not an error.
+        let _ = sink.try_send(WriterEvent::Done {
+            usage: usage.clone(),
+        });
+        log_token_usage("turn", request.generation_id, model_name, usage.clone());
+
+        // The committed turn ALWAYS goes through the existing strict parser
+        // on the complete text — the streaming extractor is display-only.
+        let parsed_content = if is_choice_only_request(request) {
+            crate::recovery::parse_generated_choices(&full_text, request.generation_id)
+        } else {
+            parse_generated_turn(&full_text, request.generation_id)
+        };
+        match parsed_content {
+            Ok(outcome) => {
+                let mut draft = outcome.draft;
+                if draft.usage.is_none() {
+                    draft.usage = usage;
+                }
+                Ok(draft)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "story_provider::openai_compatible",
+                    generation_id = %request.generation_id,
+                    model = %self.config.model,
+                    assistant_content_chars = full_text.chars().count(),
+                    error = %e,
+                    "streamed turn content rejected by game response contract"
+                );
+                Err(e)
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

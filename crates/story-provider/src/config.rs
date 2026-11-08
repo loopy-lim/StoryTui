@@ -111,6 +111,13 @@ pub struct ProviderConfig {
     /// Structured-output mode (see [`StructuredOutputMode`]).
     #[serde(default = "default_structured_output")]
     pub structured_output: StructuredOutputMode,
+    /// Stream turn generation over SSE and surface decoded narration
+    /// incrementally (issue #2). When the stream fails before the first
+    /// narration chunk — or the provider does not advertise
+    /// `supports_streaming` — generation falls back to the existing
+    /// non-streaming request.
+    #[serde(default = "default_stream_turns")]
+    pub stream_turns: bool,
 }
 
 impl ProviderConfig {
@@ -139,6 +146,7 @@ impl ProviderConfig {
             max_retries: default_max_retries(),
             context_budget_tokens: default_context_budget_tokens(),
             structured_output: default_structured_output(),
+            stream_turns: default_stream_turns(),
         }
     }
 }
@@ -227,6 +235,9 @@ fn default_context_budget_tokens() -> u32 {
 }
 fn default_structured_output() -> StructuredOutputMode {
     StructuredOutputMode::Auto
+}
+fn default_stream_turns() -> bool {
+    true
 }
 
 #[cfg(test)]

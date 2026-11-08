@@ -526,9 +526,11 @@ mod tests {
 
     #[test]
     fn world_info_json_gets_a_guidance_error() {
-        let error = parse_card_json(r#"{"entries": {"0": {"content": "x"}}}"#)
-            .err()
-            .expect("world info must be rejected");
+        let Err(error) =
+            parse_card_json(r#"{"entries": {"0": {"content": "x"}}}"#)
+            else {
+                panic!("world info must be rejected");
+            };
         assert!(error.contains("--lorebook"), "{error}");
     }
 

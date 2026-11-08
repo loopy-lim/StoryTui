@@ -1019,10 +1019,43 @@ async fn dispatch(
                     %model,
                     choice_refresh = is_choice_refresh,
                     max_tokens = request.max_tokens,
+                    streaming = config.provider.stream_turns
+                        && provider.capabilities().supports_streaming,
                     "invoking generation"
                 );
+                // MVP streaming path (issue #2): when enabled and the
+                // provider advertises SSE support, forward decoded narration
+                // chunks through the same WriterChunk → streaming_narration
+                // render chain the Director/Writer path uses. The provider
+                // itself falls back to a non-streaming request when the
+                // stream fails before the first chunk, so this stays
+                // best-effort — the completion message is identical either
+                // way (ADR-003: streaming render state lives in host/TUI,
+                // the engine is untouched).
+                let use_stream = config.provider.stream_turns
+                    && provider.capabilities().supports_streaming;
                 tokio::spawn(async move {
-                    let result = provider.generate_turn(request, token).await;
+                    let result = if use_stream {
+                        let (events, mut events_rx) = tokio::sync::mpsc::channel(32);
+                        let write = provider.generate_turn_stream(request, events, token);
+                        tokio::pin!(write);
+                        loop {
+                            tokio::select! {
+                                event = events_rx.recv() => match event {
+                                    Some(story_model::WriterEvent::Chunk { text }) => {
+                                        let _ = tx.send(HostMessage::WriterChunk { generation_id, text });
+                                    }
+                                    Some(story_model::WriterEvent::Error { detail }) => {
+                                        tracing::warn!(%generation_id, %detail, "turn stream soft error");
+                                    }
+                                    Some(story_model::WriterEvent::Done { .. }) | None => {}
+                                },
+                                result = &mut write => break result,
+                            }
+                        }
+                    } else {
+                        provider.generate_turn(request, token).await
+                    };
                     let _ = tx.send(HostMessage::Generation {
                         generation_id,
                         model,

@@ -13,6 +13,7 @@ pub mod config;
 pub mod envelope;
 pub mod error;
 pub mod mock;
+pub mod narration_stream;
 pub mod openai_compatible;
 pub mod provider;
 pub mod recovery;

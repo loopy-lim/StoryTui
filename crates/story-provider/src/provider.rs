@@ -25,6 +25,12 @@ use tokio_util::sync::CancellationToken;
 /// `Arc<dyn LlmProvider>`). The four methods are intentionally minimal:
 /// identity, advertised capabilities, health probe, and the single
 /// generation entry point.
+///
+/// `clippy::double_must_use` fires inside the `#[async_trait]` macro
+/// expansion (rustc 1.99 marks the boxed must_use future returning a
+/// must_use `Result`); the reason cannot be carried into the generated
+/// items, so the lint is suppressed at the trait.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
     /// Stable provider id (e.g. `"mock"`, `"openai-http"`), surfaced in logs.
@@ -69,5 +75,27 @@ pub trait LlmProvider: Send + Sync {
         _cancel: CancellationToken,
     ) -> Result<WriterFinish, ProviderError> {
         Err(ProviderError::UnsupportedCapability("streaming".into()))
+    }
+
+    /// Streaming variant of [`Self::generate_turn`] (issue #2). `sink`
+    /// receives [`WriterEvent::Chunk`]s carrying the decoded `narration`
+    /// prose as it arrives; the method returns the final
+    /// [`GeneratedTurnDraft`] built from the complete text through the
+    /// existing strict parser. Real impl on
+    /// [`crate::OpenAiCompatibleProvider`]; the default returns
+    /// [`ProviderError::UnsupportedCapability`] so providers that do not
+    /// advertise `supports_streaming` (e.g. [`crate::MockProvider`]) keep
+    /// using the non-streaming [`Self::generate_turn`].
+    ///
+    /// Implementations that fail BEFORE the first chunk may transparently
+    /// fall back to [`Self::generate_turn`]; once a chunk has been surfaced
+    /// a failure must be returned so the engine's checkpoint recovery runs.
+    async fn generate_turn_stream(
+        &self,
+        _req: TurnRequest,
+        _sink: Sender<WriterEvent>,
+        _cancel: CancellationToken,
+    ) -> Result<GeneratedTurnDraft, ProviderError> {
+        Err(ProviderError::UnsupportedCapability("turn_streaming".into()))
     }
 }
