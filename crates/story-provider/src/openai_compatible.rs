@@ -359,23 +359,24 @@ impl OpenAiCompatibleProvider {
     /// on success, or an error. `suppress_rf` is set on the Auto-fallback pass
     /// so `response_format` is omitted even though the capability flag is
     /// already disabled for the session.
-    async fn do_generate(
+    /// Assemble the chat-completions body for a turn request. The engine
+    /// owns prompt construction, while the runtime provider owns sampling —
+    /// MVP placeholder values embedded in a [`TurnRequest`] never override
+    /// the operator's TOML profile. Engine-owned repair requests may carry a
+    /// smaller output cap (respected, with the profile as the upper bound)
+    /// and a deterministic `temperature_override`. Shared by the
+    /// non-streaming retry loop and the streaming path so both sample with
+    /// identical parameters.
+    fn assemble_turn_body(
         &self,
         request: &TurnRequest,
         suppress_rf: bool,
-        cancel: &CancellationToken,
         temperature_override: Option<f32>,
-    ) -> Result<GeneratedTurnDraft, ProviderError> {
-        // The engine owns prompt construction, while the runtime provider
-        // owns sampling.  Do not let MVP placeholder values embedded in a
-        // TurnRequest silently override the operator's TOML profile.
+    ) -> ChatCompletionRequest {
         let mut configured_request = request.clone();
         configured_request.temperature = temperature_override.unwrap_or(self.config.temperature);
         configured_request.top_p = self.config.top_p;
         configured_request.top_k = self.config.top_k;
-        // Engine-owned repair requests intentionally carry a smaller output
-        // cap. Respect that cap while retaining the operator's profile as the
-        // upper bound for ordinary turns.
         configured_request.max_tokens = if request.max_tokens == 0 {
             self.config.max_tokens
         } else {
@@ -390,6 +391,17 @@ impl OpenAiCompatibleProvider {
         };
         let mut body = ChatCompletionRequest::from_turn(&bounded_request, model_name, send_rf);
         body.max_tokens_field = self.config.max_tokens_field;
+        body
+    }
+
+    async fn do_generate(
+        &self,
+        request: &TurnRequest,
+        suppress_rf: bool,
+        cancel: &CancellationToken,
+        temperature_override: Option<f32>,
+    ) -> Result<GeneratedTurnDraft, ProviderError> {
+        let body = self.assemble_turn_body(request, suppress_rf, temperature_override);
         let max_attempts = self.config.max_retries.saturating_add(1);
 
         for attempt in 0..max_attempts {
@@ -1218,6 +1230,21 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
             // would just re-wait the full deadline (do_generate's timeout
             // policy), so surface it for the player to act on.
             Err(error @ ProviderError::Timeout { .. }) => Err(error),
+            // A contract failure (typically max_tokens truncating the JSON
+            // after the narration streamed) historically self-healed via
+            // the non-streaming ladder. The streamed text is display-only
+            // and is replaced by the committed view, so the bounded retry
+            // does not duplicate anything — restore that self-healing.
+            Err(error @ ProviderError::InvalidGeneration(_)) => {
+                tracing::warn!(
+                    target: "story_provider::openai_compatible",
+                    generation_id = %request.generation_id,
+                    chunks_surfaced = emitted,
+                    error = %error,
+                    "streamed turn violated the contract; retrying non-streaming"
+                );
+                self.generate_turn(request, cancel).await
+            }
             Err(error) if !emitted => {
                 tracing::warn!(
                     target: "story_provider::openai_compatible",
@@ -1244,28 +1271,14 @@ impl OpenAiCompatibleProvider {
         cancel: &CancellationToken,
         emitted: &mut bool,
     ) -> Result<GeneratedTurnDraft, ProviderError> {
-        // Mirror `do_generate`'s operator-profile clamps: the engine owns
-        // prompt construction, the provider owns sampling.
-        let mut configured_request = request.clone();
-        configured_request.temperature = self.config.temperature;
-        configured_request.top_p = self.config.top_p;
-        configured_request.top_k = self.config.top_k;
-        configured_request.max_tokens = if request.max_tokens == 0 {
-            self.config.max_tokens
-        } else {
-            request.max_tokens.min(self.config.max_tokens)
-        };
-        let bounded_request = bound_context(&configured_request, self.config.context_budget_tokens);
-        let send_rf = self.structured_enabled() && request.json_schema.is_some();
+        // Identical envelope to a normal turn (shared assembly), but SSE.
+        let mut body = self.assemble_turn_body(request, false, None);
+        body.stream = true;
         let model_name = if request.model.is_empty() || request.model == "mock" {
             &self.config.model
         } else {
             &request.model
         };
-        let mut body = ChatCompletionRequest::from_turn(&bounded_request, model_name, send_rf);
-        body.max_tokens_field = self.config.max_tokens_field;
-        // Same envelope as a normal turn, but as SSE.
-        body.stream = true;
 
         if cancel.is_cancelled() {
             return Err(ProviderError::Cancelled);
@@ -1356,12 +1369,16 @@ impl OpenAiCompatibleProvider {
         }
 
         if !saw_done {
-            // Stream ended without `[DONE]` — protocol error so the host
-            // surfaces a recoverable error and the engine restores the
-            // checkpoint rather than committing partial text.
-            return Err(ProviderError::Protocol(
-                "stream ended without [DONE]".to_string(),
-            ));
+            // Some OpenAI-compatible servers/proxies close the body after
+            // the last delta without the `[DONE]` sentinel. The accumulated
+            // text is still run through the strict parser below; only an
+            // unparseable body without `[DONE]` becomes a protocol error
+            // (never a commit of partial text).
+            tracing::warn!(
+                target: "story_provider::openai_compatible",
+                generation_id = %request.generation_id,
+                "stream ended without [DONE]; attempting strict parse of accumulated text"
+            );
         }
 
         // Best-effort final notification; a dropped receiver is not an error.
@@ -1386,6 +1403,15 @@ impl OpenAiCompatibleProvider {
                 Ok(draft)
             }
             Err(e) => {
+                if !saw_done {
+                    // Unparseable body AND no `[DONE]`: protocol error so
+                    // the host surfaces a recoverable error and the engine
+                    // restores the checkpoint rather than committing
+                    // partial text.
+                    return Err(ProviderError::Protocol(
+                        "stream ended without [DONE]".to_string(),
+                    ));
+                }
                 tracing::warn!(
                     target: "story_provider::openai_compatible",
                     generation_id = %request.generation_id,

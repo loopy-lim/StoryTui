@@ -927,6 +927,36 @@ fn apply_player_profile(pack: &mut StoryPack, profile: &storytui::config::Player
     }
 }
 
+/// Pump a provider streaming call's writer events to the UI while awaiting
+/// the final result. Shared by the MVP turn path (`generate_turn_stream`)
+/// and the Director/Writer path (`write_stream`) so both forward chunks
+/// identically.
+async fn pump_writer_events<T, F>(
+    mut events_rx: tokio::sync::mpsc::Receiver<story_model::WriterEvent>,
+    write: F,
+    tx: &UnboundedSender<HostMessage>,
+    generation_id: story_model::uuid::Uuid,
+) -> Result<T, ProviderError>
+where
+    F: std::future::Future<Output = Result<T, ProviderError>>,
+{
+    tokio::pin!(write);
+    loop {
+        tokio::select! {
+            event = events_rx.recv() => match event {
+                Some(story_model::WriterEvent::Chunk { text }) => {
+                    let _ = tx.send(HostMessage::WriterChunk { generation_id, text });
+                }
+                Some(story_model::WriterEvent::Error { detail }) => {
+                    tracing::warn!(%generation_id, %detail, "writer stream soft error");
+                }
+                Some(story_model::WriterEvent::Done { .. }) | None => {}
+            },
+            result = &mut write => break result,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // host adapter keeps all effect-owned handles explicit
 async fn dispatch(
     command: EngineCommand,
@@ -1036,23 +1066,9 @@ async fn dispatch(
                     && provider.capabilities().supports_streaming;
                 tokio::spawn(async move {
                     let result = if use_stream {
-                        let (events, mut events_rx) = tokio::sync::mpsc::channel(32);
+                        let (events, events_rx) = tokio::sync::mpsc::channel(32);
                         let write = provider.generate_turn_stream(request, events, token);
-                        tokio::pin!(write);
-                        loop {
-                            tokio::select! {
-                                event = events_rx.recv() => match event {
-                                    Some(story_model::WriterEvent::Chunk { text }) => {
-                                        let _ = tx.send(HostMessage::WriterChunk { generation_id, text });
-                                    }
-                                    Some(story_model::WriterEvent::Error { detail }) => {
-                                        tracing::warn!(%generation_id, %detail, "turn stream soft error");
-                                    }
-                                    Some(story_model::WriterEvent::Done { .. }) | None => {}
-                                },
-                                result = &mut write => break result,
-                            }
-                        }
+                        pump_writer_events(events_rx, write, &tx, generation_id).await
                     } else {
                         provider.generate_turn(request, token).await
                     };
@@ -1126,23 +1142,10 @@ async fn dispatch(
                 };
                 tracing::info!(%generation_id, model = %model, "invoking Writer stage");
                 tokio::spawn(async move {
-                    let (writer_events, mut writer_events_rx) = tokio::sync::mpsc::channel(32);
+                    let (writer_events, writer_events_rx) = tokio::sync::mpsc::channel(32);
                     let write = provider.write_stream(request, writer_events, token);
-                    tokio::pin!(write);
-                    let result = loop {
-                        tokio::select! {
-                            event = writer_events_rx.recv() => match event {
-                                Some(story_model::WriterEvent::Chunk { text }) => {
-                                    let _ = tx.send(HostMessage::WriterChunk { generation_id, text });
-                                }
-                                Some(story_model::WriterEvent::Error { detail }) => {
-                                    tracing::warn!(%generation_id, %detail, "writer stream soft error");
-                                }
-                                Some(story_model::WriterEvent::Done { .. }) | None => {}
-                            },
-                            result = &mut write => break result,
-                        }
-                    };
+                    let result =
+                        pump_writer_events(writer_events_rx, write, &tx, generation_id).await;
                     let _ = tx.send(HostMessage::Writer {
                         generation_id,
                         model,

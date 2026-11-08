@@ -72,9 +72,11 @@ limitations:
 - The streaming attempt is single-shot. If it fails **before** the first
   narration chunk (connect error, `stream:true`-rejecting 4xx/5xx), the
   provider silently falls back to the non-streaming request with its full
-  retry ladder. If it fails **after** a chunk was shown, the error surfaces
-  and the engine restores the checkpoint — no transparent retry, because a
-  retry would visibly duplicate text.
+  retry ladder. A **contract failure after chunks were shown** (typically
+  max_tokens truncating the JSON) also retries once non-streaming — the
+  streamed text is display-only and is replaced by the committed view, so
+  nothing duplicates. Any other failure after a chunk (protocol/timeout)
+  surfaces an error and the engine restores the checkpoint.
 - If the host's event channel is momentarily full, a narration chunk is
   dropped from the partial display (same policy as the Writer path); the
   committed turn is unaffected because it comes from the full text.

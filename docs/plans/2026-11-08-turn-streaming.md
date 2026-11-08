@@ -1,6 +1,6 @@
 # 계획: MVP 생성 경로 SSE 스트리밍 렌더링 (이슈 #2, P0-1)
 
-작성: 2026-11-08 · 상태: 완료 (G1 PASS · G3 PASS · G4 N/A · G5 PASS, 2026-11-08)
+작성: 2026-11-08 · 상태: 완료 (G1 PASS · G3 PASS · G4 N/A · G5 PASS, 2026-11-08) · PR 리뷰 후 수정(아래 "PR 리뷰 반영" 참조)
 
 ## 목표와 수용 기준 (G0)
 
@@ -58,3 +58,13 @@
 - **부분 JSON 추출 정확성**(중첩 객체에 동명 키 등): 최종 커밋은 항상 기존 `parse_generated_turn`을 통과하므로 오염은 일시적 표시에 한정됨. 추출기는 첫 `"narration"` 문자열 값만 대상.
 - **재시도 사다리 상실**(첫 청크 이후): 로컬 모델 정책상 timeout 재시도는 본래 무의미(openai_compatible.rs:411 주석). 실패 시 체크포인트 복구 + 재생성이라는 기존 UX 유지.
 - **요청 타임아웃이 스트림 전체에 적용**(reqwest client timeout): 코드 기본값 180s, 배포 프로필 `config/storytui.toml`은 600s. 기존 `write_stream`과 동일 조건이므로 문서에만 기록한다. (timeout 재시도 무의미 주석은 openai_compatible.rs:412)
+
+## PR 리뷰 반영 (2026-11-08, PR #7)
+
+1. `[DONE]` 센티넬 없이 닫힌 스트림도 누적 전문이 엄격 파싱을 통과하면 수용(파싱 실패 시에만 Protocol 에러).
+2. 청크 노출 후 `InvalidGeneration`(예: max_tokens 절단)은 비스트리밍 수리 1회 재시도 — 스트리밍 텍스트는 표시 전용이므로 중복 없음. 기존 기본 경로의 자가 치유 동작과 동등.
+3. 값 종료 시점에 stranded high surrogate 즉시 flush(U+FFFD).
+4. malformed `\u` 이스케이프 재생 시 버퍼링된 hex 자릿수까지 재생.
+5. host의 청크 포워딩 루프를 `pump_writer_events` 공유 헬퍼로 통합(MVP·Writer 경로 동형 보장).
+6. 턴 요청 조립 블록을 `assemble_turn_body` 공유 헬퍼로 통합(스트리밍·비스트리밍 샘플링 파라미터 일치 보장).
+7. `trim_scan_buf`를 드레인 기반으로 변경(긴 prelude에서 글자당 힙 할당 제거).

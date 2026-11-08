@@ -106,7 +106,16 @@ impl NarrationStreamExtractor {
                 _ => self.resume_scanning(out, Some(ch)),
             },
             State::InString => match ch {
-                '"' => self.state = State::Done,
+                '"' => {
+                    self.state = State::Done;
+                    // A value ending on a stranded high surrogate (stream
+                    // cut mid-emoji) flushes U+FFFD immediately so the
+                    // partial display tracks the raw stream even when no
+                    // character follows the closing quote.
+                    if self.pending_high_surrogate.take().is_some() {
+                        out.push(char::REPLACEMENT_CHARACTER);
+                    }
+                }
                 '\\' => self.state = State::PendingEscape,
                 _ => self.emit(out, ch),
             },
@@ -146,23 +155,20 @@ impl NarrationStreamExtractor {
                         self.emit_unicode(out, code);
                     }
                 } else {
-                    // Malformed escape — give up on it, replay the prefix and
-                    // treat this char as ordinary string content.
+                    // Malformed escape — replay the full prefix (including
+                    // any hex digits already buffered) and treat this char
+                    // as ordinary string content.
                     self.state = State::InString;
                     self.emit(out, '\\');
                     self.emit(out, 'u');
+                    for i in 0..self.hex_len {
+                        let digit = self.hex_buf[i] as char;
+                        self.emit(out, digit);
+                    }
                     self.emit(out, ch);
                 }
             }
-            State::Done => {
-                // A value ending on a stranded high surrogate (stream cut
-                // mid-emoji) still flushes U+FFFD so the partial display
-                // tracks the raw stream length; the committed turn comes
-                // from the strict full-text parser regardless.
-                if self.pending_high_surrogate.take().is_some() {
-                    out.push(char::REPLACEMENT_CHARACTER);
-                }
-            }
+            State::Done => {}
         }
     }
 
@@ -225,13 +231,19 @@ impl NarrationStreamExtractor {
     }
 
     /// Retain enough of the tail that a key token split across feeds is
-    /// still found on the next match attempt.
+    /// still found on the next match attempt. Drains in place — a long
+    /// prelude must not cost a fresh allocation per character.
     fn trim_scan_buf(&mut self) {
         let keep = KEY.len() - 1;
-        let len = self.scan_buf.chars().count();
-        if len > keep {
-            let tail: String = self.scan_buf.chars().skip(len - keep).collect();
-            self.scan_buf = tail;
+        let excess = self.scan_buf.chars().count().saturating_sub(keep);
+        if excess > 0 {
+            let byte_at = self
+                .scan_buf
+                .char_indices()
+                .nth(excess)
+                .map(|(i, _)| i)
+                .expect("excess < char count guarantees this index exists");
+            self.scan_buf.drain(..byte_at);
         }
     }
 }
@@ -372,12 +384,19 @@ mod tests {
     #[test]
     fn trailing_stranded_surrogate_flushes_on_value_close() {
         let mut ex = NarrationStreamExtractor::new();
-        // The value ends right after an unpaired high surrogate escape.
-        let first = ex.feed("{\"narration\": \"끝\\uD83D\"");
-        assert_eq!(first, "끝");
-        // The closing quote (→ Done) plus the trailing object must flush
-        // the replacement char so the partial display tracks the stream.
-        let rest = ex.feed(", \"choices\": []}");
-        assert_eq!(rest, "\u{FFFD}");
+        // The value ends right after an unpaired high surrogate escape and
+        // the closing quote is the LAST character of the feed — the flush
+        // must happen at the InString→Done transition itself.
+        let out = ex.feed("{\"narration\": \"끝\\uD83D\"");
+        assert_eq!(out, "끝\u{FFFD}");
+    }
+
+    #[test]
+    fn malformed_unicode_escape_replays_buffered_hex_digits() {
+        // `\uD8X`: D8 is buffered before X arrives; the replay must emit
+        // the whole prefix, not just `\uX` (display-only, self-corrects on
+        // commit — this pins the raw-stream-tracking property).
+        let out = collect(&["{\"narration\": \"a\\uD8", "Xb\"}"]);
+        assert_eq!(out, "a\\uD8Xb");
     }
 }
