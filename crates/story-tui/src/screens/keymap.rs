@@ -118,7 +118,7 @@ pub const KEYMAP: &[KeymapRow] = &[
     },
     KeymapRow {
         key: "h",
-        action_ko: "이전 기록",
+        action_ko: "이전 기록 · 편집/삭제",
         group: KeymapGroup::Game,
     },
     KeymapRow {

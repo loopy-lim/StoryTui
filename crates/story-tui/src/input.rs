@@ -27,9 +27,10 @@ use unicode_width::UnicodeWidthStr;
 
 /// A grapheme-cluster-oriented text edit buffer.
 ///
-/// All cursor offsets and lengths are in grapheme clusters. The buffer is
-/// single-line for the MVP: control characters (including newlines) are dropped
-/// on paste.
+/// All cursor offsets and lengths are in grapheme clusters. The default
+/// constructor is single-line: control characters (including newlines) are
+/// dropped on paste. [`InputBuffer::new_multiline`] keeps `\n` so History
+/// narration editing can preserve paragraph breaks.
 #[derive(Clone, Debug)]
 pub struct InputBuffer {
     /// The stored graphemes, in insertion order. Each entry is exactly one
@@ -41,6 +42,8 @@ pub struct InputBuffer {
     /// Maximum number of graphemes the buffer will hold. Inserts that would
     /// exceed this are truncated to fit (grapheme-aligned, never mid-syllable).
     max_chars: usize,
+    /// When true, a lone `\n` grapheme is retained (multi-line editors).
+    allow_newlines: bool,
 }
 
 impl InputBuffer {
@@ -50,7 +53,23 @@ impl InputBuffer {
             graphemes: Vec::new(),
             cursor: 0,
             max_chars,
+            allow_newlines: false,
         }
+    }
+
+    /// Create an empty multi-line buffer that keeps newline graphemes.
+    pub fn new_multiline(max_chars: usize) -> Self {
+        Self {
+            graphemes: Vec::new(),
+            cursor: 0,
+            max_chars,
+            allow_newlines: true,
+        }
+    }
+
+    /// Whether this buffer keeps newline graphemes.
+    pub fn allow_newlines(&self) -> bool {
+        self.allow_newlines
     }
 
     /// Insert a pasted string, splitting it into graphemes via
@@ -58,7 +77,7 @@ impl InputBuffer {
     /// `max_chars` (grapheme-aligned).
     pub fn insert_str(&mut self, s: &str) {
         for g in s.graphemes(true) {
-            if !is_retained_grapheme(g) {
+            if !self.retains(g) {
                 continue;
             }
             if self.graphemes.len() >= self.max_chars {
@@ -77,7 +96,7 @@ impl InputBuffer {
         let Some(first) = g.graphemes(true).next() else {
             return;
         };
-        if !is_retained_grapheme(first) {
+        if !self.retains(first) {
             return;
         }
         if self.graphemes.len() >= self.max_chars {
@@ -85,6 +104,13 @@ impl InputBuffer {
         }
         self.graphemes.insert(self.cursor, first.to_string());
         self.cursor += 1;
+    }
+
+    fn retains(&self, g: &str) -> bool {
+        if self.allow_newlines && g == "\n" {
+            return true;
+        }
+        is_retained_grapheme(g)
     }
 
     /// Delete the grapheme immediately before the cursor (Backspace). No-op at
@@ -414,6 +440,14 @@ mod tests {
     }
 
     // --- control-char filtering --------------------------------------------
+
+    #[test]
+    fn multiline_buffer_keeps_newlines_but_still_drops_other_controls() {
+        let mut b = InputBuffer::new_multiline(50);
+        b.insert_str("첫째\n둘째\t끝\u{0007}");
+        assert_eq!(b.text(), "첫째\n둘째끝");
+        assert!(b.allow_newlines());
+    }
 
     #[test]
     fn control_chars_are_dropped_on_paste() {

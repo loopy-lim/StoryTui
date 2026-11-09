@@ -164,6 +164,22 @@ Bounds, all deliberate:
   the failed-retry slot is cleared so an old turn cannot replay on top of the
   rewound state.
 
+## History edit is prose-only; delete is suffix-truncate via the ring
+
+History (`h`) can edit any committed turn's **narration** (`Enter` → multi-line
+modal → `Ctrl+S`). Choices, player actions, and applied patches stay put —
+the player is correcting model prose, not rewriting world state. Edits bump
+revision, upsert the current-turn checkpoint, and rewrite autosave.
+
+Delete (`d` in History) truncates **from the selected turn forward** by
+restoring the checkpoint whose `game.turn == selected.turn - 1` (same
+consistency as multi-step undo). Bounds:
+
+- The opening turn (`turn == 1`) cannot be deleted — use New Game.
+- If the needed checkpoint has aged out of the 8-entry ring, delete is a
+  no-op (edit still works). There is no surgical "remove one middle turn and
+  keep later turns" path; that would require replaying patches.
+
 ## Re-rolls restart the request; in-flight drafts are not cached
 
 `r` while loading re-issues the same turn from the same checkpoint with a

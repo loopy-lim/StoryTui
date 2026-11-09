@@ -200,11 +200,7 @@ pub fn apply_resume(
         restored.use_director_writer = use_director_writer;
         *engine = restored;
         app.set_view(build_view(engine, pack, None, None));
-        app.set_lists(
-            &engine.game.history,
-            &engine.game.memories,
-            &pack.metadata.initial_state.location,
-        );
+        saves::refresh_app_lists(app, engine, pack);
         app.follow_story_end();
         app.set_can_continue(false);
         refresh_scene_images(app, pack, engine, scene_images);
@@ -388,11 +384,7 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
     );
     app.set_image_picker(picker, manual);
     refresh_scene_images(&mut app, &pack, &engine, &mut scene_images);
-    app.set_lists(
-        &engine.game.history,
-        &engine.game.memories,
-        &pack.metadata.initial_state.location,
-    );
+    saves::refresh_app_lists(&mut app, &engine, &pack);
     app.set_can_continue(resume_engine.is_some());
     app.set_greetings(greeting_labels(&pack));
     app.set_current_pack_dir(&config.pack_dir.to_string_lossy());
@@ -1098,11 +1090,7 @@ fn swap_pack(
     // together or the previous pack's images survive the switch.
     reset_scene_images(app, scene_images);
     app.set_view(build_view(engine, pack, None, None));
-    app.set_lists(
-        &engine.game.history,
-        &engine.game.memories,
-        &pack.metadata.initial_state.location,
-    );
+    saves::refresh_app_lists(app, engine, pack);
     app.follow_story_end();
     app.set_can_continue(false);
     app.set_greetings(greeting_labels(pack));
@@ -1437,11 +1425,7 @@ async fn handle_ui_requests(
                 new_engine.use_director_writer = config.use_director_writer;
                 *engine = new_engine;
                 app.set_view(build_view(engine, pack, None, None));
-                app.set_lists(
-                    &engine.game.history,
-                    &engine.game.memories,
-                    &pack.metadata.initial_state.location,
-                );
+                saves::refresh_app_lists(app, engine, pack);
                 app.follow_story_end();
                 app.close_home();
                 refresh_scene_images(app, pack, engine, scene_images);
@@ -1909,11 +1893,7 @@ pub async fn dispatch(
         e.to_string()
     })?;
     *engine = transition.state;
-    app.set_lists(
-        &engine.game.history,
-        &engine.game.memories,
-        &pack.metadata.initial_state.location,
-    );
+    saves::refresh_app_lists(app, engine, pack);
 
     for effect in transition.effects {
         match effect {

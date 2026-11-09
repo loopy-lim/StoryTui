@@ -42,7 +42,8 @@ stateDiagram-v2
     Story --> Input: i/ㅑ
     Input --> Story: Enter 전송 · Esc 취소
     Story --> History: h/ㅗ
-    History --> Story: Esc
+    History --> History: ↑↓ 선택 · Enter 내레이션 편집 · d 삭제 확인
+    History --> Story: Esc (편집·삭제는 목록을 유지한 채 적용)
     Story --> Memory: m/ㅡ
     Memory --> Story: Esc
     Story --> SaveLoad: s/ㄴ(저장) · l/ㅣ(불러오기)
@@ -81,7 +82,7 @@ stateDiagram-v2
 | `[ / ]` | **변형 순환** — 되돌렸다가 다시 확정한 턴의 내레이션을 보관된 대안 사이에서 순환 (배지 "변형 n/m", 자동 저장도 함께 갱신. 보관은 세션 메모리 — 재시작하면 사라짐) |
 | `c/ㅊ` | 생성 취소 (로딩 중) |
 | `i/ㅑ` | 자유 입력 모드 (선택지가 있고 로딩·오류가 없을 때만) |
-| `h/ㅗ` · `m/ㅡ` | 이전 기록 · 기억 목록 |
+| `h/ㅗ` · `m/ㅡ` | 이전 기록 · 기억 목록. History에서 `↑↓` 선택, `Enter` 내레이션 편집(`Ctrl+S` 적용 · `Enter` 줄바꿈 · `Esc` 취소), `d` 선택 턴부터 이후 삭제(확인 모달 · 오프닝/링 밖 거부) |
 | `s/ㄴ` · `l/ㅣ` | 저장 · 불러오기 |
 | `v/ㅓ` | **TTS 낭독 켜기/끄기** (게임 중 즉시) |
 | `w/ㅈ` | **이어쓰기** — 마지막 내레이션을 새 턴 없이 연장 (선택지·상태 유지, 다음 자동 저장에 반영) |

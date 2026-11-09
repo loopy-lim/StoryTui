@@ -76,13 +76,24 @@ pub enum StoryBlock<'a> {
 /// rule of the following turn block.
 pub const IMAGE_BLOCK_SPACER_ROWS: u16 = 1;
 
-pub fn render_list(frame: &mut Frame, area: Rect, mode: ListMode, items: &[String], scroll: u16) {
+pub fn render_list(
+    frame: &mut Frame,
+    area: Rect,
+    mode: ListMode,
+    items: &[String],
+    scroll: u16,
+    selected: Option<usize>,
+) {
     let title = match mode {
         ListMode::History => "이전 생성 기록",
         ListMode::Memory => "기억 목록",
         ListMode::Cast => "인물 목록",
         ListMode::ModelPicker => "모델 선택",
         ListMode::ProviderPicker => "프로바이더 선택",
+    };
+    let chrome = match mode {
+        ListMode::History => "↑↓ 선택 · Enter 편집 · d 삭제 · Esc 닫기",
+        _ => "PgUp/PgDn 스크롤 · Esc 닫기",
     };
     let empty_message = match mode {
         ListMode::Cast => "등장인물이 없습니다.",
@@ -93,7 +104,16 @@ pub fn render_list(frame: &mut Frame, area: Rect, mode: ListMode, items: &[Strin
     } else {
         items
             .iter()
-            .map(|item| Line::from(Span::styled(item.clone(), Styles::item_normal())))
+            .enumerate()
+            .map(|(index, item)| {
+                let style = if selected == Some(index) {
+                    Styles::item_selected()
+                } else {
+                    Styles::item_normal()
+                };
+                let prefix = if selected == Some(index) { "› " } else { "  " };
+                Line::from(Span::styled(format!("{prefix}{item}"), style))
+            })
             .collect()
     };
     let paragraph = Paragraph::new(rows)
@@ -104,13 +124,73 @@ pub fn render_list(frame: &mut Frame, area: Rect, mode: ListMode, items: &[Strin
                 .border_type(BORDER_TYPE)
                 .border_style(Styles::border_primary())
                 .title(Span::styled(
-                    format!(" ✦ {} · PgUp/PgDn 스크롤 · Esc 닫기 ✦ ", title),
+                    format!(" ✦ {title} · {chrome} ✦ "),
                     Styles::title(),
                 )),
         )
         .wrap(Wrap { trim: false });
     frame.render_widget(Clear, area);
     frame.render_widget(paragraph, area);
+}
+
+/// Multi-line narration editor opened from History (`Enter`).
+/// `Ctrl+S` applies; `Enter` inserts a newline; `Esc` cancels.
+pub fn render_history_edit_dialog(
+    frame: &mut Frame,
+    area: Rect,
+    turn: u32,
+    before: &str,
+    after: &str,
+) {
+    let header = format!("턴 {turn} 내레이션\n\n");
+    let footer = "\n\nCtrl+S 적용 · Enter 줄바꿈 · Esc 취소 — 선택지·상태는 바꾸지 않습니다";
+    let body = format!("{header}{before}▌{after}{footer}");
+    let line_guess = body.lines().count() as u16 + 2;
+    let height = line_guess.clamp(10, area.height.max(10));
+    let popup = crate::screens::popup::centered_rect(area, POPUP_WIDTH_WIDE, height);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BORDER_TYPE)
+        .border_style(Styles::border_primary())
+        .title(Span::styled(" ✦ 내레이션 편집 ✦ ", Styles::title()));
+    frame.render_widget(
+        Paragraph::new(Text::from(body))
+            .style(Styles::item_normal())
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
+/// Confirm truncating from the selected History turn forward.
+pub fn render_history_delete_confirm(frame: &mut Frame, area: Rect, turn: u32) {
+    let popup = crate::screens::popup::centered_rect(area, 60, 10);
+    frame.render_widget(Clear, popup);
+    let lines = vec![
+        Line::from(Span::styled(
+            format!("턴 {turn}부터 이후 진행을 모두 지웁니다."),
+            Styles::item_normal(),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "직전 안정 체크포인트로 돌아갑니다. 오프닝(턴 1)·링 밖은 삭제할 수 없습니다.",
+            Style::default().fg(Palette::CAUTION),
+        )),
+        Line::from(""),
+        Line::from(Span::styled("Enter 삭제 · Esc 취소", Styles::muted())),
+    ];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BORDER_TYPE)
+        .border_style(Styles::border_danger())
+        .title(Span::styled(
+            " ⚠ 턴 삭제 ",
+            Style::default()
+                .fg(Palette::DANGER)
+                .add_modifier(Modifier::BOLD),
+        ));
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
 /// Which model currently holds each generation role, for picker badges.
