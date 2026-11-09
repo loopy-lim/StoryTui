@@ -29,10 +29,9 @@ use storytui::host::{
     post_accept_automation, probe_due, should_auto_resume,
 };
 
-/// A valid 3-choice turn (passes the engine's choice-quality count) wrapped
-/// in an OpenAI-shaped chat-completion envelope.
-fn envelope() -> serde_json::Value {
-    let content = serde_json::json!({
+/// Valid 3-choice turn JSON (passes the engine's choice-quality count).
+fn turn_content() -> serde_json::Value {
+    serde_json::json!({
         "narration": "비가 그쳤고, 유나는 창밖을 바라본다.",
         "choices": [
             {"id":"c1","label":"먼저 사과한다","intent":"고개를 숙이고 잘못을 인정한다","tone":null,"target":null,"risk":"medium","hidden_requirements":[],"preview":"관계가 누그러진다"},
@@ -49,13 +48,17 @@ fn envelope() -> serde_json::Value {
             "interpretation": null,"address_form_changes": [],"important_player_actions": [],
             "source_history_ids": []
         }
-    });
+    })
+}
+
+/// The turn wrapped in an OpenAI-shaped non-streaming chat-completion envelope.
+fn envelope() -> serde_json::Value {
     serde_json::json!({
         "id": "chatcmpl-x",
         "object": "chat.completion",
         "model": "test",
         "choices": [
-            {"index": 0, "message": {"role": "assistant", "content": content.to_string()}, "finish_reason": "stop"}
+            {"index": 0, "message": {"role": "assistant", "content": turn_content().to_string()}, "finish_reason": "stop"}
         ],
         "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
     })
@@ -152,6 +155,17 @@ fn writer_stream_response() -> ResponseTemplate {
     let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"비가 그쳤고, 유나는 창밖을 바라본다.\"}}]}\n\n\
                data: [DONE]\n\n";
     ResponseTemplate::new(200).set_body_raw(sse.as_bytes().to_vec(), "text/event-stream")
+}
+
+/// SSE success for the MVP `generate_turn_stream` path: one content delta with
+/// [`turn_content()`], then `[DONE]`. A plain JSON 200 would be rejected by
+/// the SSE parser and fall back to non-streaming again.
+fn turn_stream_response() -> ResponseTemplate {
+    let payload = serde_json::json!({
+        "choices": [{"delta": {"content": turn_content().to_string()}, "finish_reason": "stop"}]
+    });
+    let sse = format!("data: {payload}\n\ndata: [DONE]\n\n");
+    ResponseTemplate::new(200).set_body_raw(sse.into_bytes(), "text/event-stream")
 }
 
 /// Loopback provider config; `max_retries` 0 keeps provider-internal retries
@@ -386,17 +400,20 @@ fn commit_opening(session: &mut Session) {
 #[tokio::test]
 async fn generation_failure_autoretries_once_and_succeeds() {
     let server = MockServer::start().await;
-    // Request 1 fails with 400 (the provider itself never retries 4xx).
+    // Default `stream_turns` uses generate_turn_stream, which falls back to a
+    // non-streaming request when the stream fails before any chunk (PR #7).
+    // That shape change is not an ADR-002 4xx retry, but it does consume a
+    // second HTTP call — so both arms must 400 before the host sees a failure.
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(400))
-        .up_to_n_times(1)
+        .up_to_n_times(2)
         .with_priority(1)
         .mount(&server)
         .await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(envelope()))
+        .respond_with(turn_stream_response())
         .mount(&server)
         .await;
 
@@ -432,16 +449,17 @@ async fn generation_failure_autoretries_once_and_succeeds() {
     assert!(session.app.view.error.is_none());
     assert!(!session.automation.retry_armed());
 
-    // Exactly two HTTP requests: the failure + the automatic retry (the
-    // committed turn's choices pass quality, so no extra refresh call).
+    // Three HTTP requests: stream fail + non-stream fail + automatic retry
+    // stream success (committed choices pass quality — no refresh call).
     let requests = server.received_requests().await.expect("recorded");
-    assert_eq!(requests.len(), 2, "fail + retry only");
+    assert_eq!(requests.len(), 3, "stream+non-stream fail + retry only");
 }
 
 #[tokio::test]
 async fn second_failure_hands_control_to_the_manual_overlay() {
     let server = MockServer::start().await;
-    // Every request fails: the automatic retry cannot save the turn.
+    // Every request fails: stream + non-stream fallback both 400 per attempt,
+    // so the host-level automatic retry still cannot save the turn.
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(400))
@@ -469,8 +487,10 @@ async fn second_failure_hands_control_to_the_manual_overlay() {
     assert!(!session.automation.retry_armed());
     assert!(session.automation.retry_spent());
 
+    // Two host attempts × (stream + non-stream fallback) = 4 HTTP calls; the
+    // spent budget must not fire a third automatic host attempt.
     let requests = server.received_requests().await.expect("recorded");
-    assert_eq!(requests.len(), 2, "no third automatic attempt");
+    assert_eq!(requests.len(), 4, "no third automatic host attempt");
 }
 
 #[tokio::test]
