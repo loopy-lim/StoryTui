@@ -160,6 +160,29 @@ pub enum EngineCommand {
         /// Step through the list: `1` forward, `-1` back; wraps at the ends.
         delta: i32,
     },
+    /// Replace the narration prose of a committed history entry. Display and
+    /// prompt text only — choices and the applied state patch are untouched
+    /// (the player is correcting model prose, not rewriting world state).
+    /// Identity while a generation is in flight or an error overlay is up,
+    /// when `entry_id` is unknown, or when `narration` is empty after trim.
+    /// On success the view is republished, the current-turn checkpoint is
+    /// upserted, and autosave re-fires so the edit survives a restart.
+    EditHistoryNarration {
+        /// [`story_model::HistoryEntry::id`] of the turn to edit.
+        entry_id: Uuid,
+        /// Replacement narration (player-authored; may be multi-line).
+        narration: String,
+    },
+    /// Truncate history from the selected entry forward by restoring the
+    /// checkpoint whose `game.turn == entry.turn - 1`. Same consistency as a
+    /// multi-step undo: flags, patches, and later turns all roll back with
+    /// the snapshot. Identity when the entry is missing, when `turn <= 1`
+    /// (opening is not deletable — use New Game), when no matching
+    /// checkpoint remains in the ring, or while loading/error.
+    DeleteHistoryFrom {
+        /// [`story_model::HistoryEntry::id`] of the first turn to drop.
+        entry_id: Uuid,
+    },
     /// The host is quitting. The engine returns the current state unchanged;
     /// terminal teardown is the host's responsibility.
     Quit,

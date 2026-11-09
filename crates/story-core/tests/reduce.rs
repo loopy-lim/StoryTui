@@ -3238,3 +3238,162 @@ fn commit_dedupes_the_variant_list_against_the_accepted_narration() {
     );
     assert_eq!(published_view(&recommitted).variant_label, None);
 }
+
+// ---------------------------------------------------------------------------
+// History 내레이션 편집·삭제 (이슈 #3)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn edit_history_narration_rewrites_prose_and_persists() {
+    let pack = sample_pack();
+    let (state, _undo_id, _gid) = two_accepted_turns(&pack);
+    let entry_id = state.game.history.last().unwrap().id;
+    let before_rev = state.game.revision;
+
+    let edited = reduce(
+        &state,
+        EngineCommand::EditHistoryNarration {
+            entry_id,
+            narration: "  교정된 내레이션입니다.  ".to_string(),
+        },
+        &pack,
+    )
+    .expect("edit");
+
+    assert_eq!(
+        edited.state.game.history.last().unwrap().narration,
+        "교정된 내레이션입니다."
+    );
+    assert_eq!(
+        published_view(&edited).narration,
+        "교정된 내레이션입니다.",
+        "last-turn edit republishes the story view"
+    );
+    assert!(edited.state.game.revision > before_rev);
+    assert!(
+        edited
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, EngineEffect::PersistStableState { .. })),
+        "autosave must follow a successful edit"
+    );
+}
+
+#[test]
+fn edit_history_narration_rejects_empty_and_unknown_ids() {
+    let pack = sample_pack();
+    let (state, _undo_id, _gid) = two_accepted_turns(&pack);
+    let entry_id = state.game.history.last().unwrap().id;
+    let original = state.game.history.last().unwrap().narration.clone();
+
+    let empty = reduce(
+        &state,
+        EngineCommand::EditHistoryNarration {
+            entry_id,
+            narration: "   \n\t  ".to_string(),
+        },
+        &pack,
+    )
+    .expect("empty");
+    assert_eq!(empty.state.game.history.last().unwrap().narration, original);
+    assert!(empty.effects.is_empty());
+
+    let missing = reduce(
+        &state,
+        EngineCommand::EditHistoryNarration {
+            entry_id: uuid::Uuid::nil(),
+            narration: "없는 턴".to_string(),
+        },
+        &pack,
+    )
+    .expect("missing");
+    assert_eq!(missing.state.game.history.last().unwrap().narration, original);
+    assert!(missing.effects.is_empty());
+}
+
+#[test]
+fn edit_history_narration_keeps_choices_and_patches() {
+    let pack = sample_pack();
+    let (state, _undo_id, _gid) = two_accepted_turns(&pack);
+    let entry = state.game.history.last().unwrap().clone();
+
+    let edited = reduce(
+        &state,
+        EngineCommand::EditHistoryNarration {
+            entry_id: entry.id,
+            narration: "패치는 그대로".to_string(),
+        },
+        &pack,
+    )
+    .expect("edit");
+    let after = edited.state.game.history.last().unwrap();
+    assert_eq!(after.choices, entry.choices);
+    assert_eq!(after.applied_patch, entry.applied_patch);
+    assert_eq!(after.player_action, entry.player_action);
+}
+
+#[test]
+fn delete_history_from_truncates_suffix_via_checkpoint() {
+    let pack = sample_pack();
+    let (state, _undo_id, _gid) = two_accepted_turns(&pack);
+    assert_eq!(state.game.turn, 2);
+    let second_id = state.game.history.last().unwrap().id;
+
+    let deleted = reduce(
+        &state,
+        EngineCommand::DeleteHistoryFrom {
+            entry_id: second_id,
+        },
+        &pack,
+    )
+    .expect("delete");
+
+    assert_eq!(deleted.state.game.turn, 1);
+    assert_eq!(deleted.state.game.history.len(), 1);
+    assert!(
+        deleted
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, EngineEffect::PersistStableState { .. })),
+        "delete must rewrite autosave like undo"
+    );
+}
+
+#[test]
+fn delete_history_from_refuses_opening_turn() {
+    let pack = sample_pack();
+    let (state, _undo_id, _gid) = two_accepted_turns(&pack);
+    let opening_id = state.game.history.first().unwrap().id;
+
+    let refused = reduce(
+        &state,
+        EngineCommand::DeleteHistoryFrom {
+            entry_id: opening_id,
+        },
+        &pack,
+    )
+    .expect("refuse opening");
+    assert_eq!(refused.state.game.turn, 2);
+    assert_eq!(refused.state.game.history.len(), 2);
+    assert!(refused.effects.is_empty());
+}
+
+#[test]
+fn delete_history_from_is_noop_without_matching_checkpoint() {
+    let pack = sample_pack();
+    let (mut state, _undo_id, _gid) = two_accepted_turns(&pack);
+    let second_id = state.game.history.last().unwrap().id;
+    // 링을 비우면 접미 절단에 필요한 turn-1 체크포인트가 없다.
+    state.checkpoints.clear();
+
+    let refused = reduce(
+        &state,
+        EngineCommand::DeleteHistoryFrom {
+            entry_id: second_id,
+        },
+        &pack,
+    )
+    .expect("no checkpoint");
+    assert_eq!(refused.state.game.turn, 2);
+    assert!(refused.effects.is_empty());
+}

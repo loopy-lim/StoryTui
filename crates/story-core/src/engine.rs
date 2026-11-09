@@ -458,6 +458,15 @@ pub fn reduce(
         EngineCommand::CycleTurnVariant { delta } => {
             Ok(reduce_cycle_turn_variant(state, pack, delta))
         }
+        EngineCommand::EditHistoryNarration {
+            entry_id,
+            narration,
+        } => Ok(reduce_edit_history_narration(
+            state, pack, entry_id, narration,
+        )),
+        EngineCommand::DeleteHistoryFrom { entry_id } => {
+            Ok(reduce_delete_history_from(state, pack, entry_id))
+        }
         EngineCommand::DismissError => Ok(reduce_dismiss_error(state, pack)),
         EngineCommand::Quit => Ok(Transition::identity(clone_state(state))),
     }?;
@@ -1593,6 +1602,92 @@ fn reduce_set_lorebook_entries(
     let mut next = clone_state(state);
     next.lorebook_override = Some(entries);
     Transition::identity(next)
+}
+
+/// Handle [`EngineCommand::EditHistoryNarration`]: replace one history
+/// entry's narration prose. Post-commit only — identity while blocked,
+/// when the id is unknown, or when the replacement is empty after trim.
+/// Choices and applied patches stay put; if the edited entry is the last
+/// committed turn, the active variant slot is rewritten so the badge and
+/// the shown text stay aligned.
+fn reduce_edit_history_narration(
+    state: &EngineState,
+    pack: &StoryPack,
+    entry_id: Uuid,
+    narration: String,
+) -> Transition {
+    if side_generation_blocked(state) {
+        return Transition::identity(clone_state(state));
+    }
+    let trimmed = narration.trim();
+    if trimmed.is_empty() {
+        return Transition::identity(clone_state(state));
+    }
+    let Some(index) = state
+        .game
+        .history
+        .iter()
+        .position(|entry| entry.id == entry_id)
+    else {
+        return Transition::identity(clone_state(state));
+    };
+    let mut next = clone_state(state);
+    let edited_turn = next.game.history[index].turn;
+    next.game.history[index].narration = trimmed.to_string();
+    next.game.revision = next.game.revision.saturating_add(1);
+    if edited_turn == next.game.turn
+        && let Some((turn, slot, variants)) = next.current_variants.as_mut()
+        && *turn == edited_turn
+        && let Some(slot_text) = variants.get_mut(*slot)
+    {
+        *slot_text = trimmed.to_string();
+    }
+    let snapshot = next.game.clone();
+    upsert_current_checkpoint(&mut next.checkpoints, &snapshot);
+    let view = build_view(&next, pack, None, None);
+    let mut effects = vec![EngineEffect::PublishView(Box::new(view))];
+    if next.autosave_on_accept {
+        effects.push(EngineEffect::PersistStableState {
+            slot_id: AUTOSAVE_SLOT.to_string(),
+            description: Some(format!("턴 {} (편집)", edited_turn)),
+        });
+    }
+    Transition {
+        state: next,
+        effects,
+        audit: Vec::new(),
+    }
+}
+
+/// Handle [`EngineCommand::DeleteHistoryFrom`]: truncate from the selected
+/// entry forward by restoring the ring checkpoint for `turn - 1`. Identity
+/// when the opening turn is targeted, when the id is unknown, or when the
+/// needed checkpoint has aged out of the ring.
+fn reduce_delete_history_from(
+    state: &EngineState,
+    pack: &StoryPack,
+    entry_id: Uuid,
+) -> Transition {
+    if side_generation_blocked(state) {
+        return Transition::identity(clone_state(state));
+    }
+    let Some(entry) = state.game.history.iter().find(|entry| entry.id == entry_id) else {
+        return Transition::identity(clone_state(state));
+    };
+    if entry.turn <= 1 {
+        return Transition::identity(clone_state(state));
+    }
+    let target_turn = entry.turn - 1;
+    let Some(checkpoint_id) = state
+        .checkpoints
+        .iter()
+        .rev()
+        .find(|checkpoint| checkpoint.game.turn == target_turn)
+        .map(|checkpoint| checkpoint.id)
+    else {
+        return Transition::identity(clone_state(state));
+    };
+    reduce_restore_checkpoint(state, pack, checkpoint_id)
 }
 
 /// Handle [`EngineCommand::CycleTurnVariant`]: rotate the last committed

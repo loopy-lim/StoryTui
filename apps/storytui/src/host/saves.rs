@@ -6,6 +6,22 @@ use story_persistence::{CHECKSUM_ALGORITHM, SaveError, SaveStore, SlotMeta};
 use story_tui::{App, SaveLoadMode, SaveLoadRequest};
 use tokio_util::sync::CancellationToken;
 
+/// Push history/memory lists and the delete-availability mask derived from
+/// the checkpoint ring (History `d` only when `turn - 1` is still rewindable).
+pub fn refresh_app_lists(app: &mut App, engine: &EngineState, pack: &StoryPack) {
+    let checkpoint_turns: Vec<u32> = engine
+        .checkpoints
+        .iter()
+        .map(|checkpoint| checkpoint.game.turn)
+        .collect();
+    app.set_lists_with_checkpoints(
+        &engine.game.history,
+        &engine.game.memories,
+        &pack.metadata.initial_state.location,
+        &checkpoint_turns,
+    );
+}
+
 /// Resume only the verified autosave belonging to the loaded Pack.
 pub fn restore_autosave(save_store: &SaveStore, pack: &StoryPack) -> Option<EngineState> {
     let envelope = match save_store.load(AUTOSAVE_SLOT) {
@@ -114,11 +130,7 @@ pub fn handle_request(
                     restored.use_director_writer = use_director_writer;
                     *engine = restored;
                     app.close_save_load();
-                    app.set_lists(
-                        &engine.game.history,
-                        &engine.game.memories,
-                        &pack.metadata.initial_state.location,
-                    );
+                    refresh_app_lists(app, engine, pack);
                     app.set_view(build_view(engine, pack, None, None));
                     app.follow_story_end();
                 }

@@ -35,9 +35,9 @@ use crate::screens::save_load::{render_save_load, save_load_selection_at};
 use crate::screens::settings::{SettingsView, render_settings};
 use crate::screens::story::{
     ListMode, ModelRoleHints, StoryBlock, StoryFooterAction, StoryStackEntry, choice_index_at,
-    footer_action_at, markdown_lines, model_picker_scroll, render_help_overlay, render_list,
-    render_model_picker, render_provider_picker, render_story, story_entry_lines,
-    streaming_entry_lines,
+    footer_action_at, markdown_lines, model_picker_scroll, render_help_overlay,
+    render_history_delete_confirm, render_history_edit_dialog, render_list, render_model_picker,
+    render_provider_picker, render_story, story_entry_lines, streaming_entry_lines,
 };
 use crate::theme::Styles;
 
@@ -154,6 +154,17 @@ struct AuthorNoteDialogState {
 
 /// Buffer capacity for the author's note modal (grapheme clusters).
 const AUTHOR_NOTE_MAX_CHARS: usize = 400;
+
+/// Multi-line narration editor opened from History (`Enter`).
+#[derive(Clone, Debug)]
+struct HistoryEditDialog {
+    entry_id: Uuid,
+    turn: u32,
+    buffer: InputBuffer,
+}
+
+/// Buffer capacity for History narration edits (grapheme clusters).
+const HISTORY_NARRATION_MAX_CHARS: usize = 8_000;
 
 /// Lorebook data the host pushes for the Settings `w` editor. `persisted`
 /// mirrors "a lorebook.toml exists to save into" — when false the dialog
@@ -310,6 +321,20 @@ pub struct App {
     pub list_mode: Option<ListMode>,
     /// Display-ready history and memory rows supplied by the host.
     pub history_items: Vec<String>,
+    /// Parallel to `history_items` (newest-first): entry ids for edit/delete.
+    history_entry_ids: Vec<Uuid>,
+    /// Parallel to `history_items`: full narration text for the edit modal.
+    history_narrations: Vec<String>,
+    /// Parallel to `history_items`: turn numbers for confirm copy.
+    history_turns: Vec<u32>,
+    /// Parallel to `history_items`: whether delete can restore `turn - 1`.
+    history_deletable: Vec<bool>,
+    /// Selected row while History list is open.
+    history_selected: usize,
+    /// Narration edit modal over History.
+    history_edit: Option<HistoryEditDialog>,
+    /// Delete-from-here confirm modal over History.
+    history_delete_confirm: bool,
     pub memory_items: Vec<String>,
     /// Models advertised by the active OpenAI-compatible provider.
     pub model_items: Vec<String>,
@@ -506,6 +531,13 @@ impl App {
             input: InputBuffer::new(500),
             list_mode: None,
             history_items: Vec::new(),
+            history_entry_ids: Vec::new(),
+            history_narrations: Vec::new(),
+            history_turns: Vec::new(),
+            history_deletable: Vec::new(),
+            history_selected: 0,
+            history_edit: None,
+            history_delete_confirm: false,
             memory_items: Vec::new(),
             model_items: Vec::new(),
             model_selected: 0,
@@ -1087,6 +1119,105 @@ impl App {
         let mut note = InputBuffer::new(AUTHOR_NOTE_MAX_CHARS);
         note.insert_str(&self.author_note);
         self.author_note_dialog = Some(AuthorNoteDialogState { note });
+    }
+
+    /// Prefill the History narration editor from the selected row.
+    fn open_history_edit(&mut self) {
+        let Some(entry_id) = self.history_entry_ids.get(self.history_selected).copied() else {
+            return;
+        };
+        let Some(turn) = self.history_turns.get(self.history_selected).copied() else {
+            return;
+        };
+        let narration = self
+            .history_narrations
+            .get(self.history_selected)
+            .cloned()
+            .unwrap_or_default();
+        let mut buffer = InputBuffer::new_multiline(HISTORY_NARRATION_MAX_CHARS);
+        buffer.insert_str(&narration);
+        self.history_edit = Some(HistoryEditDialog {
+            entry_id,
+            turn,
+            buffer,
+        });
+    }
+
+    /// Delete is offered only when the host reported a ring checkpoint for
+    /// `turn - 1` (and never for the opening turn).
+    fn history_delete_available(&self) -> bool {
+        self.history_deletable
+            .get(self.history_selected)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    fn ensure_history_selection_visible(&mut self) {
+        let selected = self.history_selected as u16;
+        if selected < self.list_scroll {
+            self.list_scroll = selected;
+        } else if selected >= self.list_scroll.saturating_add(8) {
+            self.list_scroll = selected.saturating_sub(7);
+        }
+    }
+
+    fn handle_history_edit_key(&mut self, key: KeyEvent) -> Option<EngineCommand> {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.should_quit = true;
+            return None;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+            let narration = self.history_edit.as_ref()?.buffer.text();
+            if narration.trim().is_empty() {
+                self.set_story_notice(Some("내레이션이 비어 있어 적용하지 않았습니다"));
+                return None;
+            }
+            let dialog = self.history_edit.take()?;
+            return Some(EngineCommand::EditHistoryNarration {
+                entry_id: dialog.entry_id,
+                narration,
+            });
+        }
+        let dialog = self.history_edit.as_mut()?;
+        match key.code {
+            KeyCode::Esc => self.history_edit = None,
+            KeyCode::Enter => dialog.buffer.insert_grapheme("\n"),
+            KeyCode::Backspace => dialog.buffer.backspace(),
+            KeyCode::Delete => dialog.buffer.delete(),
+            KeyCode::Left => dialog.buffer.cursor_left(),
+            KeyCode::Right => dialog.buffer.cursor_right(),
+            KeyCode::Home => dialog.buffer.cursor_start(),
+            KeyCode::End => dialog.buffer.cursor_end(),
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                dialog.buffer.insert_grapheme(&c.to_string());
+            }
+            _ => {}
+        }
+        None
+    }
+
+    fn handle_history_delete_confirm_key(&mut self, key: KeyEvent) -> Option<EngineCommand> {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.should_quit = true;
+            return None;
+        }
+        match key.code {
+            KeyCode::Enter => {
+                self.history_delete_confirm = false;
+                let entry_id = self.history_entry_ids.get(self.history_selected).copied()?;
+                Some(EngineCommand::DeleteHistoryFrom { entry_id })
+            }
+            KeyCode::Esc | KeyCode::Char('d' | 'ㅇ') => {
+                self.history_delete_confirm = false;
+                None
+            }
+            KeyCode::Char('q' | 'ㅂ') => {
+                self.should_quit = true;
+                self.history_delete_confirm = false;
+                None
+            }
+            _ => None,
+        }
     }
 
     /// Keys while the author's note modal owns the Settings screen. Enter
@@ -1846,10 +1977,36 @@ impl App {
         memories: &[story_model::MemoryEntry],
         initial_location: &LocationId,
     ) {
+        self.set_lists_with_checkpoints(history, memories, initial_location, &[]);
+    }
+
+    /// Like [`Self::set_lists`], but `checkpoint_turns` enables History delete
+    /// only when a ring snapshot for `entry.turn - 1` is still available.
+    pub fn set_lists_with_checkpoints(
+        &mut self,
+        history: &[story_model::HistoryEntry],
+        memories: &[story_model::MemoryEntry],
+        initial_location: &LocationId,
+        checkpoint_turns: &[u32],
+    ) {
         let previous_story_count = self.story_stack.len();
         self.initial_location = Some(initial_location.0.clone());
         let timeline = location_timeline(history, initial_location);
         let emotions = emotion_timeline(history);
+        self.history_entry_ids = history.iter().rev().map(|entry| entry.id).collect();
+        self.history_narrations = history
+            .iter()
+            .rev()
+            .map(|entry| entry.narration.clone())
+            .collect();
+        self.history_turns = history.iter().rev().map(|entry| entry.turn).collect();
+        self.history_deletable = history
+            .iter()
+            .rev()
+            .map(|entry| {
+                entry.turn > 1 && checkpoint_turns.iter().any(|turn| *turn == entry.turn - 1)
+            })
+            .collect();
         self.history_items = history
             .iter()
             .rev()
@@ -1861,6 +2018,13 @@ impl App {
                 self.display_text(&row).into_owned()
             })
             .collect();
+        if self.history_items.is_empty() {
+            self.history_selected = 0;
+        } else {
+            self.history_selected = self
+                .history_selected
+                .min(self.history_items.len().saturating_sub(1));
+        }
         let stack = history
             .iter()
             .zip(timeline)
@@ -1971,6 +2135,12 @@ impl App {
                 _ => None,
             };
         }
+        if self.history_edit.is_some() {
+            return self.handle_history_edit_key(key);
+        }
+        if self.history_delete_confirm {
+            return self.handle_history_delete_confirm_key(key);
+        }
         if self.pack_picker.is_some() {
             self.handle_pack_picker_key(key);
             return None;
@@ -2018,11 +2188,14 @@ impl App {
             match key.code {
                 KeyCode::Esc => {
                     self.list_mode = None;
+                    self.history_edit = None;
+                    self.history_delete_confirm = false;
                     return None;
                 }
                 KeyCode::Char('h' | 'ㅗ') => {
                     self.list_mode = Some(ListMode::History);
                     self.list_scroll = 0;
+                    self.history_selected = 0;
                     return None;
                 }
                 KeyCode::Char('m' | 'ㅡ') => {
@@ -2033,6 +2206,37 @@ impl App {
                 KeyCode::Char('p' | 'ㅔ') => {
                     self.list_mode = Some(ListMode::Cast);
                     self.list_scroll = 0;
+                    return None;
+                }
+                KeyCode::Up | KeyCode::Char('k' | 'ㅏ')
+                    if self.list_mode == Some(ListMode::History) =>
+                {
+                    self.history_selected = self.history_selected.saturating_sub(1);
+                    self.ensure_history_selection_visible();
+                    return None;
+                }
+                KeyCode::Down | KeyCode::Char('j' | 'ㅓ')
+                    if self.list_mode == Some(ListMode::History) =>
+                {
+                    if !self.history_items.is_empty() {
+                        self.history_selected = (self.history_selected + 1)
+                            .min(self.history_items.len().saturating_sub(1));
+                        self.ensure_history_selection_visible();
+                    }
+                    return None;
+                }
+                KeyCode::Enter if self.list_mode == Some(ListMode::History) => {
+                    self.open_history_edit();
+                    return None;
+                }
+                KeyCode::Char('d' | 'ㅇ') if self.list_mode == Some(ListMode::History) => {
+                    if self.history_delete_available() {
+                        self.history_delete_confirm = true;
+                    } else {
+                        self.set_story_notice(Some(
+                            "이 턴은 삭제할 수 없습니다 (오프닝 또는 되돌리기 링 밖)",
+                        ));
+                    }
                     return None;
                 }
                 KeyCode::PageUp => self.list_scroll = self.list_scroll.saturating_sub(5),
@@ -2207,6 +2411,7 @@ impl App {
         if matches!(key.code, KeyCode::Char('h' | 'ㅗ')) {
             self.list_mode = Some(ListMode::History);
             self.list_scroll = 0;
+            self.history_selected = 0;
             return None;
         }
         if matches!(key.code, KeyCode::Char('m' | 'ㅡ')) {
@@ -2659,7 +2864,21 @@ impl App {
                 }
                 ListMode::ModelPicker | ListMode::ProviderPicker => unreachable!("rendered above"),
             };
-            render_list(frame, area, mode, items, self.list_scroll);
+            let selected = (mode == ListMode::History).then_some(self.history_selected);
+            render_list(frame, area, mode, items, self.list_scroll, selected);
+            if mode == ListMode::History {
+                if let Some(dialog) = self.history_edit.as_ref() {
+                    let (before, after) = dialog.buffer.split_at_cursor();
+                    render_history_edit_dialog(frame, area, dialog.turn, &before, &after);
+                } else if self.history_delete_confirm {
+                    let turn = self
+                        .history_turns
+                        .get(self.history_selected)
+                        .copied()
+                        .unwrap_or(0);
+                    render_history_delete_confirm(frame, area, turn);
+                }
+            }
             return;
         }
         if self.settings_visible
@@ -2932,6 +3151,8 @@ impl App {
                     StoryFooterAction::History => {
                         if self.view.loading.is_none() && self.view.error.is_none() {
                             self.list_mode = Some(ListMode::History);
+                            self.list_scroll = 0;
+                            self.history_selected = 0;
                         }
                     }
                     StoryFooterAction::Memory => {
@@ -5590,6 +5811,107 @@ mod tests {
             app.handle_key(key(KeyCode::Char('ㅕ')), None),
             Some(EngineCommand::RestoreCheckpoint { checkpoint_id }),
             "korean layout resolves the same checkpoint"
+        );
+    }
+
+    #[test]
+    fn history_enter_edits_selected_narration_with_ctrl_s() {
+        let mut app = App::new(sample_view(1));
+        let first = history_entry(1, None);
+        let second = history_entry(2, None);
+        let second_id = second.id;
+        app.set_lists(&[first, second], &[], &default_location());
+
+        app.handle_key(key(KeyCode::Char('h')), None);
+        assert_eq!(app.list_mode, Some(ListMode::History));
+        assert_eq!(app.history_selected, 0, "newest row is selected first");
+        app.handle_key(key(KeyCode::Enter), None);
+        assert!(app.history_edit.is_some());
+
+        let dialog = app.history_edit.as_mut().unwrap();
+        dialog.buffer.clear();
+        dialog.buffer.insert_str("고친 문장");
+        let submit = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert_eq!(
+            app.handle_key(submit, None),
+            Some(EngineCommand::EditHistoryNarration {
+                entry_id: second_id,
+                narration: "고친 문장".to_string(),
+            })
+        );
+        assert!(app.history_edit.is_none());
+    }
+
+    #[test]
+    fn history_delete_confirm_truncates_from_selected_turn() {
+        let mut app = App::new(sample_view(1));
+        let first = history_entry(1, None);
+        let second = history_entry(2, None);
+        let second_id = second.id;
+        // Host reports a checkpoint for turn 1 → turn 2 is deletable.
+        app.set_lists_with_checkpoints(
+            &[first, second],
+            &[],
+            &default_location(),
+            &[1],
+        );
+
+        app.handle_key(key(KeyCode::Char('h')), None);
+        app.handle_key(key(KeyCode::Char('d')), None);
+        assert!(app.history_delete_confirm);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter), None),
+            Some(EngineCommand::DeleteHistoryFrom {
+                entry_id: second_id
+            })
+        );
+        assert!(!app.history_delete_confirm);
+    }
+
+    #[test]
+    fn history_delete_refuses_the_opening_turn() {
+        let mut app = App::new(sample_view(1));
+        let opening = history_entry(1, None);
+        app.set_lists_with_checkpoints(&[opening], &[], &default_location(), &[1]);
+        app.handle_key(key(KeyCode::Char('h')), None);
+        app.handle_key(key(KeyCode::Char('d')), None);
+        assert!(
+            !app.history_delete_confirm,
+            "turn 1 cannot open the delete confirm"
+        );
+        assert_eq!(
+            app.story_notice(),
+            Some("이 턴은 삭제할 수 없습니다 (오프닝 또는 되돌리기 링 밖)")
+        );
+    }
+
+    #[test]
+    fn history_delete_refuses_when_checkpoint_is_outside_the_ring() {
+        let mut app = App::new(sample_view(1));
+        let first = history_entry(1, None);
+        let second = history_entry(2, None);
+        // No turn-1 checkpoint reported → delete is refused with a notice.
+        app.set_lists_with_checkpoints(&[first, second], &[], &default_location(), &[]);
+        app.handle_key(key(KeyCode::Char('h')), None);
+        app.handle_key(key(KeyCode::Char('d')), None);
+        assert!(!app.history_delete_confirm);
+        assert!(app.story_notice().is_some());
+    }
+
+    #[test]
+    fn history_edit_keeps_dialog_on_empty_submit() {
+        let mut app = App::new(sample_view(1));
+        let entry = history_entry(1, None);
+        app.set_lists(&[entry], &[], &default_location());
+        app.handle_key(key(KeyCode::Char('h')), None);
+        app.handle_key(key(KeyCode::Enter), None);
+        app.history_edit.as_mut().unwrap().buffer.clear();
+        let submit = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert_eq!(app.handle_key(submit, None), None);
+        assert!(app.history_edit.is_some(), "empty submit must keep the dialog");
+        assert_eq!(
+            app.story_notice(),
+            Some("내레이션이 비어 있어 적용하지 않았습니다")
         );
     }
 
