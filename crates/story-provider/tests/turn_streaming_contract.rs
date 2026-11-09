@@ -565,26 +565,14 @@ async fn turn_stream_ignores_nested_narration_key_in_state_patch() {
     // Issue #8: a story pack whose state_patch.set_strings defines a
     // "narration" string variable streamed BEFORE the prose must not
     // over-stream that value — only the root-level narration surfaces.
-    let body = serde_json::json!({
-      "state_patch": {
-        "affection_delta": {},"trust_delta": {},"tension_delta": {},"relationship_transitions": {},
-        "set_flags": {},"number_delta": {},
-        "set_strings": {"narration": "메모장면 기록"},
-        "inventory_delta": {},"add_events": [],
-        "next_location": null,"next_time_slot": null,"proposed_route": null
-      },
-      "narration": "비가 그쳤다. 노란 우산이 멈춰 섰다.",
-      "choices": [
-        {"id":"c1","label":"a","intent":"i","tone":null,"target":null,"risk":"safe","hidden_requirements":[],"preview":null}
-      ],
-      "summary": {
-        "facts": [],"unresolved": [],"relationship_changes": [],"knowledge_changes": [],
-        "interpretation": null,"address_form_changes": [],"important_player_actions": [],
-        "source_history_ids": []
-      }
-    });
+    // Hand-written raw JSON (NOT serde_json::json!, which would sort the
+    // keys alphabetically and put narration first): the nested
+    // set_strings."narration" genuinely precedes the root-level prose in the
+    // streamed byte order, so the pre-#8 extractor would have streamed the
+    // memo text as scene prose and failed these assertions.
+    let body = r#"{"state_patch":{"affection_delta":{},"trust_delta":{},"tension_delta":{},"relationship_transitions":{},"set_flags":{},"number_delta":{},"set_strings":{"narration":"메모장면 기록"},"inventory_delta":{},"add_events":[],"next_location":null,"next_time_slot":null,"proposed_route":null},"narration":"비가 그쳤다. 노란 우산이 멈춰 섰다.","choices":[{"id":"c1","label":"a","intent":"i","tone":null,"target":null,"risk":"safe","hidden_requirements":[],"preview":null}],"summary":{"facts":[],"unresolved":[],"relationship_changes":[],"knowledge_changes":[],"interpretation":null,"address_form_changes":[],"important_player_actions":[],"source_history_ids":[]}}"#;
     let mut sse = String::new();
-    for piece in split_pieces(&body.to_string(), 11) {
+    for piece in split_pieces(body, 11) {
         sse.push_str(&delta_event(&piece));
     }
     sse.push_str("data: [DONE]\n\n");
