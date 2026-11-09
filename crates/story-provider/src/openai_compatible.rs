@@ -38,6 +38,12 @@ const BASE_BACKOFF_MS: u64 = 20;
 /// UI probes must never inherit the multi-minute generation deadline.
 const PROBE_TIMEOUT_MS: u64 = 3_000;
 
+/// Minimum remaining turn budget for attempting the non-streaming fallback
+/// after a failed stream (issue #10). Below this a fresh request has no
+/// plausible chance of completing, so the error surfaces immediately instead
+/// of guaranteeing another near-deadline wait.
+const FALLBACK_MIN_BUDGET_MS: u64 = 250;
+
 /// Returns `true` when the host part of `url` is a loopback address
 /// (`127.0.0.0/8`, `localhost`, `::1`). Used to decide the ADR-002 non-loopback
 /// warning — no external URL crate is pulled in (ADR-003: keep deps minimal).
@@ -1125,15 +1131,227 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
         };
         let mut body = ChatCompletionRequest::from_writer(&request, model_name);
         body.max_tokens_field = self.config.max_tokens_field;
+        // Ask spec-conformant servers to attach a final usage frame so token
+        // accounting does not silently disappear on this streamed path either
+        // (issue #9; the turn path already did).
+        body.stream_options = Some(crate::envelope::StreamOptions {
+            include_usage: true,
+        });
         let generation_id = request.generation_id;
 
+        let summary = self
+            .run_sse_stream(&body, &cancel, |text| {
+                // Forward to the sink; ignore a full channel (the host may
+                // have dropped the receiver).
+                let _ = sink.try_send(WriterEvent::Chunk {
+                    text: text.to_string(),
+                });
+            })
+            .await?;
+
+        if !summary.saw_done {
+            // Stream ended without `[DONE]` — treat as a protocol error so the
+            // host surfaces a recoverable error rather than partial text.
+            return Err(ProviderError::Protocol(
+                "stream ended without [DONE]".to_string(),
+            ));
+        }
+
+        // Best-effort final notification; a dropped receiver is not an error.
+        let _ = sink.try_send(WriterEvent::Done {
+            usage: summary.usage.clone(),
+            finish_reason: summary.finish_reason.clone(),
+        });
+
+        log_token_usage("writer", generation_id, model_name, summary.usage.clone());
+        Ok(WriterFinish {
+            generation_id,
+            full_text: summary.full_text,
+            usage: summary.usage,
+            finish_reason: summary.finish_reason,
+        })
+    }
+
+    /// Streaming MVP turn path (issue #2): SSE deltas are surfaced as decoded
+    /// `narration` chunks while the full JSON object accumulates; the final
+    /// draft always comes from the existing strict parser on the complete
+    /// text.
+    ///
+    /// Retry policy: single streaming attempt. Failures fall back to the
+    /// non-streaming [`Self::generate_turn`] — which reuses the full retry
+    /// ladder (HTTP 400 auto-fallback, envelope repair) — whenever the
+    /// fallback cannot duplicate visible text: before the first chunk
+    /// (obviously), after a contract violation, and after a transient
+    /// transport break (the streamed text is display-only and is replaced by
+    /// the committed view). Timeout surfaces instead of falling back (a
+    /// non-streaming re-ask would just re-wait the deadline), and
+    /// cancellation is player intent. An `HTTP 400` rejecting `stream:true` +
+    /// `response_format` together is retried exactly once as a stream WITHOUT
+    /// `response_format` (issue #11 — a stream-only rejection must not demote
+    /// the session's structured output; other 4xx codes skip this retry);
+    /// any remaining 4xx falls back to non-streaming form — a fallback to a
+    /// different request shape, not an ADR-002 4xx retry.
+    async fn generate_turn_stream(
+        &self,
+        request: TurnRequest,
+        sink: Sender<WriterEvent>,
+        cancel: CancellationToken,
+    ) -> Result<GeneratedTurnDraft, ProviderError> {
+        // Issue #10: the streaming attempt and any non-streaming fallback
+        // share ONE `request_timeout_ms` budget (see `fallback_within_budget`),
+        // so a slow model's worst-case turn latency stays bounded at roughly
+        // a single deadline instead of doubling.
+        let started = std::time::Instant::now();
+        let mut emitted = false;
+        let mut result = self
+            .do_generate_turn_stream(&request, &sink, &cancel, false, &mut emitted)
+            .await;
+        // Issue #11: a 400 on a request carrying BOTH `stream:true` and
+        // `response_format` is ambiguous — the schema may be rejected, or the
+        // server may reject only the combination. Demoting structured output
+        // for the whole session here would over-trigger (a server that
+        // accepts the same schema non-streaming would lose guided decoding
+        // forever), so retry the STREAM once without response_format first.
+        // Only the non-streaming ladder's own 400 arm — where the schema
+        // alone is on trial — may demote.
+        if matches!(
+            result,
+            Err(ProviderError::Protocol(ref detail)) if detail == "HTTP 400"
+        ) && self.config.structured_output == StructuredOutputMode::Auto
+            && request.json_schema.is_some()
+            && self.structured_enabled()
+        {
+            tracing::warn!(
+                target: "story_provider::openai_compatible",
+                generation_id = %request.generation_id,
+                "streaming request with response_format rejected (HTTP 400); retrying the stream without response_format"
+            );
+            result = self
+                .do_generate_turn_stream(&request, &sink, &cancel, true, &mut emitted)
+                .await;
+        }
+        match result {
+            Ok(draft) => Ok(draft),
+            // Cancellation is player intent, not a failure — never retried.
+            Err(ProviderError::Cancelled) => Err(ProviderError::Cancelled),
+            // A timeout means the model is slow; re-asking non-streaming
+            // would just re-wait the full deadline (do_generate's timeout
+            // policy), so surface it for the player to act on.
+            Err(error @ ProviderError::Timeout { .. }) => Err(error),
+            // A contract failure (typically max_tokens truncating the JSON
+            // after the narration streamed) historically self-healed via
+            // the non-streaming ladder. The streamed text is display-only
+            // and is replaced by the committed view, so the bounded retry
+            // does not duplicate anything — restore that self-healing.
+            Err(error @ ProviderError::InvalidGeneration(_)) => {
+                tracing::warn!(
+                    target: "story_provider::openai_compatible",
+                    generation_id = %request.generation_id,
+                    chunks_surfaced = emitted,
+                    error = %error,
+                    "streamed turn violated the contract; retrying non-streaming"
+                );
+                self.fallback_within_budget(request, cancel, started).await
+            }
+            Err(error) if !emitted => {
+                tracing::warn!(
+                    target: "story_provider::openai_compatible",
+                    generation_id = %request.generation_id,
+                    error = %error,
+                    "turn streaming failed before any narration chunk; falling back to non-streaming generation"
+                );
+                self.fallback_within_budget(request, cancel, started).await
+            }
+            // A transient transport failure mid-stream (connection reset,
+            // truncated body → Protocol/Unavailable) also falls back: the
+            // streamed text is display-only and is replaced by the committed
+            // view, so the non-streaming ladder's retries — which the
+            // pre-PR single-pass path always had — never duplicate visible
+            // prose. Timeout is excluded above; Cancelled is player intent.
+            Err(error @ (ProviderError::Protocol(_) | ProviderError::Unavailable(_))) => {
+                tracing::warn!(
+                    target: "story_provider::openai_compatible",
+                    generation_id = %request.generation_id,
+                    chunks_surfaced = emitted,
+                    error = %error,
+                    "turn stream broke mid-generation; retrying non-streaming"
+                );
+                self.fallback_within_budget(request, cancel, started).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl OpenAiCompatibleProvider {
+    /// Non-streaming fallback bounded by the turn's remaining time budget
+    /// (issue #10). The streaming attempt already consumed part of
+    /// `request_timeout_ms`; the fallback ladder (its own transient retries
+    /// plus any repair pass) runs only inside what remains, so the
+    /// worst-case turn latency is roughly one `request_timeout_ms` instead
+    /// of doubling. A budget that already ran out (or is too small to
+    /// plausibly complete a fresh request) surfaces `Timeout` immediately —
+    /// the player has waited a full deadline either way.
+    async fn fallback_within_budget(
+        &self,
+        request: TurnRequest,
+        cancel: CancellationToken,
+        started: std::time::Instant,
+    ) -> Result<GeneratedTurnDraft, ProviderError> {
+        let remaining_ms = self
+            .config
+            .request_timeout_ms
+            .saturating_sub(started.elapsed().as_millis() as u64);
+        if remaining_ms < FALLBACK_MIN_BUDGET_MS {
+            tracing::warn!(
+                target: "story_provider::openai_compatible",
+                generation_id = %request.generation_id,
+                remaining_ms,
+                "turn budget exhausted by the streaming attempt; surfacing Timeout instead of a non-streaming re-ask"
+            );
+            return Err(ProviderError::Timeout {
+                ms: self.config.request_timeout_ms,
+            });
+        }
+        match tokio::time::timeout(
+            Duration::from_millis(remaining_ms),
+            crate::provider::LlmProvider::generate_turn(self, request, cancel),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_deadline_elapsed) => Err(ProviderError::Timeout {
+                ms: self.config.request_timeout_ms,
+            }),
+        }
+    }
+
+    /// Shared SSE machinery for both streaming paths (issue #9): send with
+    /// cancellation raced, status check, byte-stream pump through
+    /// [`SseParser`], per-delta decode, usage / finish_reason capture, and
+    /// `[DONE]` detection. `on_text` observes every non-empty delta text in
+    /// arrival order — forwarding chunks or feeding the narration extractor
+    /// is the caller's concern.
+    ///
+    /// A body that ends without `[DONE]` is NOT an error here: the Writer
+    /// path hard-errors on it, while the turn path first attempts a strict
+    /// parse of the accumulated text (see `saw_done` in the summary).
+    async fn run_sse_stream<F>(
+        &self,
+        body: &ChatCompletionRequest,
+        cancel: &CancellationToken,
+        mut on_text: F,
+    ) -> Result<SseStreamSummary, ProviderError>
+    where
+        F: FnMut(&str),
+    {
         if cancel.is_cancelled() {
             return Err(ProviderError::Cancelled);
         }
 
         // Single attempt — once the stream has started we cannot transparently
         // retry (chunks may have already been surfaced to the UI). Pre-stream
-        // errors (connect / 4xx / 5xx) are surfaced immediately.
+        // errors (connect / 4xx / 5xx) are surfaced to the caller.
         let send = self
             .authorize(self.client.post(self.chat_url()))
             .json(&body)
@@ -1143,7 +1361,6 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
             _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
             r = send => r.map_err(|e| map_send_error(e, self.config.request_timeout_ms))?,
         };
-
         let status = resp.status();
         if !status.is_success() {
             return Err(ProviderError::Protocol(format!("HTTP {}", status.as_u16())));
@@ -1180,13 +1397,8 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
                                             if let Some(text) = parsed.text
                                                 && !text.is_empty()
                                             {
-                                                // Forward to the sink; ignore a full
-                                                // channel (the host may have dropped the
-                                                // receiver). Coalesce regardless.
-                                                let _ = sink.try_send(WriterEvent::Chunk {
-                                                    text: text.clone(),
-                                                });
                                                 full_text.push_str(&text);
+                                                on_text(&text);
                                             }
                                             if let Some(u) = parsed.usage {
                                                 usage = Some(u);
@@ -1214,125 +1426,34 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
             }
         }
 
-        if !saw_done {
-            // Stream ended without `[DONE]` — treat as a protocol error so the
-            // host surfaces a recoverable error rather than partial text.
-            return Err(ProviderError::Protocol(
-                "stream ended without [DONE]".to_string(),
-            ));
-        }
-
-        // Best-effort final notification; a dropped receiver is not an error.
-        let _ = sink.try_send(WriterEvent::Done {
-            usage: usage.clone(),
-            finish_reason: finish_reason.clone(),
-        });
-
-        log_token_usage("writer", generation_id, model_name, usage.clone());
-        Ok(WriterFinish {
-            generation_id,
+        Ok(SseStreamSummary {
             full_text,
             usage,
             finish_reason,
+            saw_done,
         })
     }
 
-    /// Streaming MVP turn path (issue #2): SSE deltas are surfaced as decoded
-    /// `narration` chunks while the full JSON object accumulates; the final
-    /// draft always comes from the existing strict parser on the complete
-    /// text.
-    ///
-    /// Retry policy: single streaming attempt. Failures fall back to the
-    /// non-streaming [`Self::generate_turn`] — which reuses the full retry
-    /// ladder (HTTP 400 auto-fallback, envelope repair) — whenever the
-    /// fallback cannot duplicate visible text: before the first chunk
-    /// (obviously), after a contract violation, and after a transient
-    /// transport break (the streamed text is display-only and is replaced by
-    /// the committed view). Timeout surfaces instead of falling back (a
-    /// non-streaming re-ask would just re-wait the deadline), and
-    /// cancellation is player intent. A `stream:true`-rejecting 4xx is
-    /// retried exactly once in non-streaming form — a fallback to a different
-    /// request shape, not an ADR-002 4xx retry.
-    async fn generate_turn_stream(
-        &self,
-        request: TurnRequest,
-        sink: Sender<WriterEvent>,
-        cancel: CancellationToken,
-    ) -> Result<GeneratedTurnDraft, ProviderError> {
-        let mut emitted = false;
-        let result = self
-            .do_generate_turn_stream(&request, &sink, &cancel, &mut emitted)
-            .await;
-        match result {
-            Ok(draft) => Ok(draft),
-            // Cancellation is player intent, not a failure — never retried.
-            Err(ProviderError::Cancelled) => Err(ProviderError::Cancelled),
-            // A timeout means the model is slow; re-asking non-streaming
-            // would just re-wait the full deadline (do_generate's timeout
-            // policy), so surface it for the player to act on.
-            Err(error @ ProviderError::Timeout { .. }) => Err(error),
-            // A contract failure (typically max_tokens truncating the JSON
-            // after the narration streamed) historically self-healed via
-            // the non-streaming ladder. The streamed text is display-only
-            // and is replaced by the committed view, so the bounded retry
-            // does not duplicate anything — restore that self-healing.
-            Err(error @ ProviderError::InvalidGeneration(_)) => {
-                tracing::warn!(
-                    target: "story_provider::openai_compatible",
-                    generation_id = %request.generation_id,
-                    chunks_surfaced = emitted,
-                    error = %error,
-                    "streamed turn violated the contract; retrying non-streaming"
-                );
-                self.generate_turn(request, cancel).await
-            }
-            Err(error) if !emitted => {
-                tracing::warn!(
-                    target: "story_provider::openai_compatible",
-                    generation_id = %request.generation_id,
-                    error = %error,
-                    "turn streaming failed before any narration chunk; falling back to non-streaming generation"
-                );
-                self.generate_turn(request, cancel).await
-            }
-            // A transient transport failure mid-stream (connection reset,
-            // truncated body → Protocol/Unavailable) also falls back: the
-            // streamed text is display-only and is replaced by the committed
-            // view, so the non-streaming ladder's retries — which the
-            // pre-PR single-pass path always had — never duplicate visible
-            // prose. Timeout is excluded above; Cancelled is player intent.
-            Err(error @ (ProviderError::Protocol(_) | ProviderError::Unavailable(_))) => {
-                tracing::warn!(
-                    target: "story_provider::openai_compatible",
-                    generation_id = %request.generation_id,
-                    chunks_surfaced = emitted,
-                    error = %error,
-                    "turn stream broke mid-generation; retrying non-streaming"
-                );
-                self.generate_turn(request, cancel).await
-            }
-            Err(error) => Err(error),
-        }
-    }
-}
-
-impl OpenAiCompatibleProvider {
     /// Single-attempt streaming body of [`Self::generate_turn_stream`].
     ///
     /// `emitted` is set once a narration chunk has actually been accepted by
     /// the sink, gating the non-streaming fallback in the caller.
+    /// `suppress_rf` omits `response_format` from this attempt (the
+    /// stream-only 400 retry of issue #11 — it does NOT touch the session's
+    /// structured-output flag).
     async fn do_generate_turn_stream(
         &self,
         request: &TurnRequest,
         sink: &Sender<WriterEvent>,
         cancel: &CancellationToken,
+        suppress_rf: bool,
         emitted: &mut bool,
     ) -> Result<GeneratedTurnDraft, ProviderError> {
         // Identical envelope to a normal turn (shared assembly), but SSE.
         // `include_usage` is required for spec-conformant servers (e.g.
         // api.openai.com) to attach a final usage frame — without it token
         // accounting silently disappears on the streamed path.
-        let mut body = self.assemble_turn_body(request, false, None);
+        let mut body = self.assemble_turn_body(request, suppress_rf, None);
         body.stream = true;
         body.stream_options = Some(crate::envelope::StreamOptions {
             include_usage: true,
@@ -1343,101 +1464,29 @@ impl OpenAiCompatibleProvider {
             &request.model
         };
 
-        if cancel.is_cancelled() {
-            return Err(ProviderError::Cancelled);
-        }
-
-        // Single attempt (see the method-level retry note). Pre-stream
-        // errors (connect / 4xx / 5xx) either fall back to the
-        // non-streaming path in the caller or surface immediately.
-        let send = self
-            .authorize(self.client.post(self.chat_url()))
-            .json(&body)
-            .send();
-        let resp = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
-            r = send => r.map_err(|e| map_send_error(e, self.config.request_timeout_ms))?,
-        };
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(ProviderError::Protocol(format!("HTTP {}", status.as_u16())));
-        }
-
-        let mut stream = resp.bytes_stream();
-        let mut parser = SseParser::new();
-        let mut full_text = String::new();
+        // Only the decoded narration prose is surfaced; JSON tokens stay
+        // invisible. `emitted` gates the caller's non-streaming fallback, so
+        // it must be latched even when the pump below ends in an error.
+        let mut emitted_local = false;
         let mut extractor = crate::narration_stream::NarrationStreamExtractor::new();
-        let mut usage: Option<TokenUsage> = None;
-        // Last chunk's server-reported termination reason ("stop"/"length"),
-        // surfaced through `WriterEvent::Done` like the Writer path.
-        let mut finish_reason: Option<String> = None;
-        let mut saw_done = false;
-
-        loop {
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => {
-                    // Cancel discards any buffered / in-flight text.
-                    return Err(ProviderError::Cancelled);
+        let pump = self
+            .run_sse_stream(&body, cancel, |text| {
+                let narration = extractor.feed(text);
+                if !narration.is_empty()
+                    && sink
+                        .try_send(WriterEvent::Chunk { text: narration })
+                        .is_ok()
+                {
+                    emitted_local = true;
                 }
-                chunk = stream.next() => {
-                    match chunk {
-                        None => break,
-                        Some(Err(e)) => {
-                            return Err(map_send_error(e, self.config.request_timeout_ms));
-                        }
-                        Some(Ok(bytes)) => {
-                            for ev in parser.feed(bytes.as_ref()) {
-                                match ev {
-                                    SseEvent::Data(payload) => {
-                                        if let Some(parsed) = parse_stream_delta(&payload) {
-                                            if let Some(text) = parsed.text
-                                                && !text.is_empty()
-                                            {
-                                                full_text.push_str(&text);
-                                                // Only the decoded narration
-                                                // prose is surfaced; JSON
-                                                // tokens stay invisible.
-                                                let narration = extractor.feed(&text);
-                                                if !narration.is_empty()
-                                                    && sink
-                                                        .try_send(WriterEvent::Chunk {
-                                                            text: narration,
-                                                        })
-                                                        .is_ok()
-                                                {
-                                                    *emitted = true;
-                                                }
-                                            }
-                                            if let Some(u) = parsed.usage {
-                                                usage = Some(u);
-                                            }
-                                            if parsed.finish_reason.is_some() {
-                                                finish_reason = parsed.finish_reason;
-                                            }
-                                        }
-                                        // Unknown payloads (keep-alive
-                                        // comments, unparseable deltas) are
-                                        // ignored.
-                                    }
-                                    SseEvent::Done => {
-                                        saw_done = true;
-                                        break;
-                                    }
-                                    SseEvent::Incomplete => {}
-                                }
-                            }
-                            if saw_done {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
+            })
+            .await;
+        if emitted_local {
+            *emitted = true;
         }
+        let summary = pump?;
 
-        if !saw_done {
+        if !summary.saw_done {
             // Some OpenAI-compatible servers/proxies close the body after
             // the last delta without the `[DONE]` sentinel. The accumulated
             // text is still run through the strict parser below; only an
@@ -1452,28 +1501,34 @@ impl OpenAiCompatibleProvider {
 
         // Best-effort final notification; a dropped receiver is not an error.
         let _ = sink.try_send(WriterEvent::Done {
-            usage: usage.clone(),
-            finish_reason: finish_reason.clone(),
+            usage: summary.usage.clone(),
+            finish_reason: summary.finish_reason.clone(),
         });
-        log_token_usage("turn", request.generation_id, model_name, usage.clone());
+        log_token_usage(
+            "turn",
+            request.generation_id,
+            model_name,
+            summary.usage.clone(),
+        );
 
         // The committed turn ALWAYS goes through the existing strict parser
         // on the complete text — the streaming extractor is display-only.
+        let full_text = &summary.full_text;
         let parsed_content = if is_choice_only_request(request) {
-            crate::recovery::parse_generated_choices(&full_text, request.generation_id)
+            crate::recovery::parse_generated_choices(full_text, request.generation_id)
         } else {
-            parse_generated_turn(&full_text, request.generation_id)
+            parse_generated_turn(full_text, request.generation_id)
         };
         match parsed_content {
             Ok(outcome) => {
                 let mut draft = outcome.draft;
                 if draft.usage.is_none() {
-                    draft.usage = usage;
+                    draft.usage = summary.usage;
                 }
                 Ok(draft)
             }
             Err(e) => {
-                if !saw_done {
+                if !summary.saw_done {
                     // Unparseable body AND no `[DONE]`: protocol error so
                     // the host surfaces a recoverable error and the engine
                     // restores the checkpoint rather than committing
@@ -1499,6 +1554,16 @@ impl OpenAiCompatibleProvider {
 // ---------------------------------------------------------------------------
 // OpenAI streaming-delta payload parsing
 // ---------------------------------------------------------------------------
+
+/// Result of one shared SSE pump run ([`OpenAiCompatibleProvider::run_sse_stream`]):
+/// the coalesced text, the last observed usage / finish_reason, and whether
+/// the `[DONE]` sentinel was seen before the body ended.
+struct SseStreamSummary {
+    full_text: String,
+    usage: Option<TokenUsage>,
+    finish_reason: Option<String>,
+    saw_done: bool,
+}
 
 /// Decoded payload from one OpenAI streaming chunk: the delta text (if any),
 /// the optional per-chunk / final usage, and the optional `finish_reason`.
