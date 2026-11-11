@@ -170,6 +170,15 @@ pub struct StatusLine {
     pub tension: Option<i16>,
     /// Current turn counter.
     pub turn: u32,
+    /// Latest turn's affection delta for the primary character, if any.
+    #[serde(default)]
+    pub affection_delta: Option<i16>,
+    /// Latest turn's trust delta for the primary character, if any.
+    #[serde(default)]
+    pub trust_delta: Option<i16>,
+    /// Latest turn's tension delta for the primary character, if any.
+    #[serde(default)]
+    pub tension_delta: Option<i16>,
 }
 
 /// Loading overlay state, present only while a generation is pending.
@@ -219,6 +228,9 @@ mod tests {
                 trust: Some(1),
                 tension: Some(8),
                 turn: 1,
+                affection_delta: Some(1),
+                trust_delta: None,
+                tension_delta: Some(-1),
             },
             loading: Some(LoadingState {
                 generation_id: Uuid::nil(),
@@ -304,6 +316,9 @@ mod tests {
                 trust: None,
                 tension: None,
                 turn: 0,
+                affection_delta: None,
+                trust_delta: None,
+                tension_delta: None,
             },
             loading: None,
             error: None,

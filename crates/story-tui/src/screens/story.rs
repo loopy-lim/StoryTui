@@ -111,7 +111,11 @@ pub fn render_list(
                 } else {
                     Styles::item_normal()
                 };
-                let prefix = if selected == Some(index) { "› " } else { "  " };
+                let prefix = if selected == Some(index) {
+                    "› "
+                } else {
+                    "  "
+                };
                 Line::from(Span::styled(format!("{prefix}{item}"), style))
             })
             .collect()
@@ -1388,22 +1392,56 @@ fn status_lines(view: &AppViewModel, width: u16, input_mode: bool) -> Vec<Line<'
 }
 
 fn status_values_line(view: &AppViewModel) -> Line<'static> {
-    let stat = |label: &'static str, v: Option<i16>, color: Color| -> Vec<Span<'static>> {
+    let stat = |label: &'static str,
+                v: Option<i16>,
+                delta: Option<i16>,
+                color: Color|
+     -> Vec<Span<'static>> {
         let val = match v {
             Some(n) => n.to_string(),
             None => "—".to_string(),
         };
-        vec![
+        let mut spans = vec![
             Span::styled(format!("{label}:"), Styles::subtle()),
             Span::styled(val, Style::default().fg(color).add_modifier(Modifier::BOLD)),
-        ]
+        ];
+        if let Some(d) = delta
+            && d != 0
+        {
+            let (d_str, d_color) = if d > 0 {
+                (format!("(+{d})"), Palette::SAFE)
+            } else {
+                (format!("({d})"), Palette::DANGER)
+            };
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                d_str,
+                Style::default().fg(d_color).add_modifier(Modifier::BOLD),
+            ));
+        }
+        spans
     };
     let mut spans = Vec::new();
-    spans.extend(stat("애정", view.status.affection, Palette::ACCENT));
+    spans.extend(stat(
+        "애정",
+        view.status.affection,
+        view.status.affection_delta,
+        Palette::ACCENT,
+    ));
     spans.push(Span::raw("  "));
-    spans.extend(stat("신뢰", view.status.trust, Palette::PRIMARY));
+    spans.extend(stat(
+        "신뢰",
+        view.status.trust,
+        view.status.trust_delta,
+        Palette::PRIMARY,
+    ));
     spans.push(Span::raw("  "));
-    spans.extend(stat("긴장", view.status.tension, Palette::CAUTION));
+    spans.extend(stat(
+        "긴장",
+        view.status.tension,
+        view.status.tension_delta,
+        Palette::CAUTION,
+    ));
     spans.push(Span::raw("  "));
     spans.push(Span::styled("턴: ", Styles::subtle()));
     spans.push(Span::styled(
@@ -1501,9 +1539,10 @@ fn risk_color(r: RiskLevel) -> Color {
 mod tests {
     use super::{
         SceneImage, StoryBlock, choice_lines, fmt_duration, markdown_lines, render_story,
-        speaker_dialogue_line,
+        speaker_dialogue_line, status_values_line,
     };
     use crate::input::InputBuffer;
+    use crate::theme::Palette;
     use image::DynamicImage;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -1532,6 +1571,9 @@ mod tests {
                 trust: Some(0),
                 tension: Some(0),
                 turn: 1,
+                affection_delta: None,
+                trust_delta: None,
+                tension_delta: None,
             },
             loading: None,
             error: None,
@@ -2041,5 +2083,77 @@ mod tests {
             speaker_dialogue_line("긴 설명 문장: \"따옴표가 있어도 화자명은 아니다\""),
             None
         );
+    }
+
+    #[test]
+    fn status_values_line_renders_deltas_with_semantic_colors() {
+        let mut view = sample_view();
+        view.status.affection = Some(5);
+        view.status.trust = Some(2);
+        view.status.tension = Some(7);
+        view.status.affection_delta = Some(2);
+        view.status.trust_delta = Some(0); // 0 delta: should be omitted
+        view.status.tension_delta = Some(-1);
+
+        let line = status_values_line(&view);
+        let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+
+        assert!(
+            rendered.contains("애정:5 (+2)"),
+            "positive delta shows (+2): {rendered}"
+        );
+        assert!(
+            rendered.contains("신뢰:2"),
+            "zero delta does not render delta badge: {rendered}"
+        );
+        assert!(
+            !rendered.contains("신뢰:2 ("),
+            "zero delta does not render delta badge: {rendered}"
+        );
+        assert!(
+            rendered.contains("긴장:7 (-1)"),
+            "negative delta shows (-1): {rendered}"
+        );
+        assert!(
+            rendered.contains("턴: 1"),
+            "turn counter intact: {rendered}"
+        );
+
+        // Verify colors
+        let pos_span = line
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "(+2)")
+            .expect("pos delta span");
+        assert_eq!(pos_span.style.fg, Some(Palette::SAFE));
+
+        let neg_span = line
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "(-1)")
+            .expect("neg delta span");
+        assert_eq!(neg_span.style.fg, Some(Palette::DANGER));
+
+        // 80-column budget check
+        let w = rendered.width();
+        assert!(
+            w <= 50,
+            "status line with deltas should comfortably fit well below 80 cols (got {w})"
+        );
+    }
+
+    #[test]
+    fn status_values_line_omits_deltas_when_none() {
+        let mut view = sample_view();
+        view.status.affection = Some(3);
+        view.status.trust = Some(1);
+        view.status.tension = Some(8);
+        view.status.affection_delta = None;
+        view.status.trust_delta = None;
+        view.status.tension_delta = None;
+
+        let line = status_values_line(&view);
+        let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(rendered, "애정:3  신뢰:1  긴장:8  턴: 1");
     }
 }

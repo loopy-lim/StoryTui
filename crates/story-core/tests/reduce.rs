@@ -3307,7 +3307,10 @@ fn edit_history_narration_rejects_empty_and_unknown_ids() {
         &pack,
     )
     .expect("missing");
-    assert_eq!(missing.state.game.history.last().unwrap().narration, original);
+    assert_eq!(
+        missing.state.game.history.last().unwrap().narration,
+        original
+    );
     assert!(missing.effects.is_empty());
 }
 
@@ -3396,4 +3399,35 @@ fn delete_history_from_is_noop_without_matching_checkpoint() {
     .expect("no checkpoint");
     assert_eq!(refused.state.game.turn, 2);
     assert!(refused.effects.is_empty());
+}
+
+#[test]
+fn build_view_extracts_relationship_deltas_from_latest_history_entry() {
+    let pack = sample_pack();
+
+    // 1. Fresh game (Turn 0): no history, deltas must be None
+    let initial = EngineState::initial(&pack);
+    let view_initial = build_view(&initial, &pack, None, None);
+    assert_eq!(view_initial.status.affection_delta, None);
+    assert_eq!(view_initial.status.trust_delta, None);
+    assert_eq!(view_initial.status.tension_delta, None);
+
+    // 2. Two accepted turns: first had affection delta +1, second had affection delta -1
+    let (state, undo_id, _gid) = two_accepted_turns(&pack);
+    let view_turn2 = build_view(&state, &pack, None, None);
+    assert_eq!(view_turn2.status.turn, 2);
+    assert_eq!(view_turn2.status.affection_delta, Some(-1));
+
+    // 3. Rewind to turn 1: delta must now reflect turn 1 (+1)
+    let rewound = reduce(
+        &state,
+        EngineCommand::RestoreCheckpoint {
+            checkpoint_id: undo_id,
+        },
+        &pack,
+    )
+    .expect("restore checkpoint");
+    let view_rewound = build_view(&rewound.state, &pack, None, None);
+    assert_eq!(view_rewound.status.turn, 1);
+    assert_eq!(view_rewound.status.affection_delta, Some(1));
 }

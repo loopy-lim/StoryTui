@@ -1663,11 +1663,7 @@ fn reduce_edit_history_narration(
 /// entry forward by restoring the ring checkpoint for `turn - 1`. Identity
 /// when the opening turn is targeted, when the id is unknown, or when the
 /// needed checkpoint has aged out of the ring.
-fn reduce_delete_history_from(
-    state: &EngineState,
-    pack: &StoryPack,
-    entry_id: Uuid,
-) -> Transition {
+fn reduce_delete_history_from(state: &EngineState, pack: &StoryPack, entry_id: Uuid) -> Transition {
     if side_generation_blocked(state) {
         return Transition::identity(clone_state(state));
     }
@@ -2651,6 +2647,19 @@ pub fn build_view(
         .and_then(|id| game.characters.get(id))
         .map(|c| (Some(c.affection), Some(c.trust), Some(c.tension)))
         .unwrap_or((None, None, None));
+    let (affection_delta, trust_delta, tension_delta) = game
+        .history
+        .last()
+        .and_then(|entry| {
+            primary.map(|id| {
+                (
+                    entry.applied_patch.affection_delta.get(id).copied(),
+                    entry.applied_patch.trust_delta.get(id).copied(),
+                    entry.applied_patch.tension_delta.get(id).copied(),
+                )
+            })
+        })
+        .unwrap_or((None, None, None));
 
     let location_display = pack
         .rules
@@ -2744,6 +2753,9 @@ pub fn build_view(
             trust,
             tension,
             turn: game.turn,
+            affection_delta,
+            trust_delta,
+            tension_delta,
         },
         loading: loading_state,
         error,
