@@ -28,6 +28,8 @@ pub fn refresh_view(
     images_enabled: bool,
     image_backend: Option<String>,
     use_director_writer: bool,
+    stream_turns: bool,
+    stream_supported: bool,
     expressions_enabled: bool,
     user_settings: &UserSettings,
     base_player: &PlayerProfile,
@@ -49,6 +51,8 @@ pub fn refresh_view(
         images_enabled,
         image_backend,
         use_director_writer,
+        stream_turns,
+        stream_supported,
         expressions_enabled,
         sampling_style_label(user_settings.sampling_style()),
         persona_status_label(&effective),
@@ -483,6 +487,8 @@ async fn refresh_projection(
         app.images_enabled(),
         app.image_backend_label(),
         app.use_director_writer(),
+        config.provider.stream_turns,
+        provider.capabilities().supports_streaming,
         app.expressions_enabled(),
         user_settings,
         &config.player,
@@ -698,6 +704,11 @@ pub async fn switch_provider(
     // cycle's 자동 restores exactly these values.
     config.base_sampling = (selected.temperature, selected.top_p, selected.top_k);
     user_settings.apply_sampling_taste(&mut selected);
+    // The Settings `s` streaming toggle is a player preference like the
+    // sampling taste: a persisted `Some(bool)` travels across profile
+    // switches instead of reverting to the new profile's own value, so the
+    // session flag and the Settings row never desync mid-session.
+    selected.stream_turns = user_settings.stream_turns.unwrap_or(selected.stream_turns);
     let rebuilt = Arc::new(
         OpenAiCompatibleProvider::new(selected.clone())
             .map_err(|e| format!("프로바이더 '{name}'를 적용하지 못했습니다: {e}"))?,
@@ -808,6 +819,8 @@ pub async fn apply_provider(
         app.images_enabled(),
         app.image_backend_label(),
         app.use_director_writer(),
+        config.provider.stream_turns,
+        provider.capabilities().supports_streaming,
         app.expressions_enabled(),
         user_settings,
         &config.player,

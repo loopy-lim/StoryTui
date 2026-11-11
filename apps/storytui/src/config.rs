@@ -242,6 +242,12 @@ pub struct UserSettings {
     /// config's `use_director_writer` (ADR-005 default: `false`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub use_director_writer: Option<bool>,
+    /// Single-pass SSE streaming-render preference from the Settings `s`
+    /// toggle. `None` inherits the provider profile's
+    /// `[provider] stream_turns`. Meaningful only on the single-pass path —
+    /// the two-stage path always streams its Writer stage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_turns: Option<bool>,
     /// Response-style preset id from the Settings `x` cycle
     /// (`creative` / `balanced` / `precise`). `None` — or any unrecognized
     /// value — means 자동: the active profile's own sampling stays in charge.
@@ -299,6 +305,7 @@ impl Default for UserSettings {
             expressions_enabled: None,
             image_protocol: None,
             use_director_writer: None,
+            stream_turns: None,
             sampling_preset: None,
             player_name: None,
             player_persona: None,
@@ -1305,6 +1312,7 @@ mod tests {
         );
         let settings = UserSettings {
             use_director_writer: Some(true),
+            stream_turns: None,
             ..UserSettings::default()
         };
         save_user_settings(&dir, &settings).expect("save");
@@ -1417,6 +1425,7 @@ mod tests {
                 expressions_enabled: None,
                 image_protocol: None,
                 use_director_writer: None,
+                stream_turns: None,
                 sampling_preset: None,
                 player_name: None,
                 player_persona: None,
@@ -1468,6 +1477,7 @@ mod tests {
             expressions_enabled: Some(false),
             image_protocol: Some("halfblocks".to_string()),
             use_director_writer: Some(true),
+            stream_turns: None,
             sampling_preset: Some("precise".to_string()),
             player_name: Some("민준".to_string()),
             player_persona: None,
@@ -1501,6 +1511,33 @@ mod tests {
                 .count(),
             0
         );
+        fs::remove_dir_all(dir).expect("clean test directory");
+    }
+
+    #[test]
+    fn stream_turns_override_round_trips() {
+        // The Settings `s` toggle persists `Some(bool)`; an untouched setup
+        // keeps the field absent so the profile's `stream_turns` stays in
+        // charge.
+        let dir = test_dir("stream-roundtrip");
+        let settings = UserSettings {
+            stream_turns: Some(false),
+            ..UserSettings::default()
+        };
+        save_user_settings(&dir, &settings).expect("save settings");
+
+        let path = user_settings_path(&dir);
+        let text = fs::read_to_string(&path).expect("saved settings");
+        assert!(text.contains("stream_turns = false"));
+        assert_eq!(
+            toml::from_str::<UserSettings>(&text).expect("parse settings"),
+            settings
+        );
+
+        // Absent field → None → profile inheritance on the next startup.
+        fs::write(&path, "").expect("empty settings");
+        let loaded = load_user_settings(&dir).expect("load settings");
+        assert_eq!(loaded.stream_turns, None);
         fs::remove_dir_all(dir).expect("clean test directory");
     }
 

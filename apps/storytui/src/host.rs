@@ -367,6 +367,16 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
     config.use_director_writer = user_settings
         .use_director_writer
         .unwrap_or(config.use_director_writer);
+    // Same inheritance rule for the single-pass streaming render: the
+    // persisted Settings `s` toggle wins over the profile's
+    // `[provider] stream_turns` once the player has used it. The working
+    // copy carries it too — the later model-repair and provider-switch
+    // paths rebuild `config.provider` from `provider_config` and must not
+    // silently revert the player's choice.
+    provider_config.stream_turns = user_settings
+        .stream_turns
+        .unwrap_or(provider_config.stream_turns);
+    config.provider.stream_turns = provider_config.stream_turns;
     let mut resume_engine = saves::restore_autosave(&save_store, &pack);
     let mut engine = EngineState::initial(&pack);
     engine.use_director_writer = config.use_director_writer;
@@ -423,6 +433,8 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
             images_enabled,
             image_backend,
             config.use_director_writer,
+            config.provider.stream_turns,
+            provider.capabilities().supports_streaming,
             expressions_enabled,
             &user_settings,
             &config.player,
@@ -1529,6 +1541,22 @@ async fn handle_ui_requests(
         user_settings.use_director_writer = Some(two_stage);
         save_user_settings(&config.save_dir, user_settings)?;
         app.update_settings_generation(two_stage);
+    }
+    if app.take_stream_toggle_request() {
+        // Same next-generation semantics as the `g` toggle: the host's
+        // config decides at RequestGeneration time, so a turn already in
+        // flight (cancelled when Settings opened) finishes under the old
+        // setting. The two-stage path ignores this flag — its Writer always
+        // streams — which the Settings row notes. The working copy stays in
+        // lockstep so the reprobe/provider-switch paths that rebuild
+        // `config.provider` from `provider_config` never resurrect a stale
+        // value (review R1).
+        let stream = !config.provider.stream_turns;
+        config.provider.stream_turns = stream;
+        provider_config.stream_turns = stream;
+        user_settings.stream_turns = Some(stream);
+        save_user_settings(&config.save_dir, user_settings)?;
+        app.update_settings_stream(stream);
     }
     if app.take_sampling_style_cycle_request() {
         // The preset rides the request config, so the next turn generates

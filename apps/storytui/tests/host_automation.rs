@@ -456,6 +456,133 @@ async fn generation_failure_autoretries_once_and_succeeds() {
 }
 
 #[tokio::test]
+async fn stream_turns_off_session_sends_one_non_streaming_request() {
+    // The Settings `s` toggle flips the session config before the next
+    // RequestGeneration; with it off, the MVP path must NOT ask for SSE at
+    // all — one plain completion call, no fallback shape change.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(envelope()))
+        .mount(&server)
+        .await;
+
+    let mut session = session_for(provider_config_for(&server.uri())).await;
+    // Exactly what the host's stream-toggle block does to the session.
+    session.config.provider.stream_turns = false;
+    host::dispatch(
+        EngineCommand::StartNewGame,
+        &mut session.engine,
+        &mut session.app,
+        &session.pack,
+        &session.provider,
+        &session.config,
+        &session.save_store,
+        &session.tts,
+        &mut session.images,
+        &session.tx,
+        &mut session.cancellation,
+    )
+    .await
+    .expect("start new game dispatch");
+
+    let message = next_generation(&mut session).await;
+    let _ = handle(&mut session, message).await;
+    assert_eq!(session.app.view.status.turn, 1, "opening committed");
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "a single request when streaming is off");
+    let body: serde_json::Value =
+        serde_json::from_slice(&requests[0].body).expect("request body parses");
+    assert_ne!(
+        body.get("stream").and_then(serde_json::Value::as_bool),
+        Some(true),
+        "no SSE ask while the toggle is off: {body}"
+    );
+}
+
+#[tokio::test]
+async fn provider_switch_carries_the_stream_preference_across_profiles() {
+    // The Settings `s` toggle is a player preference like the sampling
+    // taste: switching profiles mid-session must not revert it to the new
+    // profile's own `[provider] stream_turns`, and the projected Settings
+    // row must stay truthful about what the next generation will do.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"data": [{"id": "test-model"}]})),
+        )
+        .mount(&server)
+        .await;
+
+    let mut session = session_for(provider_config_for(&server.uri())).await;
+    // The player pressed `s` in Settings while on the default profile:
+    // session flag, working copy, persisted preference, and the row mirror.
+    session.config.provider.stream_turns = true;
+    session.provider_config.stream_turns = true;
+    session.user_settings.stream_turns = Some(true);
+    // A second profile whose own TOML says stream_turns = false.
+    let mut other = provider_config_for(&server.uri());
+    other.name = "second".to_string();
+    other.stream_turns = false;
+    session.config.providers = vec![session.config.provider.clone(), other];
+
+    // R2: seed a stale display mirror — a projection that never saw the `s`
+    // press. If apply_provider rebuilt the row from the mirror instead of
+    // the session authority, the switch would keep showing 꺼짐.
+    let tts_status = session.tts.status().await;
+    host::settings::refresh_view(
+        &mut session.app,
+        &session.provider_config,
+        ProviderHealth::Ready,
+        None,
+        None,
+        None,
+        &tts_status,
+        true,
+        None,
+        false,
+        false,
+        true,
+        true,
+        &session.user_settings,
+        &session.config.player,
+    );
+    assert!(!session.app.stream_turns(), "stale mirror seeded as off");
+
+    host::settings::apply_provider(
+        &mut session.app,
+        "second",
+        &session.config.providers.clone(),
+        &mut session.provider_config,
+        &mut session.provider,
+        &mut session.user_settings,
+        &mut session.config,
+        &session.tts,
+    )
+    .await
+    .expect("switch provider");
+
+    assert!(
+        session.config.provider.stream_turns,
+        "the player's streaming preference survives the profile switch"
+    );
+    assert!(
+        session.app.stream_turns(),
+        "the Settings row stays truthful after the switch"
+    );
+    assert_eq!(session.user_settings.stream_turns, Some(true));
+    assert_eq!(session.user_settings.provider.as_deref(), Some("second"));
+}
+
+#[tokio::test]
 async fn second_failure_hands_control_to_the_manual_overlay() {
     let server = MockServer::start().await;
     // Every request fails: stream + non-stream fallback both 400 per attempt,
@@ -766,6 +893,8 @@ async fn reprobe_marks_the_server_back_and_clears_the_home_notice() {
         true,
         None,
         false,
+        false,
+        true,
         true,
         &session.user_settings,
         &session.config.player,
@@ -809,6 +938,8 @@ async fn reprobe_stays_quiet_while_the_server_is_still_down() {
         true,
         None,
         false,
+        false,
+        true,
         true,
         &session.user_settings,
         &session.config.player,

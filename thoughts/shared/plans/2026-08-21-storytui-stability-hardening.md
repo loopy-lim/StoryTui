@@ -74,8 +74,8 @@
 
 #### 수동 검증
 
-- [ ] 로그 메시지에 모델 원문이 보이지 않음
-- [ ] 로그 파일이 설정된 최대 크기를 넘지 않음
+- [x] 로그 메시지에 모델 원문이 보이지 않음 (2026-11-09 증거 대체: `story-provider` `error_does_not_embed_raw_response_body` 통과, `apps/storytui/tests/diagnostic_bundle.rs` redacted 직렬화 검증, raw Director response 필드 부재는 위 자동 검증에서 확정)
+- [x] 로그 파일이 설정된 최대 크기를 넘지 않음 (2026-11-09 증거 대체: `apps/storytui/src/main.rs` `bounded_log_writer_never_exceeds_cap` 단위 테스트 — rollover truncate 동작 포함)
 
 ## Phase 2: Pack 호환성과 불변식
 

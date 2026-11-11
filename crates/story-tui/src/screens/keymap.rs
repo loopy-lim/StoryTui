@@ -127,13 +127,10 @@ pub const KEYMAP: &[KeymapRow] = &[
         group: KeymapGroup::Game,
     },
     KeymapRow {
-        key: "s",
-        action_ko: "저장",
-        group: KeymapGroup::Game,
-    },
-    KeymapRow {
-        key: "l",
-        action_ko: "불러오기",
+        // One row for the save/load dialog pair — same screen, adjacent
+        // semantics; keeps a headroom line inside the `?` overlay budget.
+        key: "s / l",
+        action_ko: "저장 · 불러오기",
         group: KeymapGroup::Game,
     },
     KeymapRow {
@@ -190,6 +187,11 @@ pub const KEYMAP: &[KeymapRow] = &[
     KeymapRow {
         key: "g",
         action_ko: "생성 방식 전환",
+        group: KeymapGroup::Settings,
+    },
+    KeymapRow {
+        key: "s",
+        action_ko: "스트리밍 렌더 켜기/끄기",
         group: KeymapGroup::Settings,
     },
     KeymapRow {
@@ -284,8 +286,10 @@ pub fn keymap_lines_two_columns() -> (Vec<Line<'static>>, Vec<Line<'static>>) {
     let settings: Vec<&KeymapRow> = group_rows(KeymapGroup::Settings).collect();
 
     // Everything after the game tail in the right column: blank + settings
-    // header + settings rows + blank + alias note.
-    let right_fixed = 4 + settings.len();
+    // header + settings rows + alias note (the note directly follows the
+    // settings block — muted styling separates it, saving the blank line
+    // the 20-row budget needs back since the Settings `s` row landed).
+    let right_fixed = 3 + settings.len();
     // The split must keep right ≤ budget, then go as even as possible.
     let min_split = game
         .len()
@@ -308,7 +312,6 @@ pub fn keymap_lines_two_columns() -> (Vec<Line<'static>>, Vec<Line<'static>>) {
     right.push(Line::from(""));
     right.push(group_header(SETTINGS_HEADER));
     right.extend(settings.iter().map(|row| keymap_line(row)));
-    right.push(Line::from(""));
     right.push(Line::from(Span::styled(
         ALIAS_NOTE.to_string(),
         Styles::muted(),
@@ -326,9 +329,16 @@ mod tests {
     fn keymap_documents_every_story_shortcut() {
         let keys: Vec<_> = KEYMAP.iter().map(|row| row.key).collect();
         // Rows added after the first audit: these were bound in app.rs/event.rs
-        // but missing from the table.
-        for expected in ["I", "b", "R", "u", "h", "m", "s", "l", "n", "?"] {
+        // but missing from the table. `s`/`l` share the "s / l" save-load row,
+        // so membership is a substring check for the pair keys.
+        for expected in ["I", "b", "R", "u", "h", "m", "n", "?"] {
             assert!(keys.contains(&expected), "keymap is missing {expected}");
+        }
+        for expected in ["s", "l"] {
+            assert!(
+                keys.iter().any(|key| key.contains(expected)),
+                "keymap is missing {expected}"
+            );
         }
     }
 

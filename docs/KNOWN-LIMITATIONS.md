@@ -91,8 +91,18 @@ parser, never from the streamed display. Remaining limitations:
 - `request_timeout_ms` is a reqwest client timeout that bounds the whole
   stream (code default 180 s, shipped profile 600 s) — same condition as the
   Writer path.
-- The settings UI does not yet expose `stream_turns` (edit the TOML), nor
-  `EngineState::use_director_writer`.
+- The settings UI exposes both generation knobs: `g` cycles the path
+  (single-pass vs two-stage) and `s` toggles the single-pass streaming
+  render (footer hint `[S]`), each persisted in `user-settings.toml`
+  (`None` inherits the profile's `[provider] stream_turns`; the preference
+  survives provider switches like the sampling taste). While the two-stage
+  path is active the `s` row shows the stored preference as
+  "2단계 중 (켜짐/꺼짐)" — the two-stage Writer always streams, but the
+  note keeps a press there visible instead of a silent flip. A `켜짐`
+  preference on a provider whose capabilities do not advertise SSE renders
+  as "켜짐 · SSE 미지원" — the effective turn stays non-streaming (the
+  `OpenAiCompatibleProvider` stack advertises SSE, so this state is
+  reachable only with a future non-SSE provider).
 
 ## Expression sprites are keyword-classified, not model-judged
 

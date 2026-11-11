@@ -119,6 +119,13 @@ struct SettingsState {
     image_backend_manual: bool,
     /// Two-stage Director → Writer generation path (streaming narration).
     use_director_writer: bool,
+    /// Single-pass SSE streaming-render preference (Settings `s` toggle).
+    /// The host's `config.provider.stream_turns` stays authoritative; this
+    /// mirror is what the Settings screen renders.
+    stream_turns: bool,
+    /// Whether the active provider advertises SSE streaming (the row notes
+    /// a `켜짐` preference that cannot take effect).
+    stream_supported: bool,
     /// Whether expression sprites are currently shown.
     expressions_enabled: bool,
     /// Response-style preset label (`자동` when the profile's own tuning is
@@ -365,6 +372,9 @@ pub struct App {
     image_backend_cycle_requested: bool,
     /// Set when the player toggled the generation path in Settings (`g`).
     generation_toggle_requested: bool,
+    /// Set when the player toggled single-pass streaming render in Settings
+    /// (`s`).
+    stream_toggle_requested: bool,
     /// Player toggle for expression sprites from the Settings screen (`f`).
     expressions_enabled: bool,
     /// Set when the player toggled expressions in Settings (`f`).
@@ -557,6 +567,7 @@ impl App {
             images_toggle_requested: false,
             image_backend_cycle_requested: false,
             generation_toggle_requested: false,
+            stream_toggle_requested: false,
             expressions_enabled: true,
             expressions_toggle_requested: false,
             location_images: HashMap::new(),
@@ -1422,6 +1433,8 @@ impl App {
         images_enabled: bool,
         image_backend: Option<String>,
         use_director_writer: bool,
+        stream_turns: bool,
+        stream_supported: bool,
         expressions_enabled: bool,
         sampling_style: String,
         persona_label: String,
@@ -1440,6 +1453,8 @@ impl App {
             image_backend,
             image_backend_manual: self.image_backend_manual,
             use_director_writer,
+            stream_turns,
+            stream_supported,
             expressions_enabled,
             sampling_style,
             persona_label,
@@ -1495,6 +1510,12 @@ impl App {
     /// Consume a generation-path toggle request from the Settings screen.
     pub fn take_generation_toggle_request(&mut self) -> bool {
         std::mem::take(&mut self.generation_toggle_requested)
+    }
+
+    /// Consume a single-pass streaming-render toggle request from the
+    /// Settings screen.
+    pub fn take_stream_toggle_request(&mut self) -> bool {
+        std::mem::take(&mut self.stream_toggle_requested)
     }
 
     /// Store one location's resolved image. Decoding is host-owned; encoding
@@ -1823,6 +1844,23 @@ impl App {
         self.settings
             .as_ref()
             .is_some_and(|settings| settings.use_director_writer)
+    }
+
+    /// Patch only the single-pass streaming-render section of the Settings
+    /// state (the `s` toggle).
+    pub fn update_settings_stream(&mut self, stream_turns: bool) {
+        if let Some(settings) = self.settings.as_mut() {
+            settings.stream_turns = stream_turns;
+        }
+    }
+
+    /// Single-pass streaming value currently shown on the Settings screen.
+    /// Same mirror contract as [`App::use_director_writer`]: the host's
+    /// `config.provider.stream_turns` stays the authoritative session value.
+    pub fn stream_turns(&self) -> bool {
+        self.settings
+            .as_ref()
+            .is_some_and(|settings| settings.stream_turns)
     }
 
     pub fn set_can_continue(&mut self, can_continue: bool) {
@@ -2342,6 +2380,13 @@ impl App {
                 // Same physical key under Korean 2-beolsik: g=ㅎ.
                 KeyCode::Char('g' | 'ㅎ') => {
                     self.generation_toggle_requested = true;
+                }
+                // Same physical key under Korean 2-beolsik: s=ㄴ. Only
+                // meaningful on the single-pass path (the two-stage Writer
+                // always streams); the Settings row says so when `g` picked
+                // the two-stage path.
+                KeyCode::Char('s' | 'ㄴ') => {
+                    self.stream_toggle_requested = true;
                 }
                 // Same physical key under Korean 2-beolsik: f=ㄹ.
                 KeyCode::Char('f' | 'ㄹ') => {
@@ -2901,6 +2946,8 @@ impl App {
                     image_backend: settings.image_backend.clone(),
                     image_backend_manual: settings.image_backend_manual,
                     use_director_writer: settings.use_director_writer,
+                    stream_turns: settings.stream_turns,
+                    stream_supported: settings.stream_supported,
                     expressions_enabled: settings.expressions_enabled,
                     sampling_style: &settings.sampling_style,
                     persona_label: &settings.persona_label,
@@ -4269,6 +4316,8 @@ mod tests {
             true,
             app.image_backend_label(),
             false,
+            false,
+            true,
             true,
             "자동".to_string(),
             "없음".to_string(),
@@ -4332,6 +4381,8 @@ mod tests {
             true,
             app.image_backend_label(),
             false,
+            false,
+            true,
             true,
             "자동".to_string(),
             "없음".to_string(),
@@ -5692,6 +5743,8 @@ mod tests {
             Some("halfblocks".to_string()),
             false,
             false,
+            false,
+            true,
             "자동".to_string(),
             "없음".to_string(),
             String::new(),
@@ -5774,6 +5827,8 @@ mod tests {
             Some("halfblocks".to_string()),
             false,
             false,
+            false,
+            true,
             "자동".to_string(),
             "없음".to_string(),
             String::new(),
@@ -5849,12 +5904,7 @@ mod tests {
         let second = history_entry(2, None);
         let second_id = second.id;
         // Host reports a checkpoint for turn 1 → turn 2 is deletable.
-        app.set_lists_with_checkpoints(
-            &[first, second],
-            &[],
-            &default_location(),
-            &[1],
-        );
+        app.set_lists_with_checkpoints(&[first, second], &[], &default_location(), &[1]);
 
         app.handle_key(key(KeyCode::Char('h')), None);
         app.handle_key(key(KeyCode::Char('d')), None);
@@ -5908,7 +5958,10 @@ mod tests {
         app.history_edit.as_mut().unwrap().buffer.clear();
         let submit = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
         assert_eq!(app.handle_key(submit, None), None);
-        assert!(app.history_edit.is_some(), "empty submit must keep the dialog");
+        assert!(
+            app.history_edit.is_some(),
+            "empty submit must keep the dialog"
+        );
         assert_eq!(
             app.story_notice(),
             Some("내레이션이 비어 있어 적용하지 않았습니다")
@@ -6131,6 +6184,8 @@ mod tests {
             Some("halfblocks".to_string()),
             false,
             false,
+            false,
+            true,
             "자동".to_string(),
             "없음".to_string(),
             String::new(),
@@ -6151,6 +6206,67 @@ mod tests {
         // The host flips the session value, then patches the display.
         app.update_settings_generation(true);
         assert!(app.use_director_writer());
+    }
+
+    #[test]
+    fn settings_s_key_requests_the_stream_toggle_once() {
+        let mut app = App::new(sample_view(0));
+        app.set_settings(
+            ProviderConfigSafe {
+                base_url: "http://127.0.0.1:8000".to_string(),
+                model: "a".to_string(),
+                director_model: None,
+                choice_model: None,
+                writer_model: None,
+                structured_output: "auto".to_string(),
+                request_timeout_ms: 1_000,
+                connect_timeout_ms: 1_000,
+                max_retries: 0,
+                is_loopback: true,
+            },
+            ProviderHealth::Ready,
+            0.7,
+            0.9,
+            40,
+            1_200,
+            TtsDisplay {
+                enabled: false,
+                backend: "say".to_string(),
+                voice: None,
+            },
+            true,
+            Some("halfblocks".to_string()),
+            false,
+            false,
+            false,
+            true,
+            "자동".to_string(),
+            "없음".to_string(),
+            String::new(),
+            String::new(),
+        );
+        assert!(!app.stream_turns(), "mirrors the seeded value");
+
+        // Open Settings (`o`), then `s` (2-beolsik ㄴ) requests the toggle;
+        // the Korean variant hits the same branch. The story screen's `s`
+        // (save dialog) is a different screen scope and stays unaffected —
+        // pressing it here must not open the save/load dialog either.
+        app.handle_key(key(KeyCode::Char('o')), None);
+        app.handle_key(key(KeyCode::Char('s')), None);
+        assert!(app.take_stream_toggle_request());
+        assert!(!app.take_stream_toggle_request(), "request is consumed");
+        assert!(
+            app.take_save_load_request().is_none(),
+            "settings `s` must not leak into the story save dialog"
+        );
+
+        app.handle_key(key(KeyCode::Char('ㄴ')), None);
+        assert!(app.take_stream_toggle_request());
+        assert!(app.take_save_load_request().is_none());
+
+        // The host flips the session value, then patches the display.
+        app.update_settings_stream(true);
+        assert!(app.stream_turns());
     }
 
     #[test]

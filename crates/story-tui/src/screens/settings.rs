@@ -84,6 +84,15 @@ pub struct SettingsView<'a> {
     /// `true` = the two-stage Director → Writer path (streaming narration);
     /// `false` = the single-pass structured turn.
     pub use_director_writer: bool,
+    /// Single-pass SSE streaming render (Settings `s` toggle). Shown dimmed
+    /// with a "2단계 중" note while `use_director_writer` is on, because the
+    /// two-stage Writer always streams; the note carries the stored
+    /// preference so flipping `s` there is never invisible.
+    pub stream_turns: bool,
+    /// Whether the active provider advertises SSE streaming. A `켜짐`
+    /// preference on a provider without it renders as
+    /// "켜짐 · SSE 미지원" — the effective generation stays non-streaming.
+    pub stream_supported: bool,
     /// Whether expression sprites are currently shown.
     pub expressions_enabled: bool,
     /// Response-style preset label (`자동` when the profile's own tuning is
@@ -106,12 +115,15 @@ pub fn render_settings(frame: &mut Frame, area: Rect, view: &SettingsView<'_>) {
         return;
     }
 
-    // Layout: title (2) | provider (6) | health + sampling side-by-side (9) |
-    // keymap (auto) | footer (2). The health block grew by the `표정 (f)` row.
+    // Layout: title (2) | provider (7) | health + sampling side-by-side
+    // (10) | keymap (auto) | footer (2). The health block grew by the
+    // `표정 (f)` and `스트림 (s)` rows (8 content lines + borders); at the
+    // 24-row floor the keymap teaser gives up one row — the full keymap
+    // stays in the `?` overlay, and taller terminals grow `Min(3)` back.
     let chunks = Layout::vertical([
         Constraint::Length(2),
         Constraint::Length(7),
-        Constraint::Length(9),
+        Constraint::Length(10),
         Constraint::Min(3),
         Constraint::Length(2),
     ])
@@ -299,6 +311,42 @@ fn render_health_and_sampling(frame: &mut Frame, area: Rect, view: &SettingsView
             ),
         ]),
         Line::from(vec![
+            Span::styled("스트림 (s) : ", Styles::subtle()),
+            Span::styled(
+                if view.use_director_writer {
+                    // The Writer always streams on this path; the note still
+                    // shows the stored single-pass preference so a `s` press
+                    // here is visible, not a silent flip.
+                    if view.stream_turns {
+                        "2단계 중 (켜짐)"
+                    } else {
+                        "2단계 중 (꺼짐)"
+                    }
+                } else if view.stream_turns {
+                    if view.stream_supported {
+                        "켜짐"
+                    } else {
+                        "켜짐 · SSE 미지원"
+                    }
+                } else {
+                    "꺼짐"
+                },
+                Style::default()
+                    .fg(if view.use_director_writer || !view.stream_turns {
+                        // Two-stage note and plain off both read as quiet.
+                        Palette::MUTED
+                    } else if view.stream_supported {
+                        Palette::SAFE
+                    } else {
+                        // On, but the provider cannot stream: the preference
+                        // stands while the effective turn stays
+                        // non-streaming — worth a caution, not a success.
+                        Palette::CAUTION
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
             Span::styled("표정 (f)   : ", Styles::subtle()),
             Span::styled(
                 if view.expressions_enabled {
@@ -393,21 +441,29 @@ fn render_keymap_block(frame: &mut Frame, area: Rect) {
 
 fn render_footer(frame: &mut Frame, area: Rect, returns_home: bool) {
     let esc_hint = if returns_home {
-        "시작 메뉴"
+        // Compound spelling (시작메뉴, 8 cols) keeps this variant at the
+        // same width as 게임으로 — the spaced form would clip [Q] 종료's
+        // last column on an 80-col terminal.
+        "시작메뉴"
     } else {
         "게임으로"
     };
+    // Single-space separators: with the [S] 스트림 entry the row is exactly
+    // 80 cols — double spaces would clip the trailing [Q] 종료 on an
+    // 80-col terminal (the snapshot test pins this).
     let para = Paragraph::new(Line::from(vec![
         Span::styled("[P]", Styles::keycap()),
-        Span::styled(" 모델  ", Styles::button_label()),
+        Span::styled(" 모델 ", Styles::button_label()),
         Span::styled("[E]", Styles::keycap()),
-        Span::styled(" 프로바이더  ", Styles::button_label()),
+        Span::styled(" 프로바이더 ", Styles::button_label()),
         Span::styled("[G]", Styles::keycap()),
-        Span::styled(" 생성방식  ", Styles::button_label()),
+        Span::styled(" 생성방식 ", Styles::button_label()),
+        Span::styled("[S]", Styles::keycap()),
+        Span::styled(" 스트림 ", Styles::button_label()),
         Span::styled("[F]", Styles::keycap()),
-        Span::styled(" 표정  ", Styles::button_label()),
+        Span::styled(" 표정 ", Styles::button_label()),
         Span::styled("[Esc]", Styles::keycap()),
-        Span::styled(format!(" {esc_hint}  "), Styles::button_label()),
+        Span::styled(format!(" {esc_hint} "), Styles::button_label()),
         Span::styled("[Q]", Styles::keycap()),
         Span::styled(" 종료", Styles::button_label()),
     ]))
@@ -748,6 +804,8 @@ mod tests {
             image_backend: Some("kitty".to_string()),
             image_backend_manual: false,
             use_director_writer: false,
+            stream_turns: true,
+            stream_supported: true,
             expressions_enabled: true,
             sampling_style: "자동",
             persona_label: "없음",
@@ -766,6 +824,8 @@ mod tests {
             v.tts_backend,
             v.tts_voice,
             v.use_director_writer,
+            v.stream_turns,
+            v.stream_supported,
             v.theme_name,
             v.returns_home,
         );
