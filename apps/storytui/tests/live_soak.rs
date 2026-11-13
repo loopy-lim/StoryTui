@@ -446,7 +446,7 @@ async fn live_hundred_turn_soak_rainy_reunion() {
             s.app.view.error
         );
 
-        if s.app.view.status.turn % 10 == 0 || s.app.view.status.turn >= target_turn {
+        if s.app.view.status.turn.is_multiple_of(10) || s.app.view.status.turn >= target_turn {
             eprintln!(
                 "[t100] progress turn={} step={} elapsed={:.1}s choices={}",
                 s.app.view.status.turn,
