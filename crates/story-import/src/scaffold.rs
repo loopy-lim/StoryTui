@@ -13,6 +13,7 @@ use story_model::{
 };
 
 use crate::card::ParsedCard;
+use crate::enrich::{self, CharacterEnrichment};
 use crate::macros;
 use crate::report::{ImportReport, MAX_DESCRIPTION_TOKENS, estimate_tokens, non_ascii_ratio};
 use crate::worldinfo::NormalizedBook;
@@ -116,6 +117,17 @@ pub fn emit_pack(
     // --- merge books ----------------------------------------------------------
     let lorebook = merge_books(card.book.as_ref(), sidecar_book, report);
 
+    // --- deterministic lead-ladder enrichment ---------------------------------
+    let lore_texts = lore_contents_for_enrich(&lorebook);
+    let enrichment = enrich::enrich_from_card(
+        &card.name,
+        &description,
+        &personality_prose,
+        &scenario,
+        &card.mes_example,
+        &lore_texts,
+    );
+
     // --- emit files -------------------------------------------------------------
     write_story_toml(out_dir, &slug, &card.name, options)?;
     write_characters_toml(
@@ -124,12 +136,13 @@ pub fn emit_pack(
         &card.name,
         &description_md,
         &dialogue_examples,
+        &enrichment,
     )?;
     write_rules_toml(out_dir, &character_id)?;
     write_events_toml(out_dir)?;
     write_markdown(
         &out_dir.join("world.md"),
-        &world_md(&scenario, &card.name),
+        &world_md(&scenario, &card.name, &enrichment),
         "world.md",
     )?;
     write_markdown(
@@ -244,6 +257,21 @@ pub fn emit_pack(
             lorebook.entries.len()
         ));
     }
+    report.mapped.push(format!(
+        "enrich secrets {}개 → characters.toml",
+        enrichment.secrets.len()
+    ));
+    report.mapped.push(format!(
+        "enrich current_goal → {}",
+        truncate_for_report(&enrichment.current_goal, 60)
+    ));
+    report.mapped.push(format!(
+        "enrich avoid_phrases {}개 → characters.toml",
+        enrichment.avoid_phrases.len()
+    ));
+    report
+        .mapped
+        .push("second-location (다른 장소) ↔ default-location → rules.toml".to_string());
 
     // --- self-check: the emit must satisfy the real loader --------------------
     story_persistence::PackLoader::load(out_dir).map_err(|error| {
@@ -430,6 +458,12 @@ struct CharacterRow<'a> {
     speech_style: String,
     honorific_rule: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    secrets: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    frequent_phrases: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    avoid_phrases: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     known_facts: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     unknown_facts: Vec<String>,
@@ -443,6 +477,7 @@ fn write_characters_toml(
     name: &str,
     description_md: &str,
     dialogue_examples: &Vec<String>,
+    enrichment: &CharacterEnrichment,
 ) -> Result<(), String> {
     let doc = CharactersDoc {
         schema_version: "1.0.0",
@@ -453,14 +488,17 @@ fn write_characters_toml(
             description_md,
             initial_player_relationship: "acquaintance",
             dialogue_examples,
-            personality: Vec::new(),
+            personality: enrichment.personality_hints.clone(),
             appearance: Vec::new(),
             speech_style: String::new(),
             honorific_rule: String::new(),
-            known_facts: Vec::new(),
+            secrets: enrichment.secrets.clone(),
+            frequent_phrases: enrichment.frequent_phrases.clone(),
+            avoid_phrases: enrichment.avoid_phrases.clone(),
+            known_facts: enrichment.known_facts.clone(),
             unknown_facts: Vec::new(),
-            current_goal: String::new(),
-            long_term_desire: String::new(),
+            current_goal: enrichment.current_goal.clone(),
+            long_term_desire: enrichment.long_term_desire.clone(),
         }],
     };
     let toml_text = toml::to_string_pretty(&doc)
@@ -518,11 +556,18 @@ fn write_rules_toml(out_dir: &Path, character_id: &str) -> Result<(), String> {
             normal_delta_min: -3,
             normal_delta_max: 3,
         },
-        locations: vec![LocationRow {
-            id: "default-location",
-            name: "이야기의 무대".to_string(),
-            connects_to: Vec::new(),
-        }],
+        locations: vec![
+            LocationRow {
+                id: "default-location",
+                name: "이야기의 무대".to_string(),
+                connects_to: vec!["second-location".to_string()],
+            },
+            LocationRow {
+                id: "second-location",
+                name: "다른 장소".to_string(),
+                connects_to: vec!["default-location".to_string()],
+            },
+        ],
         numbers: vec![
             NumberRow {
                 id: format!("{character_id}.affection"),
@@ -556,7 +601,33 @@ fn write_markdown(path: &Path, content: &str, label: &str) -> Result<(), String>
     std::fs::write(path, content).map_err(|e| format!("{label}을 쓰지 못했습니다: {e}"))
 }
 
-fn world_md(scenario: &str, character_name: &str) -> String {
+fn lore_contents_for_enrich(lorebook: &story_model::Lorebook) -> Vec<String> {
+    lorebook
+        .entries
+        .iter()
+        .map(|entry| {
+            let keys = entry.keys.join("/");
+            if keys.is_empty() {
+                entry.content.clone()
+            } else {
+                format!("{keys} — {}", entry.content)
+            }
+        })
+        .collect()
+}
+
+fn truncate_for_report(text: &str, max: usize) -> String {
+    let count = text.chars().count();
+    if count <= max {
+        text.to_string()
+    } else {
+        let mut s: String = text.chars().take(max.saturating_sub(1)).collect();
+        s.push('…');
+        s
+    }
+}
+
+fn world_md(scenario: &str, character_name: &str, enrichment: &CharacterEnrichment) -> String {
     let mut out = String::from("# 세계관\n\n");
     if scenario.trim().is_empty() {
         out.push_str(
@@ -572,6 +643,27 @@ fn world_md(scenario: &str, character_name: &str) -> String {
     ));
     out.push_str(
         "\n## 고정 사실\n\n- 세계의 물리·사회 규칙은 카드가 암시하는 범위 안에서 현실적으로 유지된다.\n",
+    );
+    out.push_str("\n## 엔진 전진 힌트\n\n");
+    out.push_str("임포트 시 결정적으로 채운 리드 사다리 요약입니다. 실제 엔진 훅은 `characters.toml`의 `secrets`·`current_goal`과 `rules.toml`의 두 장소입니다.\n\n");
+    out.push_str(&format!("- **현재 목표:** {}\n", enrichment.current_goal));
+    out.push_str(&format!(
+        "- **장기 욕구:** {}\n",
+        enrichment.long_term_desire
+    ));
+    if enrichment.secrets.is_empty() {
+        out.push_str("- **비밀:** (카드에서 비밀 단서를 찾지 못함 — 수동으로 secrets를 보강하세요)\n");
+    } else {
+        out.push_str("- **비밀 후보:**\n");
+        for secret in &enrichment.secrets {
+            out.push_str(&format!("  - {secret}\n"));
+        }
+    }
+    out.push_str(
+        "- **장소:** `default-location`(이야기의 무대) ↔ `second-location`(다른 장소) — PlaceTimeChange 리드용\n",
+    );
+    out.push_str(
+        "- **진행 압력 제안:** 숨긴 정보 한 조각 공개 → 관계 거리 한 칸 이동 → 다른 장소로 장면 전환\n",
     );
     out
 }

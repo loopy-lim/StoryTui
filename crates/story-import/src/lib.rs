@@ -15,6 +15,7 @@
 pub mod card;
 pub mod charx;
 pub mod chat;
+pub mod enrich;
 pub mod macros;
 pub mod normalize;
 pub mod report;
@@ -26,6 +27,7 @@ use std::path::{Path, PathBuf};
 use report::ImportReport;
 use worldinfo::NormalizedBook;
 
+pub use enrich::{CharacterEnrichment, enrich_from_card};
 pub use scaffold::{ImportOptions, slugify};
 
 /// The result of a successful import.
@@ -34,6 +36,13 @@ pub struct ImportOutput {
     pub pack_dir: PathBuf,
     /// Full import report (also written to `import-report.md`).
     pub report: ImportReport,
+}
+
+/// Aggregate result for [`import_inbox`]: partial success is allowed.
+#[derive(Default)]
+pub struct InboxImportResult {
+    pub ok: Vec<ImportOutput>,
+    pub errors: Vec<(PathBuf, String)>,
 }
 
 /// Import a card file into a pack directory.
@@ -75,4 +84,59 @@ pub fn import_card(
     scaffold::emit_pack(&parsed, sidecar_book, &pack_dir, options, &mut report)?;
     report.write(&pack_dir.join("import-report.md"))?;
     Ok(ImportOutput { pack_dir, report })
+}
+
+/// Import every supported card in `dir` (non-recursive): `*.png`, `*.json`,
+/// `*.charx`. Each file gets `stories/<slug>` (or fails individually). Existing
+/// packs are skipped unless [`ImportOptions::force`] is set.
+pub fn import_inbox(dir: &Path, options: &ImportOptions) -> Result<InboxImportResult, String> {
+    if !dir.is_dir() {
+        return Err(format!(
+            "인박스 디렉터리가 아닙니다: {}",
+            dir.display()
+        ));
+    }
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map_err(|e| format!("인박스를 읽지 못했습니다 ({}): {e}", dir.display()))?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| {
+                        let ext = ext.to_ascii_lowercase();
+                        matches!(ext.as_str(), "png" | "json" | "charx")
+                    })
+                    .unwrap_or(false)
+        })
+        .collect();
+    entries.sort();
+    if entries.is_empty() {
+        return Err(format!(
+            "인박스에 카드 파일이 없습니다 (*.png / *.json / *.charx): {}",
+            dir.display()
+        ));
+    }
+
+    let mut result = InboxImportResult::default();
+    for card_path in entries {
+        match import_card(&card_path, None, options) {
+            Ok(output) => result.ok.push(output),
+            Err(error) => result.errors.push((card_path, error)),
+        }
+    }
+    Ok(result)
+}
+
+/// Korean summary line when some inbox imports failed (partial success OK).
+pub fn inbox_error_summary(errors: &[(PathBuf, String)]) -> String {
+    if errors.is_empty() {
+        return String::new();
+    }
+    let mut lines = vec![format!("실패한 카드 {}개:", errors.len())];
+    for (path, error) in errors {
+        lines.push(format!("  - {}: {error}", path.display()));
+    }
+    lines.join("\n")
 }

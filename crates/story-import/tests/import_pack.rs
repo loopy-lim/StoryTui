@@ -149,6 +149,21 @@ fn v2_png_imports_into_a_loadable_pack() {
     assert!(characters.contains("한유나는 관찰력이 좋고 플레이어를 오래 기다렸다."));
     assert!(characters.contains("# 성격"));
     assert!(characters.contains("dialogue_examples"));
+    assert!(
+        characters.contains("current_goal"),
+        "enrichment must fill current_goal: {characters}"
+    );
+    assert!(
+        !characters.contains("current_goal = \"\""),
+        "current_goal must be non-empty: {characters}"
+    );
+
+    let rules = std::fs::read_to_string(out_dir.join("rules.toml")).expect("rules");
+    assert!(rules.contains("second-location"), "{rules}");
+    assert!(rules.contains("다른 장소"), "{rules}");
+
+    let world = std::fs::read_to_string(out_dir.join("world.md")).expect("world");
+    assert!(world.contains("엔진 전진 힌트"), "{world}");
 
     // Opening resolved {{user}}.
     let opening = std::fs::read_to_string(out_dir.join("opening.md")).expect("opening");

@@ -18,7 +18,7 @@ use crate::report::ImportReport;
 /// bounded items, so a chatty local model cannot bloat the pack.
 pub const NORMALIZE_SCHEMA: &str = r#"{
   "type": "object",
-  "required": ["personality", "likes", "dislikes", "speech_style", "honorific_rule", "current_goal", "long_term_desire", "known_facts", "unknown_facts"],
+  "required": ["personality", "likes", "dislikes", "speech_style", "honorific_rule", "current_goal", "long_term_desire", "known_facts", "unknown_facts", "secrets"],
   "additionalProperties": false,
   "properties": {
     "personality": { "type": "array", "items": { "type": "string" }, "minItems": 2, "maxItems": 6 },
@@ -29,7 +29,8 @@ pub const NORMALIZE_SCHEMA: &str = r#"{
     "current_goal": { "type": "string" },
     "long_term_desire": { "type": "string" },
     "known_facts": { "type": "array", "items": { "type": "string" }, "maxItems": 8 },
-    "unknown_facts": { "type": "array", "items": { "type": "string" }, "maxItems": 8 }
+    "unknown_facts": { "type": "array", "items": { "type": "string" }, "maxItems": 8 },
+    "secrets": { "type": "array", "items": { "type": "string" }, "maxItems": 4 }
   }
 }"#;
 
@@ -111,6 +112,7 @@ fn normalize_prompts(character: &story_persistence::pack::dto::CharacterToml) ->
 - honorific_rule은 존댓말/반말·호칭 전환 조건을 한 문장으로 쓴다. 설명에 없으면 빈 문자열.\n\
 - known_facts는 이 캐릭터가 알고 있는 사실, unknown_facts는 모르는 사실이다. 각각 독립된 짧은 단문으로 쓴다 — \
 엔진이 문자열 정확 매칭으로 사용하므로 한 문장에 두 사실을 섞지 않는다.\n\
+- secrets는 플레이어에게 숨기는 비밀을 최대 4개까지, 설명에 근거한 짧은 단문으로 쓴다. 근거가 없으면 빈 배열.\n\
 - 지정된 JSON 객체 외의 텍스트(설명, 코드펜스)를 출력하지 않는다.";
     let mut user = format!(
         "캐릭터 이름: {}\n\n설명:\n{}",
@@ -140,6 +142,7 @@ struct NormalizedCharacter {
     long_term_desire: String,
     known_facts: Vec<String>,
     unknown_facts: Vec<String>,
+    secrets: Vec<String>,
 }
 
 /// Fill the structured fields. Empty responses never overwrite the scaffold.
@@ -183,9 +186,15 @@ fn apply(
     if !normalized.unknown_facts.is_empty() {
         character.unknown_facts = normalized.unknown_facts.clone();
     }
+    if !normalized.secrets.is_empty() {
+        character.secrets = normalized.secrets.clone();
+    }
 
     record("personality", character.personality.len());
     record("known_facts", character.known_facts.len());
+    if !character.secrets.is_empty() {
+        record("secrets", character.secrets.len());
+    }
     summary.applied = true;
     summary
 }
@@ -245,6 +254,7 @@ mod tests {
         let normalized = NormalizedCharacter {
             personality: vec!["차분함".to_string(), "관찰력".to_string()],
             known_facts: vec!["플레이어가 서울에 산다".to_string()],
+            secrets: vec!["보내지 못한 편지를 숨긴다".to_string()],
             speech_style: "짧은 문장.".to_string(),
             ..Default::default()
         };
@@ -253,6 +263,7 @@ mod tests {
         assert!(summary.applied);
         assert_eq!(character.personality.len(), 2);
         assert_eq!(character.known_facts.len(), 1);
+        assert_eq!(character.secrets.len(), 1);
         assert_eq!(character.speech_style, "짧은 문장.");
         assert_eq!(character.description_md.as_deref(), Some("원문 설명"));
         assert!(
@@ -260,6 +271,11 @@ mod tests {
                 .filled
                 .iter()
                 .any(|line| line.contains("personality 2개")),
+            "{:?}",
+            summary.filled
+        );
+        assert!(
+            summary.filled.iter().any(|line| line.contains("secrets 1개")),
             "{:?}",
             summary.filled
         );

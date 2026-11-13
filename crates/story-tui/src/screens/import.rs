@@ -43,7 +43,11 @@ pub fn render_import_dialog(frame: &mut Frame, area: Rect, view: ImportDialogVie
                     Styles::item_normal(),
                 )),
                 Line::from(Span::styled(
-                    "지원 형식: PNG/JSON/CHARX · 옵션은 CLI: storytui import --help",
+                    "ST PNG v2/v3 · Risu .charx · CAI JSON",
+                    Styles::muted(),
+                )),
+                Line::from(Span::styled(
+                    "CLI: storytui import --inbox <폴더>",
                     Styles::muted(),
                 )),
                 Line::from(""),
