@@ -1234,7 +1234,7 @@ fn repeated_narration_is_rewritten_before_commit_and_preserves_authoritative_fie
             .pending
             .as_ref()
             .and_then(|pending| pending.narration_repair.as_ref()),
-        Some(NarrationRepair::SinglePass { .. })
+        Some(NarrationRepair::SinglePass { attempt: 1, .. })
     ));
     let (repair_id, repair_request) = repairing
         .effects
@@ -1288,6 +1288,8 @@ fn repeated_narration_is_rewritten_before_commit_and_preserves_authoritative_fie
             .set_flags
             .contains_key("nonexistent_flag")
     );
+    assert_eq!(completed.state.quality_pressure, 0);
+    assert!(completed.state.last_narration_quality.is_none());
 }
 
 #[test]
@@ -1323,23 +1325,68 @@ fn second_repetitive_narration_is_not_committed_or_repaired_again() {
         },
         &pack,
     )
-    .expect("repair");
+    .expect("repair attempt 1");
+    assert!(matches!(
+        repairing
+            .state
+            .pending
+            .as_ref()
+            .and_then(|pending| pending.narration_repair.as_ref()),
+        Some(NarrationRepair::SinglePass { attempt: 1, .. })
+    ));
     let repair_id = repairing.state.pending.as_ref().unwrap().generation_id;
     let mut repeated_again = valid_draft(repair_id, 1);
     repeated_again.narration = repeated.to_string();
-    let failed = reduce(
+    let repairing_again = reduce(
         &repairing.state,
         EngineCommand::AcceptGeneration {
             draft: Box::new(repeated_again),
         },
         &pack,
     )
-    .expect("bounded repair failure");
+    .expect("repair attempt 2");
+    assert!(matches!(
+        repairing_again
+            .state
+            .pending
+            .as_ref()
+            .and_then(|pending| pending.narration_repair.as_ref()),
+        Some(NarrationRepair::SinglePass { attempt: 2, .. })
+    ));
+    let (second_repair_id, second_request) = repairing_again
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            EngineEffect::RequestGeneration {
+                generation_id,
+                request,
+            } => Some((*generation_id, request)),
+            _ => None,
+        })
+        .expect("second automatic repair request");
+    let second_prompt = &second_request.messages.last().unwrap().content;
+    assert!(
+        second_prompt.contains("강제 장면 전진"),
+        "attempt-2 repair must force a new beat: {second_prompt}"
+    );
+
+    let mut repeated_third = valid_draft(second_repair_id, 1);
+    repeated_third.narration = repeated.to_string();
+    let failed = reduce(
+        &repairing_again.state,
+        EngineCommand::AcceptGeneration {
+            draft: Box::new(repeated_third),
+        },
+        &pack,
+    )
+    .expect("bounded repair failure after attempt 2");
 
     assert_eq!(failed.state.game.turn, 1);
     assert_eq!(failed.state.game.history.len(), 1);
     assert!(failed.state.pending.is_none());
     assert!(failed.state.retry_pending.is_some());
+    assert_eq!(failed.state.quality_pressure, 1);
+    assert!(failed.state.last_narration_quality.is_some());
     assert!(failed.effects.iter().any(|effect| matches!(
         effect,
         EngineEffect::ShowRecoverableError(error)
@@ -1349,7 +1396,74 @@ fn second_repetitive_narration_is_not_committed_or_repaired_again() {
         !failed
             .effects
             .iter()
-            .any(|effect| matches!(effect, EngineEffect::RequestGeneration { .. }))
+            .any(|effect| matches!(effect, EngineEffect::RequestGeneration { .. })),
+        "no third automatic repair after attempt 2"
+    );
+}
+
+#[test]
+fn attempt_two_repair_prompt_includes_forced_beat_directive() {
+    let pack = sample_pack();
+    let repeated = include_str!("fixtures/repeated_narration_ko.txt");
+    let (opening_pending, opening_id) = start_and_pending_id(&pack);
+    let mut opening = valid_draft(opening_id, 1);
+    opening.narration = repeated.to_string();
+    let opened = reduce(
+        &opening_pending,
+        EngineCommand::AcceptGeneration {
+            draft: Box::new(opening),
+        },
+        &pack,
+    )
+    .expect("accept opening");
+    let submitted = reduce(
+        &opened.state,
+        EngineCommand::SubmitChoice {
+            choice_id: "choice-0".to_string(),
+        },
+        &pack,
+    )
+    .expect("submit");
+    let first_id = submitted.state.pending.as_ref().unwrap().generation_id;
+    let mut rejected = valid_draft(first_id, 1);
+    rejected.narration = repeated.to_string();
+    let attempt1 = reduce(
+        &submitted.state,
+        EngineCommand::AcceptGeneration {
+            draft: Box::new(rejected),
+        },
+        &pack,
+    )
+    .expect("attempt 1");
+    let repair_id = attempt1.state.pending.as_ref().unwrap().generation_id;
+    let mut still_bad = valid_draft(repair_id, 1);
+    still_bad.narration = repeated.to_string();
+    let attempt2 = reduce(
+        &attempt1.state,
+        EngineCommand::AcceptGeneration {
+            draft: Box::new(still_bad),
+        },
+        &pack,
+    )
+    .expect("attempt 2");
+    let prompt = attempt2
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            EngineEffect::RequestGeneration { request, .. } => request.messages.last(),
+            _ => None,
+        })
+        .expect("attempt-2 repair prompt");
+    assert!(
+        prompt.content.contains("강제 장면 전진")
+            || prompt.content.contains("Banned recurring motifs"),
+        "attempt-2 prompt must strengthen escape: {}",
+        prompt.content
+    );
+    assert!(
+        (prompt.content.contains("HighSimilarity") || prompt.content.contains("ExactDuplicate"))
+            || prompt.content.contains("Banned recurring motifs"),
+        "attempt-2 should cite hard issues or banned motifs"
     );
 }
 
@@ -1419,7 +1533,7 @@ fn empty_narration_gets_one_repair_then_the_quality_overlay() {
             .pending
             .as_ref()
             .and_then(|pending| pending.narration_repair.as_ref()),
-        Some(NarrationRepair::SinglePass { .. })
+        Some(NarrationRepair::SinglePass { attempt: 1, .. })
     ));
     let (repair_id, repair_request) = repairing
         .effects
@@ -1431,7 +1545,7 @@ fn empty_narration_gets_one_repair_then_the_quality_overlay() {
             } => Some((*generation_id, request)),
             _ => None,
         })
-        .expect("one repair request");
+        .expect("attempt-1 repair request");
     assert!(
         repair_request
             .messages
@@ -1442,14 +1556,41 @@ fn empty_narration_gets_one_repair_then_the_quality_overlay() {
         "the repair prompt must carry the Empty instruction"
     );
 
-    // The repair also comes back empty → bounded failure: checkpoint
-    // restored, retry offered, no second automatic repair.
+    // Attempt 1 also comes back empty → second automatic repair.
     let mut still_empty = valid_draft(repair_id, 1);
     still_empty.narration = String::new();
-    let failed = reduce(
+    let repairing_again = reduce(
         &repairing.state,
         EngineCommand::AcceptGeneration {
             draft: Box::new(still_empty),
+        },
+        &pack,
+    )
+    .expect("empty repair attempt 2");
+    assert!(matches!(
+        repairing_again
+            .state
+            .pending
+            .as_ref()
+            .and_then(|pending| pending.narration_repair.as_ref()),
+        Some(NarrationRepair::SinglePass { attempt: 2, .. })
+    ));
+    let second_repair_id = repairing_again
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            EngineEffect::RequestGeneration { generation_id, .. } => Some(*generation_id),
+            _ => None,
+        })
+        .expect("attempt-2 repair request");
+
+    // Attempt 2 still empty → overlay, no third automatic repair.
+    let mut empty_again = valid_draft(second_repair_id, 1);
+    empty_again.narration = String::new();
+    let failed = reduce(
+        &repairing_again.state,
+        EngineCommand::AcceptGeneration {
+            draft: Box::new(empty_again),
         },
         &pack,
     )
@@ -1459,6 +1600,7 @@ fn empty_narration_gets_one_repair_then_the_quality_overlay() {
     assert_eq!(failed.state.game.history.len(), 0);
     assert!(failed.state.pending.is_none());
     assert!(failed.state.retry_pending.is_some());
+    assert_eq!(failed.state.quality_pressure, 1);
     assert!(failed.effects.iter().any(|effect| matches!(
         effect,
         EngineEffect::ShowRecoverableError(error)
@@ -1469,7 +1611,7 @@ fn empty_narration_gets_one_repair_then_the_quality_overlay() {
             .effects
             .iter()
             .any(|effect| matches!(effect, EngineEffect::RequestGeneration { .. })),
-        "the repair is attempted exactly once"
+        "the repair is attempted at most twice"
     );
 }
 

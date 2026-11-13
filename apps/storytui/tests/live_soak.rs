@@ -51,6 +51,15 @@ fn live_config(url: &str, model: &str, save_dir: PathBuf, two_stage: bool) -> Ru
     provider.max_retries = 1;
     provider.structured_output = StructuredOutputMode::Auto;
     provider.stream_turns = true;
+    // Weak local models: OpenAI penalties + Kobold/llama.cpp DRY extras.
+    provider.frequency_penalty = 0.3;
+    provider.presence_penalty = 0.15;
+    provider.repetition_penalty = 1.05;
+    provider.dry_multiplier = 0.8;
+    provider.dry_base = 1.75;
+    provider.dry_allowed_length = 2;
+    provider.dry_penalty_range = 1024;
+    provider.local_extra_samplers = true;
 
     RuntimeConfig {
         provider: provider.clone(),
@@ -88,6 +97,10 @@ struct LiveSession {
     last_probe: Instant,
     save_dir: PathBuf,
     last_draft: Option<story_model::GeneratedTurnDraft>,
+    quality_recovers: u32,
+    quality_hard_fails: u32,
+    /// Turn numbers (pre-recover) where a quality recoverable fired.
+    quality_recover_at: Vec<u32>,
 }
 
 impl LiveSession {
@@ -127,7 +140,264 @@ impl LiveSession {
             last_probe: Instant::now(),
             save_dir,
             last_draft: None,
+            quality_recovers: 0,
+            quality_hard_fails: 0,
+            quality_recover_at: Vec::new(),
         }
+    }
+
+    /// Write a human-readable quality report of committed history for review.
+    fn write_quality_report(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::collections::BTreeMap;
+        use std::fmt::Write as _;
+        let history = &self.engine.game.history;
+        let mut body = String::new();
+        let chars: Vec<usize> = history
+            .iter()
+            .map(|e| e.narration.chars().count())
+            .collect();
+        let avg = if chars.is_empty() {
+            0.0
+        } else {
+            chars.iter().sum::<usize>() as f64 / chars.len() as f64
+        };
+        let min = chars.iter().copied().min().unwrap_or(0);
+        let max = chars.iter().copied().max().unwrap_or(0);
+
+        // Pairwise near-duplicate + soft-issue rates over consecutive commits.
+        let mut similar_pairs = 0usize;
+        let mut soft_pairs = 0usize;
+        for window in history.windows(2) {
+            let report = story_core::narration_quality::assess_narration(
+                &{
+                    let mut g = self.engine.game.clone();
+                    g.history = vec![window[0].clone()];
+                    g
+                },
+                &window[1].narration,
+                &window[1].applied_patch,
+                None,
+                true,
+            );
+            let hard = report.issues.iter().any(|i| {
+                matches!(
+                    i,
+                    story_core::narration_quality::NarrationQualityIssue::ExactDuplicate { .. }
+                        | story_core::narration_quality::NarrationQualityIssue::HighSimilarity { .. }
+                        | story_core::narration_quality::NarrationQualityIssue::RepeatedDialogue { .. }
+                )
+            });
+            let soft = report.issues.iter().any(|i| {
+                matches!(
+                    i,
+                    story_core::narration_quality::NarrationQualityIssue::ReusedMotifs { .. }
+                        | story_core::narration_quality::NarrationQualityIssue::StalledProgress
+                )
+            });
+            if hard {
+                similar_pairs += 1;
+            }
+            if soft {
+                soft_pairs += 1;
+            }
+        }
+
+        // Dialogue-line streak: identical fingerprints across consecutive turns.
+        let mut dialogue_streak_max = 0usize;
+        let mut dialogue_streak_runs = 0usize;
+        let mut dialogue_shared_pairs = 0usize;
+        {
+            let mut run = 1usize;
+            let mut prev: Option<std::collections::BTreeSet<String>> = None;
+            for entry in history {
+                let fps: std::collections::BTreeSet<String> =
+                    story_core::narration_quality::dialogue_fingerprints(&entry.narration)
+                        .into_iter()
+                        .collect();
+                if let Some(p) = &prev {
+                    let shared = fps.intersection(p).count();
+                    if shared > 0 {
+                        dialogue_shared_pairs += 1;
+                        run += 1;
+                    } else {
+                        if run >= 3 {
+                            dialogue_streak_runs += 1;
+                        }
+                        dialogue_streak_max = dialogue_streak_max.max(run);
+                        run = 1;
+                    }
+                }
+                prev = Some(fps);
+            }
+            if run >= 3 {
+                dialogue_streak_runs += 1;
+            }
+            dialogue_streak_max = dialogue_streak_max.max(run);
+        }
+        let pair_count = history.len().saturating_sub(1);
+        let similar_pct = if pair_count == 0 {
+            0.0
+        } else {
+            similar_pairs as f64 / pair_count as f64 * 100.0
+        };
+        let soft_pct = if pair_count == 0 {
+            0.0
+        } else {
+            soft_pairs as f64 / pair_count as f64 * 100.0
+        };
+
+        // Whole-run motif document frequency (not just the 4-turn window).
+        let mut motif_freq: BTreeMap<String, usize> = BTreeMap::new();
+        for entry in history {
+            for token in entry.narration.split(|c: char| !c.is_alphanumeric()) {
+                let t = token.trim();
+                if t.chars().count() >= 2 {
+                    *motif_freq.entry(t.to_string()).or_default() += 1;
+                }
+            }
+        }
+        let mut ranked: Vec<_> = motif_freq.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        ranked.retain(|(tok, n)| *n >= 8 && tok.chars().count() >= 2);
+        let top_motifs: Vec<String> = ranked
+            .into_iter()
+            .take(20)
+            .map(|(tok, n)| format!("{tok}×{n}"))
+            .collect();
+
+        // Location / time progression from patches.
+        let mut loc_moves = 0usize;
+        let mut time_moves = 0usize;
+        let mut patch_empty = 0usize;
+        for entry in history {
+            let p = &entry.applied_patch;
+            if p.next_location.is_some() {
+                loc_moves += 1;
+            }
+            if p.next_time_slot.is_some() {
+                time_moves += 1;
+            }
+            let empty = p.affection_delta.is_empty()
+                && p.trust_delta.is_empty()
+                && p.tension_delta.is_empty()
+                && p.relationship_transitions.is_empty()
+                && p.set_flags.is_empty()
+                && p.number_delta.is_empty()
+                && p.set_strings.is_empty()
+                && p.inventory_delta.is_empty()
+                && p.add_events.is_empty()
+                && p.next_location.is_none()
+                && p.next_time_slot.is_none()
+                && p.proposed_route.is_none();
+            if empty {
+                patch_empty += 1;
+            }
+        }
+
+        let recover_list = if self.quality_recover_at.is_empty() {
+            "none".to_string()
+        } else {
+            self.quality_recover_at
+                .iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+
+        writeln!(
+            &mut body,
+            "# Live soak quality report\n\n\
+             - pack turns committed: {}\n\
+             - narration chars: avg={avg:.0} min={min} max={max}\n\
+             - consecutive hard-similar pairs: {similar_pairs}/{pair_count} ({similar_pct:.1}%)\n\
+             - consecutive soft-issue pairs (motif/stall): {soft_pairs}/{pair_count} ({soft_pct:.1}%)\n\
+             - consecutive turns sharing ≥1 dialogue fingerprint: {dialogue_shared_pairs}/{pair_count}\n\
+             - max consecutive dialogue-share streak: {dialogue_streak_max} (runs≥3: {dialogue_streak_runs})\n\
+             - empty applied patches: {patch_empty}/{}\n\
+             - location moves via patch: {loc_moves}, time-slot moves: {time_moves}\n\
+             - manual [R] recovers during soak: {} (at turns: {recover_list})\n\
+             - hard quality overlays that exhausted recover budget: {}\n\
+             - top recurring tokens (freq≥8): {}\n",
+            history.len(),
+            history.len(),
+            self.quality_recovers,
+            self.quality_hard_fails,
+            if top_motifs.is_empty() {
+                "(none)".to_string()
+            } else {
+                top_motifs.join(", ")
+            },
+        )
+        .unwrap();
+
+        writeln!(
+            &mut body,
+            "## Sample narrations\n\n\
+             (opening, every 5th turn, and the final three — ~700 chars each)\n"
+        )
+        .unwrap();
+        let mut sample_idxs: Vec<usize> = Vec::new();
+        if !history.is_empty() {
+            sample_idxs.push(0);
+            let mut t = 5usize;
+            while t <= history.len() {
+                sample_idxs.push(t - 1);
+                t += 5;
+            }
+            for back in 1..=3 {
+                if history.len() >= back {
+                    sample_idxs.push(history.len() - back);
+                }
+            }
+            sample_idxs.sort_unstable();
+            sample_idxs.dedup();
+        }
+        for idx in sample_idxs {
+            let entry = &history[idx];
+            let preview: String = entry.narration.chars().take(700).collect();
+            let truncated = if entry.narration.chars().count() > 700 {
+                format!("{preview}…")
+            } else {
+                preview
+            };
+            let loc = entry
+                .applied_patch
+                .next_location
+                .as_ref()
+                .map(|l| l.0.as_str())
+                .unwrap_or("-");
+            let time = entry
+                .applied_patch
+                .next_time_slot
+                .map(|t| format!("{t:?}"))
+                .unwrap_or_else(|| "-".into());
+            writeln!(
+                &mut body,
+                "### Turn {} (chars={}, next_loc={loc}, next_time={time})\n\n{}\n\n---\n",
+                entry.turn,
+                entry.narration.chars().count(),
+                truncated
+            )
+            .unwrap();
+        }
+
+        // Full dump for deep review.
+        let mut full = String::new();
+        writeln!(&mut full, "# Full narration dump ({} turns)\n", history.len()).unwrap();
+        for entry in history {
+            writeln!(
+                &mut full,
+                "## Turn {}\n\n{}\n\n---\n",
+                entry.turn, entry.narration
+            )
+            .unwrap();
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+            let dump = parent.join("live-quality-narrations-full.md");
+            std::fs::write(&dump, full)?;
+        }
+        std::fs::write(path, body)
     }
 
     async fn run_command(&mut self, cmd: EngineCommand, label: &str) {
@@ -207,22 +477,33 @@ impl LiveSession {
                 }
             }
             if let Some(err) = self.app.view.error.clone() {
-                if let Some(draft) = &self.last_draft {
-                    let motifs =
-                        story_core::narration_quality::recurring_motifs(&self.engine.game.history);
-                    let report = story_core::narration_quality::assess_narration(
+                let motifs =
+                    story_core::narration_quality::recurring_motifs(&self.engine.game.history);
+                let engine_issues = self
+                    .engine
+                    .last_narration_quality
+                    .as_ref()
+                    .map(|r| format!("{:?}", r.issues))
+                    .unwrap_or_else(|| "(none stored)".into());
+                let draft_issues = self.last_draft.as_ref().map(|draft| {
+                    story_core::narration_quality::assess_narration(
                         &self.engine.game,
                         &draft.narration,
                         &draft.proposed_patch,
                         Some(&draft.summary),
                         true,
-                    );
-                    eprintln!(
-                        "[{label}] diagnostic: recurring_motifs={motifs:?}, issues={:?}, patch={:?}",
-                        report.issues, draft.proposed_patch
-                    );
-                }
+                    )
+                    .issues
+                });
+                eprintln!(
+                    "[{label}] diagnostic: pressure={}, engine_issues={engine_issues}, draft_issues={draft_issues:?}, motifs={motifs:?}",
+                    self.engine.quality_pressure
+                );
                 if err.recoverable && recovers_left > 0 && self.engine.retry_pending.is_some() {
+                    if err.code.contains("quality") || err.code.contains("narration") {
+                        self.quality_recovers += 1;
+                        self.quality_recover_at.push(self.app.view.status.turn);
+                    }
                     eprintln!(
                         "[{label}] recoverable error surfaced ({}: {}), testing [R] regenerate ({} left)",
                         err.code,
@@ -237,9 +518,17 @@ impl LiveSession {
                     .await;
                     return;
                 }
+                if err.code.contains("quality") || err.code.contains("narration") {
+                    self.quality_hard_fails += 1;
+                }
+                let report_path = repo_root().join("target/live-quality-report.md");
+                let _ = self.write_quality_report(&report_path);
                 panic!(
-                    "[{label}] surfaced app error: {} ({}) - {}",
-                    err.title_ko, err.code, err.message_ko
+                    "[{label}] surfaced app error: {} ({}) - {} (partial report: {})",
+                    err.title_ko,
+                    err.code,
+                    err.message_ko,
+                    report_path.display()
                 );
             }
         }
@@ -392,10 +681,11 @@ async fn live_hundred_turn_soak_rainy_reunion() {
     assert!(!s.app.view.choices.is_empty());
 
     let free_actions = [
+        "반송된 편지 세 통에 대해 직접 묻는다.",
+        "테이블 위 봉투를 열어 보자고 제안한다.",
+        "전시회 날 나타나지 못한 일을 사과한다.",
+        "그때 가족에게 무슨 일이 있었는지 조심스럽게 묻는다.",
         "창밖 비를 바라보며 커피를 살짝 돌려 식힌다.",
-        "주머니에서 메모지를 꺼내 날짜를 다시 확인한다.",
-        "잠깐 침묵을 두고 상대의 표정을 살핀다.",
-        "테이블 모서리의 봉투를 가리키며 경위를 묻는다.",
         "자리 이동을 제안하며 조용한 구석으로 몸을 돌린다.",
     ];
 
@@ -427,8 +717,24 @@ async fn live_hundred_turn_soak_rainy_reunion() {
             )
             .await;
         } else {
-            let idx = ((step as usize).saturating_sub(1)) % s.app.view.choices.len();
-            let cid = s.app.view.choices[idx].id.clone();
+            let streak = story_core::narrative::same_scene_streak(&s.engine.game);
+            let rotate_idx =
+                ((step as usize).saturating_sub(1)) % s.app.view.choices.len();
+            let cid = if streak >= story_core::narrative::SCENE_STREAK_FORCE {
+                s.engine
+                    .game
+                    .history
+                    .last()
+                    .into_iter()
+                    .flat_map(|entry| entry.choices.iter())
+                    .find(|choice| {
+                        story_core::narrative::classify_choice(choice) == "situation"
+                    })
+                    .map(|choice| choice.id.clone())
+                    .unwrap_or_else(|| s.app.view.choices[rotate_idx].id.clone())
+            } else {
+                s.app.view.choices[rotate_idx].id.clone()
+            };
             s.run_command(
                 EngineCommand::SubmitChoice { choice_id: cid },
                 &format!("t100/choice-{step}"),
@@ -462,10 +768,43 @@ async fn live_hundred_turn_soak_rainy_reunion() {
         "expected >= {target_turn} turns, got {}",
         s.app.view.status.turn
     );
+    let report_path = repo_root().join("target/live-quality-report.md");
+    s.write_quality_report(&report_path)
+        .unwrap_or_else(|e| panic!("write quality report: {e}"));
+
+    // Fail closed on the failure mode humans noticed: identical dialogue
+    // fingerprints spanning 3+ consecutive committed turns.
+    let mut run = 1usize;
+    let mut max_run = 1usize;
+    let mut prev: Option<std::collections::BTreeSet<String>> = None;
+    for entry in &s.engine.game.history {
+        let fps: std::collections::BTreeSet<String> =
+            story_core::narration_quality::dialogue_fingerprints(&entry.narration)
+                .into_iter()
+                .collect();
+        if let Some(p) = &prev {
+            if fps.intersection(p).next().is_some() {
+                run += 1;
+                max_run = max_run.max(run);
+            } else {
+                run = 1;
+            }
+        }
+        prev = Some(fps);
+    }
+    assert!(
+        max_run < 3,
+        "dialogue fingerprint shared across {max_run} consecutive turns (limit 2); see {}",
+        report_path.display()
+    );
+
     eprintln!(
-        "[t100] done turn={} steps={} elapsed={:.1}s",
+        "[t100] done turn={} steps={} elapsed={:.1}s recovers={} dialogue_streak_max={} report={}",
         s.app.view.status.turn,
         step,
-        started.elapsed().as_secs_f32()
+        started.elapsed().as_secs_f32(),
+        s.quality_recovers,
+        max_run,
+        report_path.display()
     );
 }

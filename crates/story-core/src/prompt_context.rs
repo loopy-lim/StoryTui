@@ -473,7 +473,7 @@ fn build_user(
     s.push_str(&character_live_context(pack, state));
 
     s.push_str("\n# Current dramatic beat\n");
-    s.push_str(&dramatic_brief(state, &recall.included));
+    s.push_str(&dramatic_brief(pack, state, &recall.included));
     s.push_str("\n# Autonomous world and NPC initiative\n");
     s.push_str(&world_initiative(pack, state));
 
@@ -738,14 +738,14 @@ fn relationship_ledger(state: &GameState) -> String {
     ledger
 }
 
-fn dramatic_brief(state: &GameState, recalled: &[MemoryEntry]) -> String {
+fn dramatic_brief(pack: &StoryPack, state: &GameState, recalled: &[MemoryEntry]) -> String {
     let unresolved = recalled.iter().find(|memory| memory.unresolved);
     let mode = if state.turn % 3 == 2 {
         "Sequel"
     } else {
         "Scene"
     };
-    match unresolved.and_then(memory_summary) {
+    let mut brief = match unresolved.and_then(memory_summary) {
         Some(thread) => format!(
             "mode={mode}. Advance exactly one observable beat around this unresolved thread: {thread}. Do not resolve it completely unless a validated event makes that possible. End with a concrete new pressure, question, or consequence.\n"
         ),
@@ -753,7 +753,12 @@ fn dramatic_brief(state: &GameState, recalled: &[MemoryEntry]) -> String {
             "mode={mode}. Advance exactly one observable relationship or situation beat at {}. Do not restart the premise or repeat the last selected approach. End with a concrete new pressure, question, or consequence.\n",
             state.location.0,
         ),
-    }
+    };
+    brief.push_str(&format!(
+        "\n# 필수 전진 (engine)\n{}\n금지: 최근과 같은 질문 유형(왜 불렀는지/왜 떠났는지/정해 두고 묻는지)을 다시 묻기.\n",
+        crate::narrative::required_lead(state, pack)
+    ));
+    brief
 }
 
 fn world_initiative(pack: &StoryPack, state: &GameState) -> String {

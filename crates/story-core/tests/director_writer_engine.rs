@@ -796,7 +796,7 @@ fn writer_repetition_gets_one_narration_only_rewrite_before_commit() {
             .pending
             .as_ref()
             .and_then(|pending| pending.narration_repair.as_ref()),
-        Some(NarrationRepair::Writer { .. })
+        Some(NarrationRepair::Writer { attempt: 1, .. })
     ));
     let (repair_id, request) = repairing
         .effects
@@ -839,6 +839,7 @@ fn writer_repetition_gets_one_narration_only_rewrite_before_commit() {
         completed.state.game.history.last().unwrap().narration,
         "나무는 접어 둔 초대장을 테이블 위에 펴고, 오늘 전시회에 동행할지 묻는다."
     );
+    assert_eq!(completed.state.quality_pressure, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -950,7 +951,7 @@ fn writer_empty_narration_gets_one_repair_then_the_quality_overlay() {
             .pending
             .as_ref()
             .and_then(|pending| pending.narration_repair.as_ref()),
-        Some(NarrationRepair::Writer { .. })
+        Some(NarrationRepair::Writer { attempt: 1, .. })
     ));
     let (repair_id, repair_request) = repairing
         .effects
@@ -962,7 +963,7 @@ fn writer_empty_narration_gets_one_repair_then_the_quality_overlay() {
             } => Some((*generation_id, request)),
             _ => None,
         })
-        .expect("one writer repair request");
+        .expect("attempt-1 writer repair request");
     assert_ne!(repair_id, writer_id);
     assert!(
         repair_request
@@ -974,9 +975,8 @@ fn writer_empty_narration_gets_one_repair_then_the_quality_overlay() {
         "the repair prompt must carry the Empty instruction"
     );
 
-    // The repair also comes back empty → bounded failure: checkpoint
-    // restored, retry offered, no second automatic repair.
-    let failed = reduce(
+    // Attempt 1 also empty → second automatic repair.
+    let repairing_again = reduce(
         &repairing.state,
         EngineCommand::AcceptWriterFinish {
             finish: Box::new(WriterFinish {
@@ -988,10 +988,42 @@ fn writer_empty_narration_gets_one_repair_then_the_quality_overlay() {
         },
         &pack,
     )
+    .expect("empty writer repair attempt 2");
+    assert!(matches!(
+        repairing_again
+            .state
+            .pending
+            .as_ref()
+            .and_then(|pending| pending.narration_repair.as_ref()),
+        Some(NarrationRepair::Writer { attempt: 2, .. })
+    ));
+    let second_repair_id = repairing_again
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            EngineEffect::RequestWriter { generation_id, .. } => Some(*generation_id),
+            _ => None,
+        })
+        .expect("attempt-2 writer repair request");
+
+    // Attempt 2 still empty → overlay, no third automatic repair.
+    let failed = reduce(
+        &repairing_again.state,
+        EngineCommand::AcceptWriterFinish {
+            finish: Box::new(WriterFinish {
+                generation_id: second_repair_id,
+                full_text: String::new(),
+                usage: None,
+                finish_reason: None,
+            }),
+        },
+        &pack,
+    )
     .expect("bounded repair failure");
     assert_eq!(failed.state.game.turn, state.game.turn);
     assert!(failed.state.pending.is_none());
     assert!(failed.state.retry_pending.is_some());
+    assert_eq!(failed.state.quality_pressure, 1);
     assert!(failed.effects.iter().any(|effect| matches!(
         effect,
         EngineEffect::ShowRecoverableError(error)
@@ -1002,7 +1034,7 @@ fn writer_empty_narration_gets_one_repair_then_the_quality_overlay() {
             .effects
             .iter()
             .any(|effect| matches!(effect, EngineEffect::RequestWriter { .. })),
-        "the repair is attempted exactly once"
+        "the repair is attempted at most twice"
     );
 }
 
@@ -1096,7 +1128,7 @@ fn writer_length_finish_after_a_spent_repair_is_manual_only() {
             .pending
             .as_ref()
             .and_then(|pending| pending.narration_repair.as_ref()),
-        Some(NarrationRepair::Writer { .. })
+        Some(NarrationRepair::Writer { attempt: 1, .. })
     ));
     let repair_id = repairing
         .effects

@@ -88,6 +88,10 @@ These are facts and forms of address established during play. They override neit
 # Current dramatic beat
 mode=Scene. Advance exactly one observable relationship or situation beat at cafe-namu. Do not restart the premise or repeat the last selected approach. End with a concrete new pressure, question, or consequence.
 
+# 필수 전진 (engine)
+[push_event_flags] 필수: 미발생 이벤트/플래그를 향한 구체 대사로 전진한다 (unresolved pack progress). REQUIRED: Push toward event flags with concrete speech — not meta-questions about why they met.
+금지: 최근과 같은 질문 유형(왜 불렀는지/왜 떠났는지/정해 두고 묻는지)을 다시 묻기.
+
 # Autonomous world and NPC initiative
 World clock: turn 3 is in the arrival phase; the next pressure is due by turn 4: move the current situation forward. Before offering choices, let the setting or an NPC take one observable initiative; do not wait for the player to invent all momentum.
 NPC initiative may create pressure, offer, refusal, departure, or new information, but must not decide the player's response, feelings, speech, or irreversible commitment.
@@ -115,4 +119,4 @@ For every choice: write one concrete player action or line; make `intent` name i
 
 
 === HASH ===
-4a10149c7b3dc2bbdd6f1216b8090b7641cb11b589e7543e3e29c4d5c7f9a2d4
+b9eb139bc5b1a1c26dc9dd3990a57ad82b77f7c6ab31918ef93249d75d918b3c

@@ -14,6 +14,10 @@ const HISTORY_WINDOW: usize = 4;
 const MAX_MOTIFS: usize = 8;
 const MIN_REUSED_MOTIFS: usize = 3;
 const MIN_REUSED_MOTIF_FREQUENCY: usize = 3;
+/// Question classes that are "same conversation loop" when repeated — not
+/// story props (envelope/watch) which legitimately recur while advancing.
+const LOOP_QUESTION_BEATS: &[&str] = &["why_contact", "why_left", "answer_trap"];
+const MIN_DIALOGUE_FINGERPRINT_CHARS: usize = 20;
 
 /// A narration defect that must be repaired before the turn can be committed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -24,6 +28,12 @@ pub enum NarrationQualityIssue {
     /// A long sentence or most character trigrams were copied from a recent
     /// committed turn.
     HighSimilarity { turn: u32 },
+    /// A dialogue line (speaker-labeled or quoted) matches a recent turn's
+    /// dialogue after fingerprinting, or is highly similar to one.
+    RepeatedDialogue { turn: u32 },
+    /// The candidate reuses a dramatic question *type* (beat id) that appeared
+    /// in one of the last two history turns, even when the wording differs.
+    RepeatedQuestionBeat { beat: String, turn: u32 },
     /// Several already-recurring content motifs were reused yet again.
     ReusedMotifs { motifs: Vec<String> },
     /// The previous and candidate turns both carry no meaningful patch or
@@ -50,17 +60,24 @@ impl NarrationQualityReport {
         self.issues.is_empty()
     }
 
-    /// Issues that must still reject a turn after the one allowed narration
-    /// repair. Soft issues (`ReusedMotifs`, `StalledProgress`,
-    /// `HighSimilarity`) often reappear forever on weak local models; blocking
-    /// the player there freezes long sessions. Empty prose, exact duplicates,
-    /// and punctuation-only "repairs" stay hard stops.
+    /// Issues that must still reject a turn after the allowed narration
+    /// repair attempts (up to two).
+    ///
+    /// Hard (still block): empty prose, exact duplicates, near-copy repairs,
+    /// high sentence similarity, repeated dialogue lines, and repeated
+    /// question beats — these are the ones players notice as "같은 장면 반복".
+    /// Soft (may commit after repair): motif reuse and stalled progress alone,
+    /// which weak local models re-trigger forever on shared setting vocabulary
+    /// without meaning the scene is identical.
     pub fn blocks_commit_after_repair(&self) -> bool {
         self.issues.iter().any(|issue| {
             matches!(
                 issue,
                 NarrationQualityIssue::Empty
                     | NarrationQualityIssue::ExactDuplicate { .. }
+                    | NarrationQualityIssue::HighSimilarity { .. }
+                    | NarrationQualityIssue::RepeatedDialogue { .. }
+                    | NarrationQualityIssue::RepeatedQuestionBeat { .. }
                     | NarrationQualityIssue::UnchangedRepair
             )
         })
@@ -76,6 +93,12 @@ impl NarrationQualityReport {
                 )),
                 NarrationQualityIssue::HighSimilarity { turn } => lines.push(format!(
                     "턴 {turn}의 긴 문장이나 문장 구조를 과도하게 재사용했다. 같은 문장을 변형하지 말고 다른 사건 단위로 전진한다."
+                )),
+                NarrationQualityIssue::RepeatedDialogue { turn } => lines.push(format!(
+                    "턴 {turn}의 대사와 같거나 거의 같다. NPC의 질문/발화를 새로 창작해 장면을 전진시켜라(새 정보, 결정, 또는 거절). 이전 대사를 가볍게 바꿔 쓰지 말고 극적인 요구 자체를 바꿔라."
+                )),
+                NarrationQualityIssue::RepeatedQuestionBeat { beat, turn } => lines.push(format!(
+                    "턴 {turn}과 같은 질문 유형({beat})을 다시 하지 말고, 새 사실 공개·결정·거절·장면 전환 중 하나로 전진한다."
                 )),
                 NarrationQualityIssue::ReusedMotifs { motifs } => lines.push(format!(
                     "최근 반복 소재({})를 이번 장면의 중심 묘사로 다시 쓰지 않는다.",
@@ -139,6 +162,59 @@ pub fn assess_narration(
         }
     }
 
+    let candidate_dialogue = dialogue_fingerprints(narration);
+    if !candidate_dialogue.is_empty() {
+        let mut offending_turn = None;
+        for entry in game.history[recent_start..].iter().rev() {
+            let previous_dialogue = dialogue_fingerprints(&entry.narration);
+            if previous_dialogue.is_empty() {
+                continue;
+            }
+            let hit = candidate_dialogue.iter().any(|candidate_line| {
+                previous_dialogue.iter().any(|previous_line| {
+                    candidate_line == previous_line
+                        || highly_similar(candidate_line, previous_line)
+                })
+            });
+            if hit {
+                offending_turn = Some(entry.turn);
+                break;
+            }
+        }
+        if let Some(turn) = offending_turn {
+            issues.push(NarrationQualityIssue::RepeatedDialogue { turn });
+        }
+    }
+
+    // Only meta-loop question classes hard-block. Props like 봉투/시계 must be
+    // allowed to develop across turns; banning any mention trapped the model on
+    // object_tease while required_lead asked it to open the envelope.
+    let candidate_beats = classify_question_beats(narration);
+    if !candidate_beats.is_empty() {
+        let recent_beat_start = game.history.len().saturating_sub(2);
+        for beat in &candidate_beats {
+            if !LOOP_QUESTION_BEATS.contains(&beat.as_str()) {
+                continue;
+            }
+            let offending_turn = game.history[recent_beat_start..]
+                .iter()
+                .rev()
+                .find_map(|entry| {
+                    classify_question_beats(&entry.narration)
+                        .into_iter()
+                        .find(|previous| previous == beat)
+                        .map(|_| entry.turn)
+                });
+            if let Some(turn) = offending_turn {
+                issues.push(NarrationQualityIssue::RepeatedQuestionBeat {
+                    beat: beat.clone(),
+                    turn,
+                });
+                break;
+            }
+        }
+    }
+
     let has_progress = patch_changes_game(game, patch) || summary.is_some_and(summary_has_progress);
     let motifs = reused_motifs(&game.history, narration);
     if !has_progress && motifs.len() >= MIN_REUSED_MOTIFS {
@@ -157,6 +233,176 @@ pub fn assess_narration(
     }
 
     NarrationQualityReport { issues }
+}
+
+/// Fingerprint-normalized dialogue lines extracted from narration.
+///
+/// Speaker-labeled lines (`이름:` / `Name:`) and quoted spans are kept when
+/// their fingerprint is at least [`MIN_DIALOGUE_FINGERPRINT_CHARS`] characters.
+pub fn extract_dialogue_lines(text: &str) -> Vec<String> {
+    dialogue_fingerprints(text)
+}
+
+/// Same as [`extract_dialogue_lines`]: fingerprint strings used for comparison.
+pub fn dialogue_fingerprints(text: &str) -> Vec<String> {
+    let mut fingerprints = Vec::new();
+    let mut seen = BTreeSet::new();
+    for span in raw_dialogue_spans(text) {
+        let fingerprint = prose_fingerprint(&span);
+        if fingerprint.chars().count() < MIN_DIALOGUE_FINGERPRINT_CHARS {
+            continue;
+        }
+        if seen.insert(fingerprint.clone()) {
+            fingerprints.push(fingerprint);
+        }
+    }
+    fingerprints
+}
+
+/// Classify dramatic question *beats* in dialogue spans (not full prose).
+///
+/// Returns unique beat ids in first-seen order. Matching is substring-based
+/// (no regex crate) over Korean dialogue text.
+pub fn classify_question_beats(text: &str) -> Vec<String> {
+    let mut beats = Vec::new();
+    let mut seen = BTreeSet::new();
+    for span in raw_dialogue_spans(text) {
+        for beat in beats_in_span(&span) {
+            if seen.insert(beat) {
+                beats.push(beat.to_string());
+            }
+        }
+    }
+    beats
+}
+
+fn beats_in_span(span: &str) -> Vec<&'static str> {
+    let compact: String = span.chars().filter(|c| !c.is_whitespace()).collect();
+    let mut found = Vec::new();
+
+    // why_contact — 왜.*(불렀|만나|연락|나타|지금)|오늘.*부른|만나자고
+    if compact.contains("만나자고")
+        || (compact.contains("오늘") && compact.contains("부른"))
+        || contains_why_then(span, &["불렀", "만나", "연락", "나타", "지금"])
+    {
+        found.push("why_contact");
+    }
+
+    // why_left — 왜.*(떠났|사라졌)|떠난 이유 (bare 떠나 is too broad)
+    if contains_why_then(span, &["떠났", "사라졌"]) || compact.contains("떠난이유") {
+        found.push("why_left");
+    }
+
+    // answer_trap — 정해\s*두고|확인하고\s*싶|시험하
+    if compact.contains("정해두고")
+        || compact.contains("확인하고싶")
+        || span.contains("시험하")
+    {
+        found.push("answer_trap");
+    }
+
+    // watch_symbol — 시계
+    if span.contains("시계") {
+        found.push("watch_symbol");
+    }
+
+    // object_tease — 봉투|메모|편지
+    if span.contains("봉투") || span.contains("메모") || span.contains("편지") {
+        found.push("object_tease");
+    }
+
+    // leave_or_walk — 끝낼|카페로|걷|여기서\s*끝내|돌아가
+    if span.contains("끝낼")
+        || span.contains("카페로")
+        || span.contains("걷")
+        || compact.contains("여기서끝내")
+        || span.contains("돌아가")
+    {
+        found.push("leave_or_walk");
+    }
+
+    // self_meaning — 어떤\s*의미|지워|기억하
+    if compact.contains("어떤의미") || span.contains("지워") || span.contains("기억하") {
+        found.push("self_meaning");
+    }
+
+    found
+}
+
+fn contains_why_then(text: &str, keywords: &[&str]) -> bool {
+    let Some(pos) = text.find('왜') else {
+        return false;
+    };
+    let after = &text[pos..];
+    keywords.iter().any(|keyword| after.contains(keyword))
+}
+
+fn raw_dialogue_spans(text: &str) -> Vec<String> {
+    let mut spans = Vec::new();
+    for line in text.lines() {
+        if let Some(rest) = speaker_labeled_rest(line) {
+            let trimmed = rest.trim();
+            if let Some(inner) = unwrap_full_quotes(trimmed) {
+                spans.push(inner);
+            } else if !trimmed.is_empty() {
+                spans.push(trimmed.to_string());
+            }
+        }
+        spans.extend(quoted_spans(line));
+    }
+    spans
+}
+
+fn speaker_labeled_rest(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    let colon = trimmed.find(':')?;
+    let name = trimmed[..colon].trim();
+    if name.is_empty() || !name.chars().all(char::is_alphabetic) {
+        return None;
+    }
+    Some(&trimmed[colon + 1..])
+}
+
+fn unwrap_full_quotes(text: &str) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() < 2 {
+        return None;
+    }
+    let pairs = [('"', '"'), ('“', '”'), ('「', '」')];
+    for &(open, close) in &pairs {
+        if chars[0] == open && chars[chars.len() - 1] == close {
+            return Some(chars[1..chars.len() - 1].iter().collect());
+        }
+    }
+    None
+}
+
+fn quoted_spans(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let pairs = [('"', '"'), ('“', '”'), ('「', '」')];
+    let mut spans = Vec::new();
+    for &(open, close) in &pairs {
+        let mut index = 0;
+        while index < chars.len() {
+            if chars[index] != open {
+                index += 1;
+                continue;
+            }
+            if let Some(end) = chars[index + 1..]
+                .iter()
+                .position(|&character| character == close)
+            {
+                let inner: String = chars[index + 1..index + 1 + end].iter().collect();
+                if !inner.is_empty() {
+                    spans.push(inner);
+                }
+                index = index + 1 + end + 1;
+            } else {
+                break;
+            }
+        }
+    }
+    spans
 }
 
 /// Repeated full-prose motifs used by prompt construction. Unlike the old
@@ -655,14 +901,18 @@ mod tests {
                 NarrationQualityIssue::ReusedMotifs {
                     motifs: vec!["시계".into(), "시선".into(), "창밖".into()],
                 },
-                NarrationQualityIssue::HighSimilarity { turn: 4 },
                 NarrationQualityIssue::StalledProgress,
             ],
         };
         assert!(!soft.is_ok());
         assert!(!soft.blocks_commit_after_repair());
 
-        let hard = NarrationQualityReport {
+        let hard_similarity = NarrationQualityReport {
+            issues: vec![NarrationQualityIssue::HighSimilarity { turn: 4 }],
+        };
+        assert!(hard_similarity.blocks_commit_after_repair());
+
+        let hard_duplicate = NarrationQualityReport {
             issues: vec![
                 NarrationQualityIssue::ReusedMotifs {
                     motifs: vec!["시계".into()],
@@ -670,7 +920,20 @@ mod tests {
                 NarrationQualityIssue::ExactDuplicate { turn: 3 },
             ],
         };
-        assert!(hard.blocks_commit_after_repair());
+        assert!(hard_duplicate.blocks_commit_after_repair());
+
+        let hard_dialogue = NarrationQualityReport {
+            issues: vec![NarrationQualityIssue::RepeatedDialogue { turn: 2 }],
+        };
+        assert!(hard_dialogue.blocks_commit_after_repair());
+
+        let hard_beat = NarrationQualityReport {
+            issues: vec![NarrationQualityIssue::RepeatedQuestionBeat {
+                beat: "why_contact".into(),
+                turn: 1,
+            }],
+        };
+        assert!(hard_beat.blocks_commit_after_repair());
     }
 
     #[test]
@@ -788,8 +1051,10 @@ mod tests {
     fn single_callback_sentence_in_long_novel_turn_is_allowed() {
         let pack = crate::tests_support::sample_pack();
         let mut game = crate::engine::EngineState::initial(&pack).game;
-        let callback =
-            "아니면 당신이 오늘 나를 부른 진짜 이유가 뭔지 지금이라도 짧게라도 말해줄래요";
+        // Keep the shared callback under the dialogue fingerprint floor so a
+        // brief echo alone does not hard-gate; longer identical lines are
+        // covered by RepeatedDialogue tests below.
+        let callback = "말해줄래요";
         game.history.push(entry(
             1,
             &format!("비 오는 카페 창가에서 두 사람이 마주 앉았다. {callback}?"),
@@ -819,6 +1084,105 @@ mod tests {
     }
 
     #[test]
+    fn identical_long_yuna_dialogue_hard_blocks_even_when_prose_differs() {
+        let pack = crate::tests_support::sample_pack();
+        let mut game = crate::engine::EngineState::initial(&pack).game;
+        let yuna = "유나: \"지금 이 자리에서 내일 전시회에 같이 갈지 말지 확실히 정해줘요\"";
+        assert!(
+            dialogue_fingerprints(yuna)
+                .first()
+                .is_some_and(|fp| fp.chars().count() >= 20),
+            "fixture dialogue must clear the fingerprint floor"
+        );
+        // Surrounding prose differs and shares no long sentence / high trigram
+        // overlap, so full-prose HighSimilarity must not fire — only dialogue.
+        game.history.push(entry(
+            1,
+            &format!(
+                "빗줄기가 처마를 두드리고 카페 안은 낮은 재즈로 가득했다 {yuna} 바리스타가 젖은 트레이를 닦았다"
+            ),
+        ));
+        let candidate = format!(
+            "가로등이 유리창에 길게 번지고 폐점 종소리가 짧게 울렸다 {yuna} 주인이 의자를 테이블 위로 올리기 시작했다"
+        );
+        let report = assess_narration(&game, &candidate, &StatePatch::default(), None, false);
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|issue| matches!(issue, NarrationQualityIssue::HighSimilarity { .. })),
+            "surrounding prose must differ enough to avoid HighSimilarity: {:?}",
+            report.issues
+        );
+        assert!(
+            report.issues.iter().any(|issue| {
+                matches!(issue, NarrationQualityIssue::RepeatedDialogue { turn: 1 })
+            }),
+            "identical long Yuna dialogue must hard-gate: {:?}",
+            report.issues
+        );
+        assert!(
+            report.blocks_commit_after_repair(),
+            "RepeatedDialogue must block commit after repair"
+        );
+    }
+
+    #[test]
+    fn completely_new_dialogue_does_not_trigger_repeated_dialogue() {
+        let pack = crate::tests_support::sample_pack();
+        let mut game = crate::engine::EngineState::initial(&pack).game;
+        game.history.push(entry(
+            1,
+            "유나: \"지금 이 자리에서 내일 전시회에 같이 갈지 말지 확실히 정해줘요\"",
+        ));
+        let report = assess_narration(
+            &game,
+            "유나: \"가방 안의 초대장 주소가 맞는지 먼저 확인하고 출발 시간을 다시 잡자\"",
+            &StatePatch::default(),
+            None,
+            false,
+        );
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|issue| matches!(issue, NarrationQualityIssue::RepeatedDialogue { .. })),
+            "novel NPC ask must not raise RepeatedDialogue: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn short_shared_callback_under_fingerprint_floor_does_not_alone_trigger() {
+        let pack = crate::tests_support::sample_pack();
+        let mut game = crate::engine::EngineState::initial(&pack).game;
+        let short = "유나: \"뭐라고?\"";
+        assert!(
+            dialogue_fingerprints(short).is_empty(),
+            "short interjection must stay under the dialogue floor"
+        );
+        game.history.push(entry(
+            1,
+            &format!("창가 자리에 앉은 채 커피잔을 만지작거렸다. {short}"),
+        ));
+        let report = assess_narration(
+            &game,
+            &format!("폐점을 알리는 종소리가 울리자 그녀가 고개를 들었다. {short}"),
+            &StatePatch::default(),
+            None,
+            false,
+        );
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|issue| matches!(issue, NarrationQualityIssue::RepeatedDialogue { .. })),
+            "sub-floor callback alone must not raise RepeatedDialogue: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
     fn multiple_copied_long_sentences_in_long_turn_are_rejected() {
         let pack = crate::tests_support::sample_pack();
         let mut game = crate::engine::EngineState::initial(&pack).game;
@@ -838,6 +1202,72 @@ mod tests {
                 .iter()
                 .any(|issue| matches!(issue, NarrationQualityIssue::HighSimilarity { turn: 1 })),
             "two copied long sentences must still trigger HighSimilarity: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn repeated_why_meet_question_beat_hard_blocks_despite_new_wording() {
+        let pack = crate::tests_support::sample_pack();
+        let mut game = crate::engine::EngineState::initial(&pack).game;
+        let turn1 = "유나: \"왜 나를 불렀어? 오늘 갑자기 만나자고 한 이유가 뭐야?\"";
+        let turn2 = "유나: \"왜 지금 나타난 거야? 왜 연락한 거지?\"";
+        assert_eq!(
+            classify_question_beats(turn1),
+            vec!["why_contact".to_string()],
+            "turn1 must classify as why_contact"
+        );
+        assert_eq!(
+            classify_question_beats(turn2),
+            vec!["why_contact".to_string()],
+            "turn2 must classify as why_contact despite different wording"
+        );
+        game.history.push(entry(1, turn1));
+        let report = assess_narration(&game, turn2, &StatePatch::default(), None, false);
+        assert!(
+            report.issues.iter().any(|issue| {
+                matches!(
+                    issue,
+                    NarrationQualityIssue::RepeatedQuestionBeat {
+                        beat,
+                        turn: 1
+                    } if beat == "why_contact"
+                )
+            }),
+            "same why-meet beat with new wording must hard-gate: {:?}",
+            report.issues
+        );
+        assert!(
+            report.blocks_commit_after_repair(),
+            "RepeatedQuestionBeat must block commit after repair"
+        );
+        let instructions = report.repair_instructions();
+        assert!(
+            instructions.contains("why_contact") && instructions.contains("전진"),
+            "repair text must name the beat and push forward: {instructions}"
+        );
+    }
+
+    #[test]
+    fn why_meet_then_family_disclosure_without_repeat_ask_is_ok() {
+        let pack = crate::tests_support::sample_pack();
+        let mut game = crate::engine::EngineState::initial(&pack).game;
+        game.history.push(entry(
+            1,
+            "유나: \"왜 나를 불렀어? 오늘 갑자기 만나자고 한 이유가 뭐야?\"",
+        ));
+        let disclosure = "유나: \"사실 어머니 병간호 때문에 서울에 남아 있었어. 그때는 말할 수 없었어.\"";
+        assert!(
+            classify_question_beats(disclosure).is_empty(),
+            "disclosure must not carry the why_contact beat: {:?}",
+            classify_question_beats(disclosure)
+        );
+        let report = assess_narration(&game, disclosure, &StatePatch::default(), None, false);
+        assert!(
+            !report.issues.iter().any(|issue| {
+                matches!(issue, NarrationQualityIssue::RepeatedQuestionBeat { .. })
+            }),
+            "family disclosure without re-asking must pass beat gate: {:?}",
             report.issues
         );
     }

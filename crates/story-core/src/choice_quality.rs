@@ -67,6 +67,27 @@ pub fn design_briefs(game: &GameState, pack: &StoryPack) -> Vec<ChoiceDesignBrie
         .map(|location| location.display_name.clone())
         .unwrap_or_else(|| "현재 장소의 시간 압력이나 제삼의 변수".to_string());
 
+    let force_scene_move =
+        crate::narrative::same_scene_streak(game) >= crate::narrative::SCENE_STREAK_FORCE;
+    let (situation_objective, situation_consequence) = if force_scene_move {
+        (
+            format!(
+                "같은 장면 대화 루프는 금지. 사용 가능한 장면 변화: {next_place}. 반드시 장소 이동이나 시간 변화를 제안해 장면 조건을 바꾼다"
+            ),
+            format!(
+                "다음 장면의 장소 또는 시간이 {next_place} 쪽으로 달라진다. 같은 자리에서 한 번 더 이야기하는 선택은 허용되지 않는다"
+            ),
+        )
+    } else {
+        (
+            format!(
+                "사용 가능한 장면 변화 자원: {next_place}. 이동, 마감, 제삼자, 제안 또는 즉시 행동으로 장면 조건을 바꾼다"
+            ),
+            "장소·시간·참여자·즉시 목표 중 하나가 달라져 다음 장면이 같은 대화의 반복이 되지 않는다"
+                .to_string(),
+        )
+    };
+
     let mut briefs = vec![
         ChoiceDesignBrief {
             role: ChoiceRole::Relationship,
@@ -92,12 +113,9 @@ pub fn design_briefs(game: &GameState, pack: &StoryPack) -> Vec<ChoiceDesignBrie
         },
         ChoiceDesignBrief {
             role: ChoiceRole::Situation,
-            objective: format!(
-                "사용 가능한 장면 변화 자원: {next_place}. 이동, 마감, 제삼자, 제안 또는 즉시 행동으로 장면 조건을 바꾼다"
-            ),
+            objective: situation_objective,
             cost: "현재 질문을 미뤄 오해를 남기거나 대화할 수 있는 시간을 잃을 수 있다".to_string(),
-            consequence: "장소·시간·참여자·즉시 목표 중 하나가 달라져 다음 장면이 같은 대화의 반복이 되지 않는다"
-                .to_string(),
+            consequence: situation_consequence,
             risk_hint: "medium 또는 high",
         },
     ];
@@ -148,6 +166,12 @@ pub fn design_prompt(
     out.push_str(
         "For every choice: write one concrete player action or line; make `intent` name its actual goal; make `preview` a non-empty, spoiler-free Korean hint about what it tests or changes. Use a distinct person, promise, quoted claim, object, place, or time already present in the context as each option's hook. At most one option may be a pure question; the others must manipulate evidence or change the scene conditions. Do not use observation, waiting, silence, small talk, or atmosphere commentary unless it creates a new deadline, discovery, refusal, movement, or relationship consequence. The set must include both a lower-risk option and a medium-or-higher-risk option.\n",
     );
+    let streak = crate::narrative::same_scene_streak(game);
+    if streak >= crate::narrative::SCENE_STREAK_FORCE {
+        out.push_str(&format!(
+            "같은 장면 {streak}턴 연속 — 상황 선택지는 반드시 장소/시간 변화를 제안.\n"
+        ));
+    }
     out
 }
 
@@ -211,6 +235,8 @@ pub enum ChoiceQualityIssue {
     ImpossibleWorldControl { indices: Vec<usize> },
     MissingPlayerAction { indices: Vec<usize> },
     RepeatsRejectedOffer { index: usize },
+    SceneStuckNeedsMove { streak: u32 },
+    RepeatsRecentLabel { index: usize },
 }
 
 /// Result of the deterministic pre-display choice quality gate.
@@ -239,6 +265,8 @@ impl ChoiceQualityReport {
                     | ChoiceQualityIssue::ImpossibleWorldControl { .. }
                     | ChoiceQualityIssue::MissingPlayerAction { .. }
                     | ChoiceQualityIssue::RepeatsRejectedOffer { .. }
+                    | ChoiceQualityIssue::SceneStuckNeedsMove { .. }
+                    | ChoiceQualityIssue::RepeatsRecentLabel { .. }
             )
         })
     }
@@ -301,6 +329,13 @@ impl ChoiceQualityReport {
                 )),
                 ChoiceQualityIssue::RepeatsRejectedOffer { index } => messages.push(format!(
                     "{}번 선택지가 이미 거절된 제안을 다시 표현했다",
+                    index + 1
+                )),
+                ChoiceQualityIssue::SceneStuckNeedsMove { streak } => messages.push(format!(
+                    "같은 장면이 {streak}턴 연속이다. 상황 선택지로 장소 이동이나 시간 변화를 반드시 넣는다"
+                )),
+                ChoiceQualityIssue::RepeatsRecentLabel { index } => messages.push(format!(
+                    "{}번 선택지가 최근에 고른 라벨과 겹친다. 다른 행동을 제시한다",
                     index + 1
                 )),
             }
@@ -497,6 +532,28 @@ pub fn assess_choices(
                 .any(|old| labels_repeat(&old.label, &choice.label))
             {
                 issues.push(ChoiceQualityIssue::RepeatsRejectedOffer { index });
+            }
+        }
+    }
+
+    let streak = crate::narrative::same_scene_streak(game);
+    if streak >= crate::narrative::SCENE_STREAK_FORCE {
+        let has_situation = choices
+            .iter()
+            .any(|choice| crate::narrative::classify_choice(choice) == "situation");
+        if !has_situation {
+            issues.push(ChoiceQualityIssue::SceneStuckNeedsMove { streak });
+        }
+    }
+
+    let recent_labels = crate::narrative::recent_choice_labels(game);
+    if !recent_labels.is_empty() {
+        for (index, choice) in choices.iter().enumerate() {
+            let haystack = format!("{} {}", choice.label, choice.intent);
+            if recent_labels.iter().any(|recent| {
+                labels_repeat(recent, &choice.label) || text_matches(recent, &haystack)
+            }) {
+                issues.push(ChoiceQualityIssue::RepeatsRecentLabel { index });
             }
         }
     }
@@ -1109,6 +1166,84 @@ mod tests {
         assert!(report.issues.iter().any(
             |issue| matches!(issue, ChoiceQualityIssue::MissingPlayerAction { indices } if indices == &[2])
         ));
+    }
+
+    #[test]
+    fn scene_stuck_without_situation_choice_is_hard_reject() {
+        let pack = crate::tests_support::sample_pack();
+        let mut game = crate::engine::EngineState::initial(&pack).game;
+        game.numbers.insert(
+            "__storytui.narrative.same_scene_streak".to_string(),
+            3,
+        );
+        let choices = vec![
+            choice(
+                "유나에게 솔직히 사과한다",
+                "관계의 거리를 직접 바꾼다",
+                RiskLevel::High,
+                "사과를 받아들일지 즉시 드러난다.",
+            ),
+            choice(
+                "젖은 편지 봉투의 발신인을 확인한다",
+                "탁자 위 단서의 출처를 조사한다",
+                RiskLevel::Low,
+                "새 사실 하나를 얻는 대신 캐묻는 인상을 줄 수 있다.",
+            ),
+            choice(
+                "전시회 날 약속에 대해 진심을 묻는다",
+                "관계의 오해를 솔직히 다룬다",
+                RiskLevel::Medium,
+                "진심이 신뢰를 움직일지 시험한다.",
+            ),
+        ];
+
+        let report = assess_choices(&game, &choices, 3, None);
+        assert!(
+            report.issues.iter().any(|issue| {
+                matches!(issue, ChoiceQualityIssue::SceneStuckNeedsMove { streak: 3 })
+            }),
+            "{report:?}"
+        );
+        assert!(!report.is_playable());
+    }
+
+    #[test]
+    fn recent_choice_label_repeat_is_hard_reject() {
+        let pack = crate::tests_support::sample_pack();
+        let mut game = crate::engine::EngineState::initial(&pack).game;
+        game.strings.insert(
+            "__storytui.narrative.recent_choice_labels".to_string(),
+            "카페가 닫기 전에 강변을 걷자고 제안한다".to_string(),
+        );
+        let choices = vec![
+            choice(
+                "3년 전 일을 먼저 사과해 유나의 답을 요구한다",
+                "회피하던 갈등을 직접 다룬다",
+                RiskLevel::High,
+                "솔직함이 신뢰와 긴장 중 어느 쪽을 움직일지 시험한다.",
+            ),
+            choice(
+                "젖은 편지 봉투의 발신인을 확인한다",
+                "탁자 위 단서의 출처를 확인한다",
+                RiskLevel::Low,
+                "새 사실 하나를 얻는 대신 캐묻는 인상을 줄 수 있다.",
+            ),
+            choice(
+                "카페가 닫기 전에 강변을 걷자고 제안한다",
+                "장소와 대화의 조건을 바꾼다",
+                RiskLevel::Medium,
+                "현재 질문을 미룬 채 다음 장면의 장소가 달라진다.",
+            ),
+        ];
+
+        let report = assess_choices(&game, &choices, 3, None);
+        assert!(
+            report.issues.iter().any(|issue| {
+                matches!(issue, ChoiceQualityIssue::RepeatsRecentLabel { index: 2 })
+            }),
+            "{report:?}"
+        );
+        assert!(!report.is_playable());
     }
 
     fn choice(label: &str, intent: &str, risk: RiskLevel, preview: &str) -> Choice {

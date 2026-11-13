@@ -170,6 +170,17 @@ pub struct EngineState {
     /// never re-dispatches on its own. A non-empty side accept, a regular
     /// turn request/commit, or a rewind clears it. Session memory only.
     pub empty_side_result: bool,
+    /// Consecutive hard narration-quality failures (after the automatic
+    /// repair budget is spent). Bumped by
+    /// [`narration_repair_failed`]; cleared on a successful normal-turn
+    /// accept. Drives forced-beat injection on regenerate for weak local
+    /// models. Session memory only.
+    pub quality_pressure: u8,
+    /// Last hard-fail [`crate::narration_quality::NarrationQualityReport`]
+    /// retained for diagnostics after the repair budget is exhausted.
+    /// Cleared on a successful normal-turn accept. Session memory only.
+    pub last_narration_quality:
+        Option<crate::narration_quality::NarrationQualityReport>,
 }
 
 /// A committed-state snapshot the player can rewind to via
@@ -215,10 +226,11 @@ pub struct PendingGeneration {
     /// Choice sets rejected during this refresh cycle. A retry receives and
     /// validates against them so it cannot repeat the first failed rewrite.
     pub choice_refresh_rejected: Vec<story_model::Choice>,
-    /// Present only during the one engine-owned narration repair attempt.
-    /// The single-pass variant retains the first draft as the authority for
-    /// choices, patch, and summary; the Writer variant retains only the
-    /// rejected prose because its Director plan is already authoritative.
+    /// Present during an engine-owned narration repair (at most two automatic
+    /// attempts). The single-pass variant retains the first draft as the
+    /// authority for choices, patch, and summary; the Writer variant retains
+    /// only the rejected prose because its Director plan is already
+    /// authoritative.
     pub narration_repair: Option<NarrationRepair>,
     /// `Some` only for the side-generation family
     /// ([`SideGenerationKind::Continue`] / [`SideGenerationKind::Suggest`] /
@@ -235,16 +247,32 @@ pub struct PendingGeneration {
     pub lorebook_activations: Vec<story_model::LorebookActivation>,
 }
 
-/// State retained while a rejected narration is rewritten once.
+/// State retained while a rejected narration is rewritten (up to two automatic
+/// attempts). `attempt` is 1-based.
 #[derive(Clone, Debug)]
 pub enum NarrationRepair {
     SinglePass {
         authoritative: Box<GeneratedTurnDraft>,
+        attempt: u8,
     },
     Writer {
         rejected_narration: String,
+        attempt: u8,
     },
 }
+
+impl NarrationRepair {
+    /// 1-based automatic repair attempt number.
+    pub fn attempt(&self) -> u8 {
+        match self {
+            Self::SinglePass { attempt, .. } | Self::Writer { attempt, .. } => *attempt,
+        }
+    }
+}
+
+/// Maximum automatic narration-repair attempts before surfacing a recoverable
+/// quality overlay.
+const MAX_NARRATION_REPAIR_ATTEMPTS: u8 = 2;
 
 /// Purpose discriminator for the side-generation family
 /// ([`EngineCommand::ContinueNarration`] / [`EngineCommand::SuggestAction`] /
@@ -313,6 +341,8 @@ impl EngineState {
             current_variants: None,
             truncation: TruncationStatus::None,
             empty_side_result: false,
+            quality_pressure: 0,
+            last_narration_quality: None,
         }
     }
 
@@ -382,6 +412,8 @@ impl EngineState {
             current_variants: None,
             truncation: TruncationStatus::None,
             empty_side_result: false,
+            quality_pressure: 0,
+            last_narration_quality: None,
         }
     }
 }
@@ -599,6 +631,8 @@ fn reduce_start_new_game(state: &EngineState, pack: &StoryPack) -> Result<Transi
     // A fresh game retires any per-turn badges from the previous session.
     next.truncation = TruncationStatus::None;
     next.empty_side_result = false;
+    next.quality_pressure = 0;
+    next.last_narration_quality = None;
 
     let loading_view = build_view(&next, pack, Some(&pending), None);
     let effects = if state.use_director_writer {
@@ -814,26 +848,42 @@ fn reduce_regenerate(state: &EngineState, pack: &StoryPack) -> Transition {
             ),
         }
     } else if state.use_director_writer {
+        let mut request = build_director_request(
+            generation_id,
+            pack,
+            &pending.checkpoint,
+            pending.player_action.as_ref(),
+            selected_choice,
+        );
+        apply_quality_pressure_escape(
+            &mut request.messages,
+            &mut request.temperature,
+            state.quality_pressure,
+            &pending.checkpoint.history,
+        );
         EngineEffect::RequestDirector {
             generation_id,
-            request: build_director_request(
-                generation_id,
-                pack,
-                &pending.checkpoint,
-                pending.player_action.as_ref(),
-                selected_choice,
-            ),
+            request,
         }
     } else {
+        let mut request = build_turn_request(
+            generation_id,
+            pack,
+            &pending.checkpoint,
+            pending.player_action.as_ref(),
+            selected_choice,
+        );
+        apply_quality_pressure_escape_with_penalties(
+            &mut request.messages,
+            &mut request.temperature,
+            Some(&mut request.frequency_penalty),
+            Some(&mut request.presence_penalty),
+            state.quality_pressure,
+            &pending.checkpoint.history,
+        );
         EngineEffect::RequestGeneration {
             generation_id,
-            request: build_turn_request(
-                generation_id,
-                pack,
-                &pending.checkpoint,
-                pending.player_action.as_ref(),
-                selected_choice,
-            ),
+            request,
         }
     };
     let effects = vec![
@@ -936,7 +986,7 @@ fn reduce_accept(
     // generated prose (plus its usage accounting).
     let mut accepted_draft = draft;
     let mut repair_was_distinct = true;
-    if let Some(NarrationRepair::SinglePass { authoritative }) = &pending.narration_repair {
+    if let Some(NarrationRepair::SinglePass { authoritative, .. }) = &pending.narration_repair {
         repair_was_distinct = crate::narration_quality::repair_is_distinct(
             &authoritative.narration,
             &accepted_draft.narration,
@@ -970,23 +1020,47 @@ fn reduce_accept(
                     .push(crate::narration_quality::NarrationQualityIssue::UnchangedRepair);
             }
             if !quality.is_ok() {
-                if pending.narration_repair.is_some() {
-                    // Repair budget spent. Soft quality issues (motif reuse /
-                    // high similarity / stalled progress) must not freeze a
-                    // long play session on a weak local model — accept and
-                    // continue. Empty / exact-duplicate / unchanged repairs
-                    // still hard-fail.
-                    if quality.blocks_commit_after_repair() {
-                        return Ok(narration_repair_failed(state, pack, pending.generation_id));
+                let current_attempt = pending
+                    .narration_repair
+                    .as_ref()
+                    .map(NarrationRepair::attempt);
+                match current_attempt {
+                    None => {
+                        return Ok(begin_single_pass_narration_repair(
+                            state,
+                            pack,
+                            pending,
+                            accepted_draft,
+                            &quality,
+                            1,
+                        ));
                     }
-                } else {
-                    return Ok(begin_single_pass_narration_repair(
-                        state,
-                        pack,
-                        pending,
-                        accepted_draft,
-                        &quality,
-                    ));
+                    Some(attempt)
+                        if attempt < MAX_NARRATION_REPAIR_ATTEMPTS
+                            && quality.blocks_commit_after_repair() =>
+                    {
+                        return Ok(begin_single_pass_narration_repair(
+                            state,
+                            pack,
+                            pending,
+                            accepted_draft,
+                            &quality,
+                            attempt + 1,
+                        ));
+                    }
+                    Some(_) if quality.blocks_commit_after_repair() => {
+                        // Repair budget spent on hard issues. Motif-only /
+                        // stalled soft leftovers fall through and commit.
+                        return Ok(narration_repair_failed(
+                            state,
+                            pack,
+                            pending.generation_id,
+                            quality,
+                        ));
+                    }
+                    Some(_) => {
+                        // Soft leftover after a repair attempt: accept.
+                    }
                 }
             }
             let choice_context = choice_quality_context(pending);
@@ -1048,6 +1122,7 @@ fn begin_single_pass_narration_repair(
     pending: &PendingGeneration,
     rejected: GeneratedTurnDraft,
     report: &crate::narration_quality::NarrationQualityReport,
+    attempt: u8,
 ) -> Transition {
     let generation_id = Uuid::new_v4();
     let selected_choice = selected_choice_from_pending(pending);
@@ -1058,33 +1133,55 @@ fn begin_single_pass_narration_repair(
         pending.player_action.as_ref(),
         selected_choice.as_ref(),
     );
+    // Keep the first draft's choices/patch/summary as authority across retries.
+    let authoritative = match &pending.narration_repair {
+        Some(NarrationRepair::SinglePass { authoritative, .. }) => (**authoritative).clone(),
+        _ => rejected.clone(),
+    };
     let rejected_envelope = story_model::serde_json::json!({
         "narration": &rejected.narration,
-        "choices": &rejected.choices,
-        "state_patch": &rejected.proposed_patch,
-        "summary": &rejected.summary,
+        "choices": &authoritative.choices,
+        "state_patch": &authoritative.proposed_patch,
+        "summary": &authoritative.summary,
     });
     request.messages.push(story_model::ChatMessage {
         role: "assistant".to_string(),
         content: rejected_envelope.to_string(),
     });
+    let repair_body = quality_repair_user_message(
+        report,
+        &pending.checkpoint.history,
+        attempt,
+        &pending.checkpoint,
+        pack,
+    );
+    let attempt_note = if attempt >= MAX_NARRATION_REPAIR_ATTEMPTS {
+        "This is the final automatic repair attempt."
+    } else {
+        "A second automatic repair is available if this still hard-fails."
+    };
     request.messages.push(story_model::ChatMessage {
         role: "user".to_string(),
         content: format!(
             "# Narration-only quality repair\n\
-             The engine rejected only the narration for these reasons:\n- {}\n\
+             {repair_body}\n\
              Return one complete valid JSON envelope. Rewrite `narration` from scratch in natural Korean. \
              Preserve `choices`, `state_patch`, and `summary` exactly; the engine will ignore changes to them. \
-             Do not explain the repair or mention these instructions. This is the only automatic repair attempt.",
-            report.repair_instructions()
+             Do not explain the repair or mention these instructions. {attempt_note}"
         ),
     });
+    if attempt >= 2 {
+        bump_quality_escape_temperature(&mut request.temperature);
+        request.frequency_penalty = Some(0.5);
+        request.presence_penalty = Some(0.35);
+    }
 
     let mut next = clone_state(state);
     let mut repaired_pending = pending.clone();
     repaired_pending.generation_id = generation_id;
     repaired_pending.narration_repair = Some(NarrationRepair::SinglePass {
-        authoritative: Box::new(rejected),
+        authoritative: Box::new(authoritative),
+        attempt,
     });
     next.pending = Some(repaired_pending.clone());
     next.retry_pending = None;
@@ -1107,8 +1204,9 @@ fn narration_repair_failed(
     state: &EngineState,
     pack: &StoryPack,
     generation_id: Uuid,
+    quality: crate::narration_quality::NarrationQualityReport,
 ) -> Transition {
-    reduce_provider_failed(
+    let mut failed = reduce_provider_failed(
         state,
         pack,
         generation_id,
@@ -1119,7 +1217,144 @@ fn narration_repair_failed(
                 .to_string(),
             recoverable: true,
         },
-    )
+    );
+    failed.state.quality_pressure = failed.state.quality_pressure.saturating_add(1);
+    failed.state.last_narration_quality = Some(quality);
+    failed
+}
+
+/// Shared repair-instruction body. Attempt ≥1 appends the required lead;
+/// attempt ≥2 adds the forced-beat escape hatch with banned motifs.
+fn quality_repair_user_message(
+    report: &crate::narration_quality::NarrationQualityReport,
+    history: &[HistoryEntry],
+    attempt: u8,
+    game: &GameState,
+    pack: &StoryPack,
+) -> String {
+    let mut body = format!(
+        "The engine rejected the narration for these reasons:\n- {}",
+        report.repair_instructions()
+    );
+    if attempt >= 1 {
+        body.push_str(&format!(
+            "\n# 필수 전진 (engine)\n{}\n금지: 최근과 같은 질문 유형(왜 불렀는지/왜 떠났는지/정해 두고 묻는지)을 다시 묻기.\n",
+            crate::narrative::required_lead(game, pack)
+        ));
+    }
+    if attempt >= 2 {
+        body.push('\n');
+        body.push_str(&forced_scene_advance_directive(
+            history,
+            report,
+            attempt,
+            game,
+            pack,
+        ));
+    }
+    body
+}
+
+fn forced_scene_advance_directive(
+    history: &[HistoryEntry],
+    report: &crate::narration_quality::NarrationQualityReport,
+    pressure: u8,
+    game: &GameState,
+    pack: &StoryPack,
+) -> String {
+    let motifs = crate::narration_quality::recurring_motifs(history);
+    let banned = if motifs.is_empty() {
+        "(none extracted)".to_string()
+    } else {
+        motifs.join(", ")
+    };
+    let high_sim: Vec<String> = report
+        .issues
+        .iter()
+        .filter_map(|issue| match issue {
+            crate::narration_quality::NarrationQualityIssue::HighSimilarity { turn }
+            | crate::narration_quality::NarrationQualityIssue::ExactDuplicate { turn } => {
+                Some(turn.to_string())
+            }
+            _ => None,
+        })
+        .collect();
+    let mut text = format!(
+        "# 강제 장면 전진\n\
+         Banned recurring motifs: {banned}\n\
+         You MUST advance with a new observable beat (new info, physical change, or NPC question not used in the last two turns). Do not reuse banned phrases. Do not rewrite the same scene mood.\n\
+         Pressure level: {pressure}\n\
+         # 필수 전진 (engine)\n\
+         {}\n\
+         금지: 최근과 같은 질문 유형(왜 불렀는지/왜 떠났는지/정해 두고 묻는지)을 다시 묻기.",
+        crate::narrative::required_lead(game, pack)
+    );
+    if !high_sim.is_empty() {
+        text.push_str(&format!(
+            "\nHighSimilarity/ExactDuplicate against turn(s): {}.",
+            high_sim.join(", ")
+        ));
+    }
+    text
+}
+
+fn bump_quality_escape_temperature(temperature: &mut f32) {
+    *temperature = (*temperature + 0.15).min(1.15);
+}
+
+/// When regenerate runs under quality pressure, inject a forced-beat directive
+/// and bump sampling temperature so the next draft is less likely to replay.
+fn apply_quality_pressure_escape(
+    messages: &mut Vec<story_model::ChatMessage>,
+    temperature: &mut f32,
+    quality_pressure: u8,
+    history: &[HistoryEntry],
+) {
+    apply_quality_pressure_escape_with_penalties(
+        messages,
+        temperature,
+        None,
+        None,
+        quality_pressure,
+        history,
+    );
+}
+
+/// Like [`apply_quality_pressure_escape`], optionally setting TurnRequest
+/// frequency/presence penalties when regenerating under pressure.
+fn apply_quality_pressure_escape_with_penalties(
+    messages: &mut Vec<story_model::ChatMessage>,
+    temperature: &mut f32,
+    frequency_penalty: Option<&mut Option<f32>>,
+    presence_penalty: Option<&mut Option<f32>>,
+    quality_pressure: u8,
+    history: &[HistoryEntry],
+) {
+    if quality_pressure == 0 {
+        return;
+    }
+    let motifs = crate::narration_quality::recurring_motifs(history);
+    let banned = if motifs.is_empty() {
+        "(none extracted)".to_string()
+    } else {
+        motifs.join(", ")
+    };
+    messages.push(story_model::ChatMessage {
+        role: "user".to_string(),
+        content: format!(
+            "# 강제 장면 전진\n\
+             Banned recurring motifs: {banned}\n\
+             You MUST advance with a new observable beat (new info, physical change, or NPC question not used in the last two turns). Do not reuse banned phrases. Do not rewrite the same scene mood.\n\
+             Pressure level: {quality_pressure}"
+        ),
+    });
+    bump_quality_escape_temperature(temperature);
+    if let Some(slot) = frequency_penalty {
+        *slot = Some(0.5);
+    }
+    if let Some(slot) = presence_penalty {
+        *slot = Some(0.35);
+    }
 }
 
 /// Begin a choice-only refresh from the already committed current turn. The
@@ -1781,6 +2016,8 @@ fn build_side_request(
             &pack.rules,
             !pack.characters.is_empty(),
         )),
+        frequency_penalty: None,
+        presence_penalty: None,
     }
 }
 
@@ -2050,7 +2287,7 @@ fn reduce_accept_writer_finish(
         None,
         pending.narration_repair.is_none(),
     );
-    if let Some(NarrationRepair::Writer { rejected_narration }) = &pending.narration_repair
+    if let Some(NarrationRepair::Writer { rejected_narration, .. }) = &pending.narration_repair
         && !crate::narration_quality::repair_is_distinct(rejected_narration, &writer.narration)
     {
         quality
@@ -2058,20 +2295,47 @@ fn reduce_accept_writer_finish(
             .push(crate::narration_quality::NarrationQualityIssue::UnchangedRepair);
     }
     if !quality.is_ok() {
-        if pending.narration_repair.is_some() {
-            if quality.blocks_commit_after_repair() {
-                return Ok(narration_repair_failed(state, pack, pending.generation_id));
+        let current_attempt = pending
+            .narration_repair
+            .as_ref()
+            .map(NarrationRepair::attempt);
+        match current_attempt {
+            None => {
+                return Ok(begin_writer_narration_repair(
+                    state,
+                    pack,
+                    pending,
+                    validated,
+                    writer.narration,
+                    &quality,
+                    1,
+                ));
             }
-            // Soft leftover issues: accept Writer prose and keep playing.
-        } else {
-            return Ok(begin_writer_narration_repair(
-                state,
-                pack,
-                pending,
-                validated,
-                writer.narration,
-                &quality,
-            ));
+            Some(attempt)
+                if attempt < MAX_NARRATION_REPAIR_ATTEMPTS
+                    && quality.blocks_commit_after_repair() =>
+            {
+                return Ok(begin_writer_narration_repair(
+                    state,
+                    pack,
+                    pending,
+                    validated,
+                    writer.narration,
+                    &quality,
+                    attempt + 1,
+                ));
+            }
+            Some(_) if quality.blocks_commit_after_repair() => {
+                return Ok(narration_repair_failed(
+                    state,
+                    pack,
+                    pending.generation_id,
+                    quality,
+                ));
+            }
+            Some(_) => {
+                // Soft leftover issues: accept Writer prose and keep playing.
+            }
         }
     }
     let (mut next, audit) = assemble_accepted_2stage_turn(state, pack, pending, validated, writer);
@@ -2106,6 +2370,7 @@ fn begin_writer_narration_repair(
     validated: &ValidatedPlan,
     rejected_narration: String,
     report: &crate::narration_quality::NarrationQualityReport,
+    attempt: u8,
 ) -> Transition {
     let generation_id = Uuid::new_v4();
     let digest = plan_digest(&validated.plan);
@@ -2121,21 +2386,38 @@ fn begin_writer_narration_repair(
         role: "assistant".to_string(),
         content: rejected_narration.clone(),
     });
+    let repair_body = quality_repair_user_message(
+        report,
+        &pending.checkpoint.history,
+        attempt,
+        &pending.checkpoint,
+        pack,
+    );
+    let attempt_note = if attempt >= MAX_NARRATION_REPAIR_ATTEMPTS {
+        "This is the final automatic repair attempt."
+    } else {
+        "A second automatic repair is available if this still hard-fails."
+    };
     request.messages.push(story_model::ChatMessage {
         role: "user".to_string(),
         content: format!(
             "# Writer narration quality repair\n\
-             The engine rejected that narration for these reasons:\n- {}\n\
+             {repair_body}\n\
              Rewrite the entire player-visible Korean narration from scratch while following the same validated Director plan. \
-             Emit narration only. Do not explain the repair. This is the only automatic repair attempt.",
-            report.repair_instructions()
+             Emit narration only. Do not explain the repair. {attempt_note}"
         ),
     });
+    if attempt >= 2 {
+        bump_quality_escape_temperature(&mut request.temperature);
+    }
 
     let mut next = clone_state(state);
     let mut repaired_pending = pending.clone();
     repaired_pending.generation_id = generation_id;
-    repaired_pending.narration_repair = Some(NarrationRepair::Writer { rejected_narration });
+    repaired_pending.narration_repair = Some(NarrationRepair::Writer {
+        rejected_narration,
+        attempt,
+    });
     next.pending = Some(repaired_pending.clone());
     next.retry_pending = None;
     next.lineage.push(generation_id);
@@ -2295,6 +2577,9 @@ fn assemble_accepted_2stage_turn(
         // side-result flag.
         truncation: TruncationStatus::None,
         empty_side_result: false,
+        // Successful normal-turn accept clears quality escape diagnostics.
+        quality_pressure: 0,
+        last_narration_quality: None,
     };
     // The writer lint pass is non-fatal; the offending text has already been
     // stripped. Surfacing it through the engine is future work (a tracing
@@ -2410,6 +2695,9 @@ fn assemble_accepted_turn(
         // truncation badge retires with the displayed turn it described.
         truncation: TruncationStatus::None,
         empty_side_result: false,
+        // Successful normal-turn accept clears quality escape diagnostics.
+        quality_pressure: 0,
+        last_narration_quality: None,
     };
     (next, result.change_log)
 }
@@ -2900,6 +3188,8 @@ fn build_choice_refresh_request(
                 ),
             },
         ],
+        frequency_penalty: None,
+        presence_penalty: None,
     }
 }
 
@@ -2980,6 +3270,8 @@ fn build_turn_request(
             &pack.rules,
             !pack.characters.is_empty(),
         )),
+        frequency_penalty: None,
+        presence_penalty: None,
     }
 }
 
@@ -3338,6 +3630,8 @@ fn clone_state(state: &EngineState) -> EngineState {
         current_variants: state.current_variants.clone(),
         truncation: state.truncation,
         empty_side_result: state.empty_side_result,
+        quality_pressure: state.quality_pressure,
+        last_narration_quality: state.last_narration_quality.clone(),
     }
 }
 
