@@ -131,9 +131,9 @@ impl LiveSession {
     }
 
     async fn run_command(&mut self, cmd: EngineCommand, label: &str) {
-        // Weak local models often need a couple of [R] regenerations for
-        // director/choice quality; allow a small budget before failing the soak.
-        self.run_command_inner(cmd, label, 3).await;
+        // Weak local models often need several [R] regenerations for quality
+        // gates on long soaks; allow a small budget before failing the soak.
+        self.run_command_inner(cmd, label, 5).await;
     }
 
     async fn run_command_inner(&mut self, cmd: EngineCommand, label: &str, recovers_left: u32) {

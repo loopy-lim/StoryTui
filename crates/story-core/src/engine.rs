@@ -971,15 +971,23 @@ fn reduce_accept(
             }
             if !quality.is_ok() {
                 if pending.narration_repair.is_some() {
-                    return Ok(narration_repair_failed(state, pack, pending.generation_id));
+                    // Repair budget spent. Soft quality issues (motif reuse /
+                    // high similarity / stalled progress) must not freeze a
+                    // long play session on a weak local model — accept and
+                    // continue. Empty / exact-duplicate / unchanged repairs
+                    // still hard-fail.
+                    if quality.blocks_commit_after_repair() {
+                        return Ok(narration_repair_failed(state, pack, pending.generation_id));
+                    }
+                } else {
+                    return Ok(begin_single_pass_narration_repair(
+                        state,
+                        pack,
+                        pending,
+                        accepted_draft,
+                        &quality,
+                    ));
                 }
-                return Ok(begin_single_pass_narration_repair(
-                    state,
-                    pack,
-                    pending,
-                    accepted_draft,
-                    &quality,
-                ));
             }
             let choice_context = choice_quality_context(pending);
             let choice_quality = crate::choice_quality::assess_choices(
@@ -2051,16 +2059,20 @@ fn reduce_accept_writer_finish(
     }
     if !quality.is_ok() {
         if pending.narration_repair.is_some() {
-            return Ok(narration_repair_failed(state, pack, pending.generation_id));
+            if quality.blocks_commit_after_repair() {
+                return Ok(narration_repair_failed(state, pack, pending.generation_id));
+            }
+            // Soft leftover issues: accept Writer prose and keep playing.
+        } else {
+            return Ok(begin_writer_narration_repair(
+                state,
+                pack,
+                pending,
+                validated,
+                writer.narration,
+                &quality,
+            ));
         }
-        return Ok(begin_writer_narration_repair(
-            state,
-            pack,
-            pending,
-            validated,
-            writer.narration,
-            &quality,
-        ));
     }
     let (mut next, audit) = assemble_accepted_2stage_turn(state, pack, pending, validated, writer);
     // AC-5/AC-8: a "length" finish means the output token cap cut the prose

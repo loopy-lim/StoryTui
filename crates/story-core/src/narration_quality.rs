@@ -50,6 +50,22 @@ impl NarrationQualityReport {
         self.issues.is_empty()
     }
 
+    /// Issues that must still reject a turn after the one allowed narration
+    /// repair. Soft issues (`ReusedMotifs`, `StalledProgress`,
+    /// `HighSimilarity`) often reappear forever on weak local models; blocking
+    /// the player there freezes long sessions. Empty prose, exact duplicates,
+    /// and punctuation-only "repairs" stay hard stops.
+    pub fn blocks_commit_after_repair(&self) -> bool {
+        self.issues.iter().any(|issue| {
+            matches!(
+                issue,
+                NarrationQualityIssue::Empty
+                    | NarrationQualityIssue::ExactDuplicate { .. }
+                    | NarrationQualityIssue::UnchangedRepair
+            )
+        })
+    }
+
     /// Concise repair instructions suitable for the provider prompt.
     pub fn repair_instructions(&self) -> String {
         let mut lines = Vec::new();
@@ -630,6 +646,31 @@ mod tests {
             "유나는 초대장을 내밀었다.",
             "유나는, 초대장을 내밀었다!"
         ));
+    }
+
+    #[test]
+    fn soft_issues_do_not_block_commit_after_repair() {
+        let soft = NarrationQualityReport {
+            issues: vec![
+                NarrationQualityIssue::ReusedMotifs {
+                    motifs: vec!["시계".into(), "시선".into(), "창밖".into()],
+                },
+                NarrationQualityIssue::HighSimilarity { turn: 4 },
+                NarrationQualityIssue::StalledProgress,
+            ],
+        };
+        assert!(!soft.is_ok());
+        assert!(!soft.blocks_commit_after_repair());
+
+        let hard = NarrationQualityReport {
+            issues: vec![
+                NarrationQualityIssue::ReusedMotifs {
+                    motifs: vec!["시계".into()],
+                },
+                NarrationQualityIssue::ExactDuplicate { turn: 3 },
+            ],
+        };
+        assert!(hard.blocks_commit_after_repair());
     }
 
     #[test]
