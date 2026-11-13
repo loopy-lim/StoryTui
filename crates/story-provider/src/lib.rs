@@ -9,6 +9,7 @@
 //! - recovery parser (W5.3): strict `GeneratedTurn` JSON parse + limited repair.
 //! - [`envelope`] is a stub — the real OpenAI HTTP client lands in W6.
 
+pub mod builtin;
 pub mod config;
 pub mod envelope;
 pub mod error;
@@ -19,6 +20,10 @@ pub mod provider;
 pub mod recovery;
 pub mod sse;
 
+pub use builtin::{
+    BUILTIN_BASE_URL, BUILTIN_DEFAULT_MODEL, BUILTIN_MODELS, BUILTIN_PROVIDER_ID,
+    BuiltinStoryProvider, builtin_provider_config, is_builtin_config,
+};
 pub use config::{MaxTokensField, ProviderConfig, StructuredOutputMode};
 pub use mock::{MockProvider, MockResponse};
 pub use openai_compatible::{OpenAiCompatibleProvider, is_loopback_base_url};

@@ -35,11 +35,21 @@ pub trait LlmProvider: Send + Sync {
     /// Stable provider id (e.g. `"mock"`, `"openai-http"`), surfaced in logs.
     fn id(&self) -> &str;
 
+    /// Active model identifier reported by this provider (empty when unset).
+    fn model_name(&self) -> &str {
+        ""
+    }
+
     /// Capabilities advertised by this provider.
     fn capabilities(&self) -> ProviderCapabilities;
 
     /// Current health, used by the status bar / coordinator (FR-037).
     async fn health(&self) -> Result<ProviderHealth, ProviderError>;
+
+    /// Discover models exposed by this provider.
+    async fn list_models(&self) -> Result<Vec<String>, ProviderError> {
+        Ok(Vec::new())
+    }
 
     /// Generate one turn. Honors `cancel`: if cancelled during a latency wait,
     /// returns [`ProviderError::Cancelled`] and discards any in-flight draft.

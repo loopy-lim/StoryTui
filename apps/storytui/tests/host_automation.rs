@@ -14,7 +14,9 @@ use story_core::engine::{EngineState, build_view, reduce};
 use story_core::engine_cmd::EngineCommand;
 use story_model::ProviderHealth;
 use story_model::uuid::Uuid;
-use story_provider::{OpenAiCompatibleProvider, ProviderConfig, ProviderError};
+use story_provider::{
+    BUILTIN_PROVIDER_ID, LlmProvider, ProviderConfig, ProviderError, builtin_provider_config,
+};
 use story_tts::{TtsConfig, TtsService};
 use story_tui::App;
 use tokio::sync::mpsc::unbounded_channel;
@@ -196,7 +198,7 @@ struct Session {
     app: App,
     pack: story_model::StoryPack,
     provider_config: ProviderConfig,
-    provider: Arc<OpenAiCompatibleProvider>,
+    provider: Arc<dyn LlmProvider>,
     user_settings: UserSettings,
     config: RuntimeConfig,
     save_store: story_persistence::SaveStore,
@@ -224,8 +226,7 @@ async fn session_for(provider_config: ProviderConfig) -> Session {
     let pack = story_core::tests_support::sample_pack();
     let engine = EngineState::initial(&pack);
     let app = App::new(build_view(&engine, &pack, None, None));
-    let provider =
-        Arc::new(OpenAiCompatibleProvider::new(provider_config.clone()).expect("provider"));
+    let provider = host::settings::build_provider(&provider_config).expect("provider");
     let config = RuntimeConfig {
         provider: provider_config.clone(),
         providers: vec![provider_config.clone()],
@@ -1149,4 +1150,260 @@ async fn empty_side_result_is_redispatched_once_then_guided() {
     .expect("post accept");
     assert!(session.engine.pending.is_none(), "no second re-dispatch");
     assert_eq!(session.app.story_notice(), Some(host::EMPTY_SIDE_NOTICE));
+}
+
+// ---------------------------------------------------------------------------
+// Offline built-in provider + automatic server promotion
+// ---------------------------------------------------------------------------
+
+/// Receive and apply `WriterChunk` frames until the final turn/stage message arrives.
+async fn next_non_chunk_message(session: &mut Session) -> HostMessage {
+    loop {
+        let message = next_generation(session).await;
+        if let HostMessage::WriterChunk { .. } = &message {
+            let _ = handle(session, message).await;
+            continue;
+        }
+        return message;
+    }
+}
+
+/// Drive provider results until the engine is idle (no pending generation).
+/// Builtin openings occasionally start a choice-refresh after the first accept.
+async fn settle_until_idle(session: &mut Session) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while session.engine.pending.is_some() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for pending generation to settle"
+        );
+        let message = next_non_chunk_message(session).await;
+        let _ = handle(session, message).await;
+        if let Some(err) = session.app.view.error.clone() {
+            panic!(
+                "unexpected error while settling: {} ({}) - {}",
+                err.title_ko, err.code, err.message_ko
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn builtin_offline_drives_full_opening_and_choice_turns_through_host_dispatch() {
+    let mut session = start_session(builtin_provider_config()).await;
+    settle_until_idle(&mut session).await;
+    assert_eq!(session.app.view.status.turn, 1, "opening turn committed");
+    assert!(session.app.view.error.is_none());
+    assert!(session.app.view.choices.len() >= 3);
+
+    let choice_id = session.app.view.choices[0].id.clone();
+    host::dispatch(
+        EngineCommand::SubmitChoice { choice_id },
+        &mut session.engine,
+        &mut session.app,
+        &session.pack,
+        &session.provider,
+        &session.config,
+        &session.save_store,
+        &session.tts,
+        &mut session.images,
+        &session.tx,
+        &mut session.cancellation,
+    )
+    .await
+    .expect("submit choice");
+    settle_until_idle(&mut session).await;
+    assert_eq!(session.app.view.status.turn, 2);
+    assert!(session.app.view.error.is_none());
+    assert!(!session.app.view.choices.is_empty());
+}
+
+#[tokio::test]
+async fn builtin_auto_fallback_promotes_to_live_server_on_reprobe_unless_pinned() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": "live-model"}]
+        })))
+        .mount(&server)
+        .await;
+
+    let live_http = provider_config_for(&server.uri());
+
+    // Auto-fallback builtin should promote to the live HTTP server on reprobe.
+    let mut auto = session_for(builtin_provider_config()).await;
+    auto.config.providers = vec![live_http.clone()];
+    auto.provider_config = builtin_provider_config();
+    auto.provider = host::settings::build_provider(&auto.provider_config).expect("builtin");
+    auto.user_settings.provider = None; // not pinned
+    let tts_status = auto.tts.status().await;
+    host::settings::refresh_view(
+        &mut auto.app,
+        &auto.provider_config,
+        ProviderHealth::Ready,
+        None,
+        None,
+        None,
+        &tts_status,
+        true,
+        None,
+        false,
+        false,
+        true,
+        true,
+        &auto.user_settings,
+        &auto.config.player,
+    );
+    auto.last_probe = Instant::now() - host::PROBE_INTERVAL;
+
+    let redraw = frame_at(&mut auto, Instant::now()).await;
+    assert!(redraw, "auto builtin should promote to live HTTP");
+    assert_ne!(auto.provider.id(), BUILTIN_PROVIDER_ID);
+    assert!(!auto.provider_config.base_url.starts_with("builtin://"));
+
+    // Explicitly pinned builtin stays offline even when a live server appears.
+    let mut pinned = session_for(builtin_provider_config()).await;
+    let tts_status = pinned.tts.status().await;
+    host::settings::refresh_view(
+        &mut pinned.app,
+        &pinned.provider_config,
+        ProviderHealth::Ready,
+        None,
+        None,
+        None,
+        &tts_status,
+        true,
+        None,
+        false,
+        false,
+        true,
+        true,
+        &pinned.user_settings,
+        &pinned.config.player,
+    );
+    pinned.config.providers = vec![live_http];
+    pinned.user_settings.provider = Some(BUILTIN_PROVIDER_ID.to_string());
+    pinned.last_probe = Instant::now() - host::PROBE_INTERVAL;
+
+    let redraw = frame_at(&mut pinned, Instant::now()).await;
+    assert!(!redraw, "pinned builtin stays quiet and on builtin-offline");
+    assert_eq!(pinned.provider.id(), BUILTIN_PROVIDER_ID);
+    assert_eq!(pinned.provider_config.base_url, "builtin://offline");
+}
+
+#[tokio::test]
+async fn builtin_offline_plays_rainy_reunion_pack_without_errors() {
+    let pack_dir =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../stories/rainy-reunion");
+    let pack = story_persistence::PackLoader::load(&pack_dir).expect("load rainy-reunion");
+
+    let mut session = session_for(builtin_provider_config()).await;
+    session.pack = pack;
+    session.engine = EngineState::initial(&session.pack);
+    session
+        .app
+        .set_view(build_view(&session.engine, &session.pack, None, None));
+
+    host::dispatch(
+        EngineCommand::StartNewGame,
+        &mut session.engine,
+        &mut session.app,
+        &session.pack,
+        &session.provider,
+        &session.config,
+        &session.save_store,
+        &session.tts,
+        &mut session.images,
+        &session.tx,
+        &mut session.cancellation,
+    )
+    .await
+    .expect("start rainy-reunion");
+    settle_until_idle(&mut session).await;
+    assert_eq!(session.app.view.status.turn, 1);
+    assert!(session.app.view.error.is_none());
+
+    let parsed = story_core::action_parse::parse_action(
+        "창밖 비를 바라보며 커피를 건넨다.",
+        &story_core::action_parse::ParseContext {
+            known_characters: &session.pack.characters,
+            known_locations: &session.pack.rules.locations,
+        },
+    );
+    host::dispatch(
+        EngineCommand::SubmitFreeAction {
+            action: Box::new(parsed),
+        },
+        &mut session.engine,
+        &mut session.app,
+        &session.pack,
+        &session.provider,
+        &session.config,
+        &session.save_store,
+        &session.tts,
+        &mut session.images,
+        &session.tx,
+        &mut session.cancellation,
+    )
+    .await
+    .expect("submit free action");
+    settle_until_idle(&mut session).await;
+    assert_eq!(session.app.view.status.turn, 2);
+    assert!(session.app.view.error.is_none());
+}
+
+#[tokio::test]
+async fn dispatch_rejected_command_surfaces_error_without_returning_err() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(envelope())
+                .set_delay(Duration::from_secs(2)),
+        )
+        .mount(&server)
+        .await;
+
+    let mut session = start_session(provider_config_for(&server.uri())).await;
+    assert!(session.engine.pending.is_some());
+
+    // Submitting a second turn while one is already in flight is rejected by
+    // the engine. `host::dispatch` must surface a recoverable error overlay and
+    // return Ok(()) rather than bubbling Err out of the interactive loop.
+    let parsed = story_core::action_parse::parse_action(
+        "창밖을 본다.",
+        &story_core::action_parse::ParseContext {
+            known_characters: &session.pack.characters,
+            known_locations: &session.pack.rules.locations,
+        },
+    );
+    host::dispatch(
+        EngineCommand::SubmitFreeAction {
+            action: Box::new(parsed),
+        },
+        &mut session.engine,
+        &mut session.app,
+        &session.pack,
+        &session.provider,
+        &session.config,
+        &session.save_store,
+        &session.tts,
+        &mut session.images,
+        &session.tx,
+        &mut session.cancellation,
+    )
+    .await
+    .expect("rejected dispatch returns Ok");
+    assert!(session.app.view.error.is_some());
+    assert_eq!(
+        session.app.view.error.as_ref().map(|e| e.code.as_str()),
+        Some("engine_generation_in_flight")
+    );
 }

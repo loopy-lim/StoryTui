@@ -1,6 +1,5 @@
 ---
 source: crates/story-core/tests/prompt_context.rs
-assertion_line: 256
 expression: combined
 ---
 === SYSTEM ===
@@ -24,6 +23,11 @@ expression: combined
 affection: -3..=3
 trust: -3..=3
 tension: -3..=3
+# Stat bounds (total after delta, inclusive)
+affection: -100..=100
+trust: -100..=100
+tension: -100..=100
+Never emit a delta that pushes `current + delta` below min or above max (e.g., if `tension=0` and min is `0`, `tension_delta` must be `>= 0`).
 
 # Relationship state update policy
 After each scene, inspect the observable consequence for every involved character. When the scene credibly changes warmth, reliability, or immediate strain, put a small signed integer in `state_patch.affection_delta`, `trust_delta`, or `tension_delta` for that character. Do not leave all three maps empty merely because the scene is subtle. Use `{}` only when no observable relationship state changed. Never invent a change just to make a meter move; narration and the patch must describe the same consequence.
@@ -111,4 +115,4 @@ For every choice: write one concrete player action or line; make `intent` name i
 
 
 === HASH ===
-8448cc41fad9f3fe526807f0c44cebf04ce40648a921ad2b1e78421b6478dc0d
+4a10149c7b3dc2bbdd6f1216b8090b7641cb11b589e7543e3e29c4d5c7f9a2d4

@@ -693,10 +693,10 @@ pub fn load(cli: &CliOptions) -> Result<RuntimeConfig, String> {
         None => (FileConfig::default(), None),
     };
 
-    if file.provider.kind != "openai_compatible" {
+    if file.provider.kind != "openai_compatible" && file.provider.kind != "builtin" {
         tracing::warn!(
             kind = %file.provider.kind,
-            "unknown provider kind; only 'openai_compatible' is implemented and the value is ignored"
+            "unknown provider kind; only 'openai_compatible' or 'builtin' is implemented and the value is ignored"
         );
     }
 
@@ -781,6 +781,8 @@ pub fn load(cli: &CliOptions) -> Result<RuntimeConfig, String> {
         && let Some(selected) = providers.iter().find(|entry| &entry.name == name)
     {
         file.provider = selected.clone();
+    } else if settings.provider.as_deref() == Some(story_provider::BUILTIN_PROVIDER_ID) {
+        file.provider = story_provider::builtin_provider_config();
     } else if settings.provider.is_some() {
         tracing::warn!(
             provider = %settings.provider.clone().unwrap_or_default(),

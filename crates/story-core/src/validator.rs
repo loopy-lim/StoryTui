@@ -17,10 +17,14 @@
 //!    key is an expected model slip and must not discard a whole generation.
 //!    Each drop is audited as a `Rejected` change-log entry plus a
 //!    [`GenerationWarning`].
-//! 3. **Range** — single-turn deltas within `delta_limits`; projected final
-//!    stats within `stat_limits` (no automatic clamping); number deltas within
-//!    the var's `[min, max]`; strings ≤ `max_len` and in `allowed`; projected
-//!    inventory ≥ 0.
+//! 3. **Range** — single-turn deltas within `delta_limits` (hard reject when
+//!    the magnitude itself is illegal). Projected final affection/trust/tension
+//!    that would leave `stat_limits` are *clamped* to the remaining headroom
+//!    (or dropped when already at the bound), with a warning — the same
+//!    "keep the turn alive" rationale as unknown keys, because local models
+//!    routinely emit `tension_delta: -1` when `tension` is already `0`.
+//!    Number deltas within the var's `[min, max]`; strings ≤ `max_len` and in
+//!    `allowed`; projected inventory ≥ 0 remain hard rejects.
 //! 4. **Permission** — relationship transitions limited to single-step moves
 //!    unless an `allow_relationship_skip` event is present in `add_events`.
 //! 5. **Transition** — `next_location` must be adjacent to the current
@@ -76,8 +80,43 @@ pub fn validate(
     // Stage 2: Reference ----------------------------------------------
     // Unknown references are dropped (with audit), not rejected: one stray
     // key must not discard a whole generation.
-    let (sanitized, warnings, change_log) =
+    let (mut sanitized, mut warnings, mut change_log) =
         drop_unknown_references(state, rules, patch, generation_id);
+
+    // Stage 2.5: Clamp projected affection/trust/tension to stat bounds.
+    // Local models often nudge a meter that is already at its floor/ceiling;
+    // discarding the whole generation over that slip is worse than trimming
+    // the delta. Illegal *magnitudes* still hard-fail in stage 3.
+    let mut clamp_audit = DropAudit::new(generation_id, state.turn);
+    clamp_axis_to_stat_bounds(
+        &mut sanitized.affection_delta,
+        state,
+        |c| c.affection,
+        &rules.delta_limits.affection,
+        rules.affection_stat_limits(),
+        "affection",
+        &mut clamp_audit,
+    );
+    clamp_axis_to_stat_bounds(
+        &mut sanitized.trust_delta,
+        state,
+        |c| c.trust,
+        &rules.delta_limits.trust,
+        rules.trust_stat_limits(),
+        "trust",
+        &mut clamp_audit,
+    );
+    clamp_axis_to_stat_bounds(
+        &mut sanitized.tension_delta,
+        state,
+        |c| c.tension,
+        &rules.delta_limits.tension,
+        rules.tension_stat_limits(),
+        "tension",
+        &mut clamp_audit,
+    );
+    warnings.extend(clamp_audit.warnings);
+    change_log.extend(clamp_audit.entries);
 
     // Stage 3: Range ---------------------------------------------------
     // Registry lookups below rely on the reference stage having removed
@@ -385,8 +424,59 @@ fn check_ranges(
     Ok(())
 }
 
-/// Check delta-magnitude + projected-final-stat bounds for a single axis
-/// (affection/trust/tension).
+/// Clamp a single affection/trust/tension delta so `current + delta` stays
+/// inside `stat_range`. Illegal magnitudes are left untouched for
+/// [`check_axis_delta`] to hard-reject.
+fn clamp_axis_to_stat_bounds(
+    deltas: &mut std::collections::BTreeMap<CharacterId, i16>,
+    state: &GameState,
+    read_current: impl Fn(&CharacterState) -> i16,
+    delta_range: &Int16Range,
+    stat_range: &Int16Range,
+    axis_name: &str,
+    audit: &mut DropAudit,
+) {
+    let characters: Vec<CharacterId> = deltas.keys().cloned().collect();
+    for ch in characters {
+        let Some(&delta) = deltas.get(&ch) else {
+            continue;
+        };
+        if !delta_range.contains(delta) {
+            // Magnitude is itself illegal — leave it for the hard reject.
+            continue;
+        }
+        let current = state
+            .characters
+            .get(&ch)
+            .map(&read_current)
+            .expect("checked at reference stage");
+        let projected = current.saturating_add(delta);
+        if stat_range.contains(projected) {
+            continue;
+        }
+        let clamped_final = projected.clamp(stat_range.min, stat_range.max);
+        let adjusted = clamped_final.saturating_sub(current);
+        audit.record(
+            format!("state_patch.{axis_name}_delta.{ch}"),
+            story_model::serde_json::json!(delta),
+            PATCH_STAT_OUT_OF_RANGE,
+            format!(
+                "{axis_name}_delta for {ch} clamped from {delta} to {adjusted} \
+                 (current={current}, projected={projected}, bounds=[{}, {}])",
+                stat_range.min, stat_range.max
+            ),
+        );
+        if adjusted == 0 {
+            deltas.remove(&ch);
+        } else {
+            deltas.insert(ch, adjusted);
+        }
+    }
+}
+
+/// Check delta-magnitude bounds for a single axis (affection/trust/tension).
+/// Projected final-stat overflow is handled earlier by
+/// [`clamp_axis_to_stat_bounds`].
 fn check_axis_delta(
     deltas: &std::collections::BTreeMap<CharacterId, i16>,
     state: &GameState,
@@ -411,6 +501,7 @@ fn check_axis_delta(
             .map(&read_current)
             .expect("checked at reference stage");
         let projected = current.saturating_add(*delta);
+        // Defensive: stage 2.5 should have clamped these already.
         if !stat_range.contains(projected) {
             return Err(CoreError::invalid_patch(
                 PATCH_STAT_OUT_OF_RANGE,

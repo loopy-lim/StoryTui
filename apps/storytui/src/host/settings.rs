@@ -5,8 +5,11 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use story_model::{ProviderHealth, StoryPack};
-use story_provider::{LlmProvider, OpenAiCompatibleProvider, ProviderConfig};
+use story_model::{ProviderError, ProviderHealth, StoryPack};
+use story_provider::{
+    BUILTIN_PROVIDER_ID, BuiltinStoryProvider, LlmProvider, OpenAiCompatibleProvider,
+    ProviderConfig, builtin_provider_config, is_builtin_config,
+};
 use story_tts::{TtsService, TtsStatus};
 use story_tui::App;
 
@@ -15,6 +18,37 @@ use storytui::config::{
     effective_player_profile, resolve_sampling, sampling_style_label, save_user_settings,
 };
 use storytui::diagnostic::provider_config_safe_with_models;
+
+/// Build either the offline built-in story engine or the HTTP client
+/// matching `config`.
+pub fn build_provider(config: &ProviderConfig) -> Result<Arc<dyn LlmProvider>, ProviderError> {
+    if is_builtin_config(config) {
+        Ok(Arc::new(BuiltinStoryProvider::new(config.clone())))
+    } else {
+        Ok(Arc::new(OpenAiCompatibleProvider::new(config.clone())?))
+    }
+}
+
+/// Full provider roster shown in the Settings picker: configured profiles plus
+/// the always-available built-in offline engine (if not already listed).
+pub fn effective_provider_roster(providers: &[ProviderConfig]) -> Vec<ProviderConfig> {
+    let mut roster = providers.to_vec();
+    if !roster
+        .iter()
+        .any(|entry| entry.name == BUILTIN_PROVIDER_ID || is_builtin_config(entry))
+    {
+        roster.push(builtin_provider_config());
+    }
+    roster
+}
+
+/// Format a provider roster for `App::set_providers`.
+pub fn provider_roster_labels(providers: &[ProviderConfig]) -> Vec<(String, String)> {
+    providers
+        .iter()
+        .map(|entry| (entry.name.clone(), entry.base_url.clone()))
+        .collect()
+}
 
 #[allow(clippy::too_many_arguments)] // the projection stays explicit at the host boundary
 pub fn refresh_view(
@@ -185,7 +219,7 @@ fn storytui_tts_display(tts: &TtsStatus) -> story_tui::app::TtsDisplay {
 
 pub async fn refresh_model_list(
     app: &mut App,
-    provider: &OpenAiCompatibleProvider,
+    provider: &dyn LlmProvider,
     provider_config: &ProviderConfig,
     preserve_selection: bool,
 ) {
@@ -227,12 +261,14 @@ pub fn reconcile_active_model(
     advertised.first().cloned()
 }
 
-/// Common local OpenAI-compatible endpoints probed when no model is selected
-/// yet and the configured endpoint does not answer. Deliberately generic —
-/// no product names: anything that answers `/v1/models` with a chat model
-/// wins, whatever server happens to be running there.
+/// Common local OpenAI-compatible endpoints probed when the configured
+/// endpoint does not answer. Includes standard local LLM router/server ports
+/// so local setups connect automatically without manual config edits.
 pub const AUTO_SETUP_CANDIDATE_BASE_URLS: &[&str] = &[
+    "http://127.0.0.1:8079",
     "http://127.0.0.1:8080",
+    "http://127.0.0.1:8000",
+    "http://127.0.0.1:8081",
     "http://127.0.0.1:1234",
     "http://127.0.0.1:11434",
 ];
@@ -269,7 +305,7 @@ pub fn pick_auto_model(current: &str, fallback: &str, advertised: &[String]) -> 
 pub fn probe_candidates(configured_base_url: &str) -> Vec<String> {
     let mut candidates: Vec<String> = Vec::with_capacity(AUTO_SETUP_CANDIDATE_BASE_URLS.len() + 1);
     let configured = configured_base_url.trim().trim_end_matches('/');
-    if !configured.is_empty() {
+    if !configured.is_empty() && !configured.starts_with("builtin://") {
         candidates.push(configured.to_string());
     }
     for candidate in AUTO_SETUP_CANDIDATE_BASE_URLS {
@@ -278,6 +314,17 @@ pub fn probe_candidates(configured_base_url: &str) -> Vec<String> {
         }
     }
     candidates
+}
+
+/// Returns `false` when a profile requires an env var API key that is unset or empty.
+fn provider_has_credentials(config: &ProviderConfig) -> bool {
+    if config.api_key.is_some() {
+        return true;
+    }
+    match &config.api_key_env {
+        Some(var) => std::env::var(var).is_ok_and(|value| !value.trim().is_empty()),
+        None => true,
+    }
 }
 
 /// Result of the first-run server discovery.
@@ -293,9 +340,172 @@ pub enum DiscoveryOutcome {
     NoServer,
 }
 
+/// Full outcome of scanning configured HTTP profiles and common local ports.
+#[derive(Clone, Debug, PartialEq)]
+pub enum HttpDiscoveryResult {
+    /// Found a live OpenAI-compatible server with an active chat model.
+    Connected {
+        config: Box<ProviderConfig>,
+        advertised: Vec<String>,
+    },
+    /// At least one server answered `/v1/models` without a usable chat model.
+    NoChatModel,
+    /// No configured profile or local port answered.
+    NoServer,
+}
+
+async fn probe_http_profile(
+    profile: &ProviderConfig,
+    fallback_model: &str,
+) -> Result<(ProviderConfig, Vec<String>), DiscoveryOutcome> {
+    if is_builtin_config(profile) || !provider_has_credentials(profile) {
+        return Err(DiscoveryOutcome::NoServer);
+    }
+    let mut candidate = profile.clone();
+    candidate.connect_timeout_ms = 1_000;
+    candidate.max_retries = 0;
+    let provider = match OpenAiCompatibleProvider::new(candidate.clone()) {
+        Ok(provider) => provider,
+        Err(error) => {
+            tracing::debug!(%error, profile = %profile.name, "probe provider build failed");
+            return Err(DiscoveryOutcome::NoServer);
+        }
+    };
+    match provider.list_models().await {
+        Ok(advertised) if !advertised.is_empty() => {
+            if let Some(model) = pick_auto_model(&profile.model, fallback_model, &advertised) {
+                let mut resolved = profile.clone();
+                resolved.model = model;
+                return Ok((resolved, advertised));
+            }
+            Err(DiscoveryOutcome::NoChatModel)
+        }
+        Ok(_) => {
+            if !profile.model.trim().is_empty()
+                && provider.health().await == Ok(ProviderHealth::Ready)
+            {
+                return Ok((profile.clone(), Vec::new()));
+            }
+            Err(DiscoveryOutcome::NoChatModel)
+        }
+        Err(error) => {
+            tracing::debug!(%error, base_url = %profile.base_url, "HTTP models probe failed");
+            if !profile.model.trim().is_empty()
+                && provider.health().await == Ok(ProviderHealth::Ready)
+            {
+                return Ok((profile.clone(), Vec::new()));
+            }
+            Err(DiscoveryOutcome::NoServer)
+        }
+    }
+}
+
+/// Scan the preferred HTTP profile first, then any configured `[[providers]]`
+/// entries, then common local ports (`8079`, `8080`, `8000`, `8081`, `1234`,
+/// `11434`), returning the first live chat provider.
+pub async fn discover_best_http_provider(
+    preferred: &ProviderConfig,
+    profiles: &[ProviderConfig],
+    fallback_model: &str,
+) -> HttpDiscoveryResult {
+    let mut remembered = HttpDiscoveryResult::NoServer;
+    let mut visited: Vec<(String, Option<String>, Option<String>)> = Vec::new();
+
+    let key_for = |cfg: &ProviderConfig| {
+        (
+            cfg.base_url.trim().trim_end_matches('/').to_string(),
+            cfg.api_key.clone(),
+            cfg.api_key_env.clone(),
+        )
+    };
+
+    if !is_builtin_config(preferred) {
+        visited.push(key_for(preferred));
+        match probe_http_profile(preferred, fallback_model).await {
+            Ok((config, advertised)) => {
+                return HttpDiscoveryResult::Connected {
+                    config: Box::new(config),
+                    advertised,
+                };
+            }
+            Err(DiscoveryOutcome::NoChatModel) => remembered = HttpDiscoveryResult::NoChatModel,
+            Err(_) => {}
+        }
+    }
+
+    for profile in profiles {
+        if is_builtin_config(profile) {
+            continue;
+        }
+        let k = key_for(profile);
+        if visited.iter().any(|seen| seen == &k) {
+            continue;
+        }
+        visited.push(k);
+        match probe_http_profile(profile, &profile.model).await {
+            Ok((config, advertised)) => {
+                return HttpDiscoveryResult::Connected {
+                    config: Box::new(config),
+                    advertised,
+                };
+            }
+            Err(DiscoveryOutcome::NoChatModel) if remembered == HttpDiscoveryResult::NoServer => {
+                remembered = HttpDiscoveryResult::NoChatModel;
+            }
+            Err(_) => {}
+        }
+    }
+
+    let mut template = ProviderConfig::defaults();
+    if !is_builtin_config(preferred) {
+        template.name = preferred.name.clone();
+        template.stream_turns = preferred.stream_turns;
+        template.temperature = preferred.temperature;
+        template.top_p = preferred.top_p;
+        template.top_k = preferred.top_k;
+        template.max_tokens = preferred.max_tokens;
+    } else if let Some(first_http) = profiles.iter().find(|p| !is_builtin_config(p)) {
+        template.name = first_http.name.clone();
+    }
+
+    for base_url in AUTO_SETUP_CANDIDATE_BASE_URLS {
+        let k = (
+            (*base_url).to_string(),
+            template.api_key.clone(),
+            template.api_key_env.clone(),
+        );
+        if visited.iter().any(|seen| seen == &k) {
+            continue;
+        }
+        visited.push(k);
+        let mut candidate = template.clone();
+        candidate.base_url = (*base_url).to_string();
+        match probe_http_profile(&candidate, "").await {
+            Ok((mut config, advertised)) => {
+                // Keep a clean profile name when discovering a port ad-hoc.
+                if let Some(matched) = profiles
+                    .iter()
+                    .find(|p| p.base_url.trim().trim_end_matches('/') == *base_url)
+                {
+                    config.name = matched.name.clone();
+                }
+                return HttpDiscoveryResult::Connected {
+                    config: Box::new(config),
+                    advertised,
+                };
+            }
+            Err(DiscoveryOutcome::NoChatModel) if remembered == HttpDiscoveryResult::NoServer => {
+                remembered = HttpDiscoveryResult::NoChatModel;
+            }
+            Err(_) => {}
+        }
+    }
+
+    remembered
+}
+
 /// Probe the configured endpoint and the common local candidates, adopting
-/// the first one that advertises a usable chat model. Only called while no
-/// model is selected (fresh clone / wiped user settings).
+/// the first one that advertises a usable chat model.
 ///
 /// Each probe uses a short connect timeout and no retries: loopback
 /// refusals are instant, and an unresponsive local listener costs at most
@@ -343,6 +553,16 @@ pub fn unconfigured_home_status(outcome: &DiscoveryOutcome) -> (String, bool) {
     (line.to_string(), true)
 }
 
+/// Plain-Korean line when StoryTUI auto-selected the built-in offline story
+/// engine because no external model server was running (gray — ready to play).
+pub fn builtin_fallback_home_status() -> (String, bool) {
+    (
+        "외부 모델 서버가 없어 내장 오프라인 모드로 실행 중 — 서버를 켜면 자동 연결됩니다."
+            .to_string(),
+        false,
+    )
+}
+
 /// Plain-Korean line for a returning user whose persisted model's server is
 /// unreachable (gray — the menu stays fully usable).
 pub fn server_down_home_status() -> (String, bool) {
@@ -352,88 +572,163 @@ pub fn server_down_home_status() -> (String, bool) {
     )
 }
 
+/// Whether automatic HTTP server discovery/promotion should run when Settings
+/// opens or the periodic reprobe fires. True when no model is selected, OR when
+/// the session is running in automatic offline fallback mode (not explicitly
+/// pinned to `builtin-offline` in `user_settings.provider`).
+pub fn should_auto_discover(
+    provider_config: &ProviderConfig,
+    user_settings: &UserSettings,
+) -> bool {
+    provider_config.model.trim().is_empty()
+        || (is_builtin_config(provider_config)
+            && user_settings.provider.as_deref() != Some(BUILTIN_PROVIDER_ID))
+}
+
 /// Re-run auto-setup when the settings menu opens while no model is
-/// selected: a successfully adopted session provider is persisted (model
-/// only — never the URL) and re-projected. `None` means the model was
-/// already configured, so there was nothing to discover.
+/// selected or while running in automatic built-in fallback mode.
 pub async fn reprobe_if_unconfigured(
     app: &mut App,
     provider_config: &mut ProviderConfig,
-    provider: &mut Arc<OpenAiCompatibleProvider>,
+    provider: &mut Arc<dyn LlmProvider>,
     user_settings: &mut UserSettings,
     config: &mut RuntimeConfig,
     tts: &TtsService,
 ) -> Option<DiscoveryOutcome> {
-    if !provider_config.model.trim().is_empty() {
+    if !should_auto_discover(provider_config, user_settings) {
         return None;
     }
-    let outcome = discover_session_provider(provider_config).await;
-    if let DiscoveryOutcome::Connected { base_url, model } = &outcome {
-        let mut adopted = provider_config.clone();
-        adopted.base_url = base_url.clone();
-        adopted.model = model.clone();
-        // Build before swapping: a failed construction leaves the old
-        // provider fully in charge (same discipline as `apply_provider`).
-        match OpenAiCompatibleProvider::new(adopted.clone()) {
-            Ok(rebuilt) => {
-                *provider = Arc::new(rebuilt);
-                *provider_config = adopted;
-                config.provider = provider_config.clone();
-                user_settings.model = Some(model.clone());
-                if let Err(error) = save_user_settings(&config.save_dir, user_settings) {
-                    tracing::warn!(%error, "auto-selected model could not be persisted");
-                }
-                refresh_projection(app, provider_config, provider, config, tts, user_settings)
+    let was_builtin = is_builtin_config(provider_config);
+    let outcome = match discover_best_http_provider(
+        provider_config,
+        &config.providers,
+        &config.fallback_model,
+    )
+    .await
+    {
+        HttpDiscoveryResult::Connected {
+            config: adopted,
+            advertised,
+        } => {
+            let mut adopted = *adopted;
+            config.base_sampling = (adopted.temperature, adopted.top_p, adopted.top_k);
+            user_settings.apply_sampling_taste(&mut adopted);
+            adopted.stream_turns = user_settings.stream_turns.unwrap_or(adopted.stream_turns);
+            match build_provider(&adopted) {
+                Ok(rebuilt) => {
+                    let connected_url = adopted.base_url.clone();
+                    let connected_model = adopted.model.clone();
+                    *provider = rebuilt;
+                    *provider_config = adopted.clone();
+                    config.provider = adopted;
+                    // Restore or repair stage models for the promoted HTTP profile.
+                    let saved = user_settings.stage_models.get(&provider_config.name);
+                    let default = config.stage_defaults.get(&provider_config.name);
+                    let current = StageModels {
+                        director: config.director_model.clone(),
+                        choice: config.choice_model.clone(),
+                        writer: config.writer_model.clone(),
+                    };
+                    let (resolved, repairs) = resolve_stage_assignments(
+                        saved,
+                        default,
+                        &current,
+                        &advertised,
+                        &provider_config.model,
+                    );
+                    config.director_model = resolved.director.clone();
+                    config.choice_model = resolved.choice.clone();
+                    config.writer_model = resolved.writer.clone();
+                    record_repaired_stages(
+                        &mut user_settings.stage_models,
+                        &provider_config.name,
+                        repairs,
+                        &resolved,
+                    );
+                    if !is_builtin_config(provider_config) {
+                        user_settings.model = Some(connected_model.clone());
+                    }
+                    if let Err(error) = save_user_settings(&config.save_dir, user_settings) {
+                        tracing::warn!(%error, "auto-selected model could not be persisted");
+                    }
+                    let roster =
+                        provider_roster_labels(&effective_provider_roster(&config.providers));
+                    app.set_providers(&roster, &provider_config.name);
+                    refresh_projection(
+                        app,
+                        provider_config,
+                        provider.as_ref(),
+                        config,
+                        tts,
+                        user_settings,
+                    )
                     .await;
-                refresh_model_list(app, provider, provider_config, false).await;
-                tracing::info!(
-                    base_url = %base_url,
-                    model = %model,
-                    "auto-setup adopted a local server"
-                );
-            }
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    "auto-setup adopted provider build failed; keeping the old provider"
-                );
+                    refresh_model_list(app, provider.as_ref(), provider_config, false).await;
+                    tracing::info!(
+                        base_url = %connected_url,
+                        model = %connected_model,
+                        "auto-setup promoted session to live HTTP server"
+                    );
+                    return Some(DiscoveryOutcome::Connected {
+                        base_url: connected_url,
+                        model: connected_model,
+                    });
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "auto-setup adopted provider build failed; keeping current provider"
+                    );
+                    DiscoveryOutcome::NoServer
+                }
             }
         }
+        HttpDiscoveryResult::NoChatModel => DiscoveryOutcome::NoChatModel,
+        HttpDiscoveryResult::NoServer => DiscoveryOutcome::NoServer,
+    };
+    if was_builtin {
+        // Keep auto-fallback built-in mode quiet — refresh its own model list cleanly.
+        refresh_model_list(app, provider.as_ref(), provider_config, false).await;
+        return None;
     }
     Some(outcome)
 }
 
 /// One background availability reprobe (AC-4), shared by the settings-open
 /// path and the periodic frame timer. Re-runs auto-setup while no model is
-/// selected; otherwise probes health and, on any change, re-projects the
-/// Settings screen and refreshes the home status line. Returns `true` when
-/// availability changed (worth a redraw).
+/// selected or while running in automatic built-in fallback mode; otherwise
+/// probes health and, on any change, re-projects the Settings screen and
+/// refreshes the home status line. Returns `true` when availability changed
+/// (worth a redraw).
 pub async fn reprobe_availability(
     app: &mut App,
     provider_config: &mut ProviderConfig,
-    provider: &mut Arc<OpenAiCompatibleProvider>,
+    provider: &mut Arc<dyn LlmProvider>,
     user_settings: &mut UserSettings,
     config: &mut RuntimeConfig,
     tts: &TtsService,
 ) -> bool {
-    if provider_config.model.trim().is_empty() {
+    if should_auto_discover(provider_config, user_settings) {
+        let was_builtin = is_builtin_config(provider_config);
         let outcome =
             reprobe_if_unconfigured(app, provider_config, provider, user_settings, config, tts)
                 .await;
         return match outcome {
             Some(DiscoveryOutcome::Connected { .. }) => {
-                // Adopted a server: the "no model" guidance line is stale.
+                // Adopted a server: clear any offline / unconfigured notice.
                 clear_home_status_if_matches(
                     app,
                     &unconfigured_home_status(&DiscoveryOutcome::NoServer).0,
                 );
+                clear_home_status_if_matches(app, &builtin_fallback_home_status().0);
+                clear_home_status_if_matches(app, &server_down_home_status().0);
                 true
             }
-            Some(other) => {
+            Some(other) if !was_builtin => {
                 app.set_home_status(Some(unconfigured_home_status(&other)));
                 false
             }
-            None => false,
+            _ => false,
         };
     }
     let health = provider
@@ -444,7 +739,15 @@ pub async fn reprobe_availability(
     if health == previous {
         return false;
     }
-    refresh_projection(app, provider_config, provider, config, tts, user_settings).await;
+    refresh_projection(
+        app,
+        provider_config,
+        provider.as_ref(),
+        config,
+        tts,
+        user_settings,
+    )
+    .await;
     if health != ProviderHealth::Unavailable {
         // The server came back: the gray "서버를 켠 뒤…" line must go.
         clear_home_status_if_matches(app, &server_down_home_status().0);
@@ -466,7 +769,7 @@ fn clear_home_status_if_matches(app: &mut App, text: &str) {
 async fn refresh_projection(
     app: &mut App,
     provider_config: &ProviderConfig,
-    provider: &OpenAiCompatibleProvider,
+    provider: &dyn LlmProvider,
     config: &RuntimeConfig,
     tts: &TtsService,
     user_settings: &UserSettings,
@@ -520,7 +823,7 @@ pub fn apply_style_to_config(
 pub async fn cycle_sampling_style(
     app: &mut App,
     provider_config: &mut ProviderConfig,
-    provider: &mut Arc<OpenAiCompatibleProvider>,
+    provider: &mut Arc<dyn LlmProvider>,
     user_settings: &mut UserSettings,
     config: &mut RuntimeConfig,
 ) -> Result<(), String> {
@@ -530,10 +833,8 @@ pub async fn cycle_sampling_style(
         apply_style_to_config(next, user_settings, provider_config, config);
     // Build before swapping: a failed construction leaves the old provider
     // fully in charge (same discipline as `apply_model`).
-    *provider = Arc::new(
-        OpenAiCompatibleProvider::new(provider_config.clone())
-            .map_err(|e| format!("샘플링 스타일을 적용하지 못했습니다: {e}"))?,
-    );
+    *provider = build_provider(provider_config)
+        .map_err(|e| format!("샘플링 스타일을 적용하지 못했습니다: {e}"))?;
     save_user_settings(&config.save_dir, user_settings)?;
     app.update_settings_sampling(label.clone(), temperature, top_p, top_k);
     tracing::info!(style = %label, temperature, top_p, top_k, "sampling style cycled");
@@ -681,11 +982,17 @@ pub async fn switch_provider(
     name: &str,
     providers: &[ProviderConfig],
     provider_config: &mut ProviderConfig,
-    provider: &mut Arc<OpenAiCompatibleProvider>,
+    provider: &mut Arc<dyn LlmProvider>,
     user_settings: &mut UserSettings,
     config: &mut RuntimeConfig,
 ) -> Result<Option<ProviderHealth>, String> {
-    let Some(selected) = providers.iter().find(|entry| entry.name == name) else {
+    let builtin_fallback;
+    let selected = if let Some(entry) = providers.iter().find(|entry| entry.name == name) {
+        entry
+    } else if name == BUILTIN_PROVIDER_ID {
+        builtin_fallback = builtin_provider_config();
+        &builtin_fallback
+    } else {
         tracing::warn!(provider = %name, "requested provider is not configured");
         return Ok(None);
     };
@@ -695,6 +1002,7 @@ pub async fn switch_provider(
         base_url = %selected.base_url,
         "switching provider"
     );
+    let was_builtin = is_builtin_config(provider_config);
     // Build before swapping any state: a failed construction (rare — client
     // build) must leave the old provider fully in charge. Sampling taste is
     // machine-level and travels across switches; `model` does not — the
@@ -709,10 +1017,8 @@ pub async fn switch_provider(
     // switches instead of reverting to the new profile's own value, so the
     // session flag and the Settings row never desync mid-session.
     selected.stream_turns = user_settings.stream_turns.unwrap_or(selected.stream_turns);
-    let rebuilt = Arc::new(
-        OpenAiCompatibleProvider::new(selected.clone())
-            .map_err(|e| format!("프로바이더 '{name}'를 적용하지 못했습니다: {e}"))?,
-    );
+    let rebuilt = build_provider(&selected)
+        .map_err(|e| format!("프로바이더 '{name}'를 적용하지 못했습니다: {e}"))?;
     *provider_config = selected;
     config.provider = provider_config.clone();
     *provider = rebuilt;
@@ -744,10 +1050,15 @@ pub async fn switch_provider(
     // Restore this profile's stage assignments: its saved choice first, then
     // its `[[providers]]` TOML default, then the assignments in effect (the
     // previous profile's), with stale values repaired to the active model.
-    let current = StageModels {
-        director: config.director_model.clone(),
-        choice: config.choice_model.clone(),
-        writer: config.writer_model.clone(),
+    // Built-in model IDs never leak into an HTTP profile's stage assignments.
+    let current = if was_builtin && !is_builtin_config(provider_config) {
+        StageModels::default()
+    } else {
+        StageModels {
+            director: config.director_model.clone(),
+            choice: config.choice_model.clone(),
+            writer: config.writer_model.clone(),
+        }
     };
     let (resolved, repairs) = resolve_stage_assignments(
         user_settings.stage_models.get(name),
@@ -790,14 +1101,15 @@ pub async fn apply_provider(
     name: &str,
     providers: &[ProviderConfig],
     provider_config: &mut ProviderConfig,
-    provider: &mut Arc<OpenAiCompatibleProvider>,
+    provider: &mut Arc<dyn LlmProvider>,
     user_settings: &mut UserSettings,
     config: &mut RuntimeConfig,
     tts: &TtsService,
 ) -> Result<(), String> {
+    let roster_configs = effective_provider_roster(providers);
     let Some(health) = switch_provider(
         name,
-        providers,
+        &roster_configs,
         provider_config,
         provider,
         user_settings,
@@ -825,12 +1137,17 @@ pub async fn apply_provider(
         user_settings,
         &config.player,
     );
-    let roster: Vec<(String, String)> = providers
-        .iter()
-        .map(|entry| (entry.name.clone(), entry.base_url.clone()))
-        .collect();
+    let roster = provider_roster_labels(&roster_configs);
     app.set_providers(&roster, name);
-    refresh_model_list(app, provider, provider_config, false).await;
+    if health != ProviderHealth::Unavailable {
+        clear_home_status_if_matches(app, &builtin_fallback_home_status().0);
+        clear_home_status_if_matches(app, &server_down_home_status().0);
+        clear_home_status_if_matches(
+            app,
+            &unconfigured_home_status(&DiscoveryOutcome::NoServer).0,
+        );
+    }
+    refresh_model_list(app, provider.as_ref(), provider_config, false).await;
     Ok(())
 }
 
@@ -842,19 +1159,32 @@ pub async fn apply_model(
     model: String,
     config: &RuntimeConfig,
     provider_config: &mut ProviderConfig,
-    provider: &mut Arc<OpenAiCompatibleProvider>,
+    provider: &mut Arc<dyn LlmProvider>,
     user_settings: &mut UserSettings,
     save_dir: &Path,
     tts: &TtsService,
 ) -> Result<(), String> {
-    provider_config.model = model.clone();
-    user_settings.model = Some(model);
-    save_user_settings(save_dir, user_settings)?;
-    *provider = Arc::new(
-        OpenAiCompatibleProvider::new(provider_config.clone())
-            .map_err(|e| format!("선택한 모델을 적용하지 못했습니다: {e}"))?,
-    );
-    refresh_projection(app, provider_config, provider, config, tts, user_settings).await;
+    let mut updated_config = provider_config.clone();
+    updated_config.model = model.clone();
+    let rebuilt = build_provider(&updated_config)
+        .map_err(|e| format!("선택한 모델을 적용하지 못했습니다: {e}"))?;
+    *provider_config = updated_config;
+    *provider = rebuilt;
+    if !is_builtin_config(provider_config)
+        || user_settings.provider.as_deref() == Some(BUILTIN_PROVIDER_ID)
+    {
+        user_settings.model = Some(model);
+        save_user_settings(save_dir, user_settings)?;
+    }
+    refresh_projection(
+        app,
+        provider_config,
+        provider.as_ref(),
+        config,
+        tts,
+        user_settings,
+    )
+    .await;
     Ok(())
 }
 
@@ -865,7 +1195,7 @@ pub async fn apply_director_model(
     model: String,
     config: &mut RuntimeConfig,
     provider_config: &ProviderConfig,
-    provider: &OpenAiCompatibleProvider,
+    provider: &dyn LlmProvider,
     user_settings: &mut UserSettings,
     tts: &TtsService,
 ) -> Result<(), String> {
@@ -887,7 +1217,7 @@ pub async fn apply_choice_model(
     model: String,
     config: &mut RuntimeConfig,
     provider_config: &ProviderConfig,
-    provider: &OpenAiCompatibleProvider,
+    provider: &dyn LlmProvider,
     user_settings: &mut UserSettings,
     tts: &TtsService,
 ) -> Result<(), String> {
@@ -909,7 +1239,7 @@ pub async fn apply_writer_model(
     model: String,
     config: &mut RuntimeConfig,
     provider_config: &ProviderConfig,
-    provider: &OpenAiCompatibleProvider,
+    provider: &dyn LlmProvider,
     user_settings: &mut UserSettings,
     tts: &TtsService,
 ) -> Result<(), String> {
@@ -927,20 +1257,23 @@ pub async fn apply_writer_model(
 #[cfg(test)]
 mod tests {
     use super::{
-        DiscoveryOutcome, StageRepairs, activate_author_note, activate_persona,
-        apply_prompt_overlays, apply_style_to_config, filter_chat_models, persona_status_label,
-        pick_auto_model, probe_candidates, reconcile_active_model, record_repaired_stages,
+        BUILTIN_PROVIDER_ID, DiscoveryOutcome, HttpDiscoveryResult, StageRepairs,
+        activate_author_note, activate_persona, apply_prompt_overlays, apply_style_to_config,
+        build_provider, builtin_provider_config, discover_best_http_provider,
+        effective_provider_roster, filter_chat_models, persona_status_label, pick_auto_model,
+        probe_candidates, reconcile_active_model, record_repaired_stages,
         resolve_stage_assignments, server_down_home_status, set_player_profile_section,
-        switch_provider, unconfigured_home_status,
+        should_auto_discover, switch_provider, unconfigured_home_status,
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
-    use std::sync::Arc;
-    use story_provider::{OpenAiCompatibleProvider, ProviderConfig};
+    use story_provider::ProviderConfig;
     use story_tts::TtsConfig;
     use storytui::config::{
         PlayerProfile, RuntimeConfig, StageModels, UserSettings, load_user_settings,
     };
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn stale_model_falls_back_to_profile_model() {
@@ -1089,8 +1422,7 @@ mod tests {
         let profile_b = dead_profile("b", "b-main");
         let mut config = runtime_for(save_dir.clone(), vec![profile_a.clone(), profile_b.clone()]);
         let mut provider_config = profile_a;
-        let mut provider =
-            Arc::new(OpenAiCompatibleProvider::new(provider_config.clone()).expect("provider"));
+        let mut provider = build_provider(&provider_config).expect("provider");
         let mut user_settings = UserSettings {
             sampling_preset: Some("precise".to_string()),
             ..UserSettings::default()
@@ -1235,7 +1567,9 @@ mod tests {
             probe_candidates("http://127.0.0.1:8000"),
             vec![
                 "http://127.0.0.1:8000".to_string(),
+                "http://127.0.0.1:8079".to_string(),
                 "http://127.0.0.1:8080".to_string(),
+                "http://127.0.0.1:8081".to_string(),
                 "http://127.0.0.1:1234".to_string(),
                 "http://127.0.0.1:11434".to_string(),
             ]
@@ -1245,11 +1579,15 @@ mod tests {
             probe_candidates("http://127.0.0.1:1234/"),
             vec![
                 "http://127.0.0.1:1234".to_string(),
+                "http://127.0.0.1:8079".to_string(),
                 "http://127.0.0.1:8080".to_string(),
+                "http://127.0.0.1:8000".to_string(),
+                "http://127.0.0.1:8081".to_string(),
                 "http://127.0.0.1:11434".to_string(),
             ]
         );
         assert_eq!(probe_candidates("  "), probe_candidates(""));
+        assert_eq!(probe_candidates("builtin://offline"), probe_candidates(""));
     }
 
     #[test]
@@ -1457,8 +1795,7 @@ mod tests {
         config.writer_model = Some("a-wri".to_string());
 
         let mut provider_config = profile_a;
-        let mut provider =
-            Arc::new(OpenAiCompatibleProvider::new(provider_config.clone()).expect("provider"));
+        let mut provider = build_provider(&provider_config).expect("provider");
         let mut user_settings = UserSettings::default();
         user_settings.stage_models.insert(
             "b".to_string(),
@@ -1510,8 +1847,7 @@ mod tests {
         config.director_model = Some("kept-dir".to_string());
 
         let mut provider_config = profile_a;
-        let mut provider =
-            Arc::new(OpenAiCompatibleProvider::new(provider_config.clone()).expect("provider"));
+        let mut provider = build_provider(&provider_config).expect("provider");
         let mut user_settings = UserSettings {
             // Machine-level sampling taste: profile c itself carries the
             // defaults.
@@ -1542,6 +1878,130 @@ mod tests {
         // its own defaults.
         assert_eq!(provider_config.temperature, 0.4);
         assert_eq!(provider_config.max_tokens, 777);
+        std::fs::remove_dir_all(save_dir).ok();
+    }
+
+    #[test]
+    fn should_auto_discover_distinguishes_auto_fallback_from_pinned_builtin() {
+        let unconfigured = ProviderConfig {
+            model: String::new(),
+            ..ProviderConfig::default()
+        };
+        assert!(should_auto_discover(
+            &unconfigured,
+            &UserSettings::default()
+        ));
+
+        let auto_builtin = builtin_provider_config();
+        assert!(should_auto_discover(
+            &auto_builtin,
+            &UserSettings::default()
+        ));
+
+        let pinned_builtin = UserSettings {
+            provider: Some(BUILTIN_PROVIDER_ID.to_string()),
+            ..UserSettings::default()
+        };
+        assert!(!should_auto_discover(&auto_builtin, &pinned_builtin));
+
+        let http_profile = dead_profile("local", "qwen");
+        assert!(!should_auto_discover(
+            &http_profile,
+            &UserSettings::default()
+        ));
+    }
+
+    #[test]
+    fn effective_provider_roster_always_appends_builtin_once() {
+        let a = dead_profile("a", "a-main");
+        let roster = effective_provider_roster(std::slice::from_ref(&a));
+        assert_eq!(roster.len(), 2);
+        assert_eq!(roster[0].name, "a");
+        assert_eq!(roster[1].name, BUILTIN_PROVIDER_ID);
+
+        // Calling again on an already-expanded roster never duplicates it.
+        let roster_again = effective_provider_roster(&roster);
+        assert_eq!(roster_again.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn discover_best_http_provider_falls_over_from_dead_primary_to_live_secondary() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"data": [{"id": "chat-live"}]})),
+            )
+            .mount(&server)
+            .await;
+
+        let mut primary = dead_profile("dead-primary", "dead-model");
+        primary.api_key_env = Some("STORYTUI_DEFINITELY_MISSING_KEY".to_string());
+        let mut live_secondary = dead_profile("live-secondary", "stale-model");
+        live_secondary.base_url = server.uri();
+
+        let result =
+            discover_best_http_provider(&primary, &[primary.clone(), live_secondary], "fallback")
+                .await;
+        match result {
+            HttpDiscoveryResult::Connected { config, advertised } => {
+                assert_eq!(config.name, "live-secondary");
+                assert_eq!(config.base_url, server.uri());
+                assert_eq!(config.model, "chat-live");
+                assert_eq!(advertised, vec!["chat-live".to_string()]);
+            }
+            other => panic!("expected Connected, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn switch_provider_activates_builtin_offline_even_when_unlisted() {
+        let save_dir = switch_test_dir("builtin-switch");
+        let profile_a = dead_profile("a", "a-main");
+        let mut config = runtime_for(save_dir.clone(), vec![profile_a.clone()]);
+        config.director_model = Some("external-dir".to_string());
+        let mut provider_config = profile_a;
+        let mut provider = build_provider(&provider_config).expect("provider");
+        let mut user_settings = UserSettings::default();
+
+        let roster = config.providers.clone();
+        let health = switch_provider(
+            BUILTIN_PROVIDER_ID,
+            &roster,
+            &mut provider_config,
+            &mut provider,
+            &mut user_settings,
+            &mut config,
+        )
+        .await
+        .expect("switch")
+        .expect("builtin exists");
+
+        assert_eq!(health, story_model::ProviderHealth::Ready);
+        assert_eq!(provider.id(), BUILTIN_PROVIDER_ID);
+        assert_eq!(provider_config.name, BUILTIN_PROVIDER_ID);
+        assert_eq!(user_settings.provider.as_deref(), Some(BUILTIN_PROVIDER_ID));
+        // External stage model was repaired cleanly to a valid built-in model.
+        assert_eq!(config.director_model.as_deref(), Some("builtin-story-v1"));
+
+        // Switching back to an offline HTTP profile must NOT leak built-in stage
+        // models into the HTTP profile.
+        switch_provider(
+            "a",
+            &roster,
+            &mut provider_config,
+            &mut provider,
+            &mut user_settings,
+            &mut config,
+        )
+        .await
+        .expect("switch back")
+        .expect("profile a exists");
+        assert_eq!(config.director_model, None);
+        assert_eq!(config.choice_model, None);
+        assert_eq!(config.writer_model, None);
+
         std::fs::remove_dir_all(save_dir).ok();
     }
 }

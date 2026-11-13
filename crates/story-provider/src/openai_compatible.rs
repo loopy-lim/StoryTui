@@ -48,6 +48,9 @@ const FALLBACK_MIN_BUDGET_MS: u64 = 250;
 /// (`127.0.0.0/8`, `localhost`, `::1`). Used to decide the ADR-002 non-loopback
 /// warning — no external URL crate is pulled in (ADR-003: keep deps minimal).
 pub fn is_loopback_base_url(url: &str) -> bool {
+    if url.trim().starts_with("builtin://") {
+        return true;
+    }
     let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
     // Pull the host: bracketed IPv6 (`[::1]:port`) vs. the more common
     // `host:port` / `host/path` shapes.
@@ -797,12 +800,20 @@ impl crate::provider::LlmProvider for OpenAiCompatibleProvider {
         &self.id
     }
 
+    fn model_name(&self) -> &str {
+        &self.config.model
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             supports_structured_output: self.structured_enabled(),
             supports_director: true,
             supports_streaming: true,
         }
+    }
+
+    async fn list_models(&self) -> Result<Vec<String>, ProviderError> {
+        OpenAiCompatibleProvider::list_models(self).await
     }
 
     async fn health(&self) -> Result<ProviderHealth, ProviderError> {

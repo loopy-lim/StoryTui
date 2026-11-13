@@ -288,19 +288,33 @@ fn build_system(pack: &StoryPack, player_action: Option<&ParsedAction>) -> Strin
         s.push('\n');
     }
 
-    // Per-turn delta limits.
+    // Per-turn delta limits and cumulative stat bounds.
     let dl = &pack.rules.delta_limits;
+    let al = pack.rules.affection_stat_limits();
+    let tl = pack.rules.trust_stat_limits();
+    let nl = pack.rules.tension_stat_limits();
     s.push_str(&format!(
         "\n# Delta limits (per turn, inclusive)\n\
          affection: {a_min}..={a_max}\n\
          trust: {t_min}..={t_max}\n\
-         tension: {n_min}..={n_max}\n",
+         tension: {n_min}..={n_max}\n\
+         # Stat bounds (total after delta, inclusive)\n\
+         affection: {as_min}..={as_max}\n\
+         trust: {ts_min}..={ts_max}\n\
+         tension: {ns_min}..={ns_max}\n\
+         Never emit a delta that pushes `current + delta` below min or above max (e.g., if `tension=0` and min is `0`, `tension_delta` must be `>= 0`).\n",
         a_min = dl.affection.min,
         a_max = dl.affection.max,
         t_min = dl.trust.min,
         t_max = dl.trust.max,
         n_min = dl.tension.min,
         n_max = dl.tension.max,
+        as_min = al.min,
+        as_max = al.max,
+        ts_min = tl.min,
+        ts_max = tl.max,
+        ns_min = nl.min,
+        ns_max = nl.max,
     ));
     s.push_str(
         "\n# Relationship state update policy\n\
@@ -1402,5 +1416,41 @@ mod tests {
             "plain free actions keep their prompt byte-shape (no directive line)"
         );
         assert_eq!(with.hash, again.hash, "the directive line is deterministic");
+    }
+
+    #[test]
+    fn system_prompt_includes_cumulative_stat_bounds() {
+        let (mut pack, state) = minimal_fixture();
+        let default_bundle = build_prompt(&pack, &state, &[], None);
+        assert!(
+            default_bundle
+                .system
+                .contains("# Stat bounds (total after delta, inclusive)"),
+            "{}",
+            default_bundle.system
+        );
+        assert!(
+            default_bundle.system.contains("tension: -100..=100"),
+            "{}",
+            default_bundle.system
+        );
+
+        pack.rules.stat_limits_by_axis = Some(story_model::DeltaLimits {
+            affection: story_model::Int16Range {
+                min: -100,
+                max: 100,
+            },
+            trust: story_model::Int16Range {
+                min: -100,
+                max: 100,
+            },
+            tension: story_model::Int16Range { min: 0, max: 30 },
+        });
+        let custom_bundle = build_prompt(&pack, &state, &[], None);
+        assert!(
+            custom_bundle.system.contains("tension: 0..=30"),
+            "{}",
+            custom_bundle.system
+        );
     }
 }

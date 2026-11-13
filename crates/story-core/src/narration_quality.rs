@@ -13,6 +13,7 @@ use story_model::{GameState, HistoryEntry, StatePatch, TurnSummary};
 const HISTORY_WINDOW: usize = 4;
 const MAX_MOTIFS: usize = 8;
 const MIN_REUSED_MOTIFS: usize = 3;
+const MIN_REUSED_MOTIF_FREQUENCY: usize = 3;
 
 /// A narration defect that must be repaired before the turn can be committed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -86,7 +87,7 @@ impl NarrationQualityReport {
 /// rejected candidate.
 pub fn repair_is_distinct(rejected: &str, repaired: &str) -> bool {
     prose_fingerprint(rejected) != prose_fingerprint(repaired)
-        && !highly_similar(rejected, repaired)
+        && !highly_similar(repaired, rejected)
 }
 
 /// Evaluate a candidate before it reaches history/save.
@@ -122,15 +123,15 @@ pub fn assess_narration(
         }
     }
 
+    let has_progress = patch_changes_game(game, patch) || summary.is_some_and(summary_has_progress);
     let motifs = reused_motifs(&game.history, narration);
-    if motifs.len() >= MIN_REUSED_MOTIFS {
+    if !has_progress && motifs.len() >= MIN_REUSED_MOTIFS {
         issues.push(NarrationQualityIssue::ReusedMotifs { motifs });
     }
 
     if enforce_progress
         && !game.history.is_empty()
-        && !patch_changes_game(game, patch)
-        && summary.is_none_or(|summary| !summary_has_progress(summary))
+        && !has_progress
         && game
             .history
             .last()
@@ -157,7 +158,9 @@ fn reused_motifs(history: &[HistoryEntry], candidate: &str) -> Vec<String> {
     let candidate_tokens = content_tokens(candidate);
     motif_document_frequency(history)
         .into_iter()
-        .filter(|(motif, frequency)| *frequency >= 2 && candidate_tokens.contains(motif))
+        .filter(|(motif, frequency)| {
+            *frequency >= MIN_REUSED_MOTIF_FREQUENCY && candidate_tokens.contains(motif)
+        })
         .take(MAX_MOTIFS)
         .map(|(motif, _)| motif)
         .collect()
@@ -177,11 +180,21 @@ fn motif_document_frequency(history: &[HistoryEntry]) -> Vec<(String, usize)> {
 }
 
 fn highly_similar(candidate: &str, previous: &str) -> bool {
+    let candidate_chars = prose_fingerprint(candidate).chars().count();
     let candidate_sentences = sentence_fingerprints(candidate);
     let previous_sentences = sentence_fingerprints(previous);
-    if candidate_sentences
-        .iter()
-        .any(|sentence| sentence.chars().count() >= 32 && previous_sentences.contains(sentence))
+    let mut matched_long_count = 0usize;
+    let mut matched_long_chars = 0usize;
+    for sentence in &candidate_sentences {
+        let len = sentence.chars().count();
+        if len >= 32 && previous_sentences.contains(sentence) {
+            matched_long_count += 1;
+            matched_long_chars += len;
+        }
+    }
+    if matched_long_count >= 2
+        || (matched_long_chars > 0
+            && (matched_long_chars * 4 >= candidate_chars || matched_long_chars >= 64))
     {
         return true;
     }
@@ -262,21 +275,35 @@ const STOPWORDS: &[&str] = &[
     "그러나",
     "하지만",
     "그래서",
+    "그런데",
+    "그러면",
+    "그러자",
+    "아니면",
+    "아니라",
+    "아닌",
     "다시",
     "조금",
+    "조금씩",
     "잠시",
+    "잠깐",
     "지금",
     "이미",
     "아직",
     "그대로",
+    "여전히",
+    "그냥",
     "자신",
     "서로",
     "정도",
     "사이",
+    "사이로",
     "순간",
+    "동안",
     "말",
     "말을",
     "말이",
+    "대답",
+    "대신",
     "목소리",
     "유나",
     "나무",
@@ -289,7 +316,17 @@ const STOPWORDS: &[&str] = &[
     "내가",
     "했다",
     "있다",
+    "있고",
+    "있는",
+    "있어",
+    "있던",
+    "있었다",
     "없다",
+    "없고",
+    "없는",
+    "없어",
+    "없던",
+    "없었다",
     "한다",
     "하는",
     "하고",
@@ -297,6 +334,46 @@ const STOPWORDS: &[&str] = &[
     "된다",
     "됐다",
     "위해",
+    "어떤",
+    "어떻게",
+    "어느",
+    "무슨",
+    "그런",
+    "이런",
+    "저런",
+    "모든",
+    "다른",
+    "같은",
+    "마치",
+    "결국",
+    "계속",
+    "먼저",
+    "바로",
+    "사실",
+    "혹시",
+    "아마",
+    "갑자기",
+    "점점",
+    "서서히",
+    "살짝",
+    "조용히",
+    "천천히",
+    "가만히",
+    "건지",
+    "건가",
+    "것을",
+    "것이",
+    "것은",
+    "것도",
+    "거야",
+    "거다",
+    "앞에",
+    "뒤로",
+    "위로",
+    "아래",
+    "속에",
+    "안에서",
+    "밖으로",
     "그",
     "이",
     "저",
@@ -579,6 +656,147 @@ mod tests {
         assert!(
             !report.issues.contains(&NarrationQualityIssue::Empty),
             "readable prose is not Empty: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn common_korean_function_words_are_excluded_from_motifs() {
+        let history = vec![
+            entry(
+                1,
+                "유나는 여전히 대답 없이 창밖만 보고 있고 어떤 말도 건네지 않았다.",
+            ),
+            entry(
+                2,
+                "그냥 앉아 있는 시간 속에서 아니면 먼저 말을 꺼내야 하는 건지 고민했다.",
+            ),
+            entry(
+                3,
+                "여전히 침묵이 있고 어떤 대답 없이 아니면 그냥 커피만 바라보았다.",
+            ),
+        ];
+        let motifs = recurring_motifs(&history);
+        for word in ["여전히", "대답", "있고", "어떤", "그냥", "아니면", "건지"] {
+            assert!(
+                !motifs.contains(&word.to_string()),
+                "function word {word:?} leaked into motifs: {motifs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_turn_setting_overlap_does_not_hard_reject_turn_three() {
+        let pack = crate::tests_support::sample_pack();
+        let mut game = crate::engine::EngineState::initial(&pack).game;
+        game.history.extend([
+            entry(
+                1,
+                "카페 창밖으로 가로등 불빛이 번지고 은색 시계가 반짝인다.",
+            ),
+            entry(
+                2,
+                "유나는 은색 시계를 만지작거리며 창밖 가로등을 바라보았다.",
+            ),
+        ]);
+        let report = assess_narration(
+            &game,
+            "커피잔을 밀어둔 채 은색 시계와 창밖 가로등을 스치듯 보고 질문을 던졌다.",
+            &StatePatch::default(),
+            None,
+            false,
+        );
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|issue| matches!(issue, NarrationQualityIssue::ReusedMotifs { .. })),
+            "2 turns of overlap must not hard-reject turn 3: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn reused_setting_motifs_with_real_progress_are_not_hard_rejected() {
+        let pack = crate::tests_support::sample_pack();
+        let mut game = crate::engine::EngineState::initial(&pack).game;
+        game.history.extend([
+            entry(1, "카페 창밖 빗소리 사이로 재즈 선율이 흐른다."),
+            entry(2, "카페 안의 재즈가 잦아들고 창밖 불빛이 흔들린다."),
+            entry(3, "창밖을 등진 채 카페 테이블 위의 재즈 팸플릿을 넘겼다."),
+        ]);
+        let mut patch = StatePatch::default();
+        patch
+            .tension_delta
+            .insert(story_model::CharacterId("c-namu".to_string()), 1);
+        let report = assess_narration(
+            &game,
+            "새 손님이 들어선 카페 문 너머로 창밖 우산과 재즈 LP가 나란히 놓였다.",
+            &patch,
+            None,
+            true,
+        );
+        assert!(
+            report.is_ok(),
+            "novel prose with state progress in the same setting must pass: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn single_callback_sentence_in_long_novel_turn_is_allowed() {
+        let pack = crate::tests_support::sample_pack();
+        let mut game = crate::engine::EngineState::initial(&pack).game;
+        let callback =
+            "아니면 당신이 오늘 나를 부른 진짜 이유가 뭔지 지금이라도 짧게라도 말해줄래요";
+        game.history.push(entry(
+            1,
+            &format!("비 오는 카페 창가에서 두 사람이 마주 앉았다. {callback}?"),
+        ));
+        let candidate = format!(
+            "유나는 이미 가방을 고쳐 멘 채 자리에서 일어날 준비를 마쳤다. \
+             카페 안의 공기는 폐점을 앞둔 서늘한 정적과 빗소리로 가득 차 대화의 여백을 메운다. \
+             창밖으로 시선을 던진 그녀의 옆얼굴에는 피로감이 짙게 배어 있고 손목 시계가 차갑게 빛난다. \
+             {callback}? \
+             카운터 너머 주인은 의자를 정리하며 마감 준비를 서두르고 가로등 불빛이 유리창에 길게 번졌다. \
+             이 어정쩡한 재회가 흐지부지 끝나기 전에 무언가 분명한 대답을 꺼내야 할 순간이 다가오고 있다."
+        );
+        let mut patch = StatePatch::default();
+        patch
+            .tension_delta
+            .insert(story_model::CharacterId("c-namu".to_string()), 1);
+        let report = assess_narration(&game, &candidate, &patch, None, true);
+        assert!(
+            report.is_ok(),
+            "one short callback sentence inside long novel prose should pass: {:?}",
+            report.issues
+        );
+        assert!(repair_is_distinct(
+            &format!("유나는 다른 이야기를 이어갔다. {callback}."),
+            &candidate,
+        ));
+    }
+
+    #[test]
+    fn multiple_copied_long_sentences_in_long_turn_are_rejected() {
+        let pack = crate::tests_support::sample_pack();
+        let mut game = crate::engine::EngineState::initial(&pack).game;
+        let s1 = "유나는 접어 둔 초대장을 테이블 위에 천천히 펴고 오늘 저녁 전시회의 정확한 주소를 가리켰다";
+        let s2 = "창밖으로 굵은 빗줄기가 쏟아지는 가운데 카페 안의 재즈 선율이 낮게 바닥을 울리며 흘렀다";
+        game.history
+            .push(entry(1, &format!("{s1}. 이어서 잠시 숨을 골랐다. {s2}.")));
+        let candidate = format!(
+            "새로운 손님이 문을 열고 들어섰다. {s1}. \
+             바리스타가 주문표를 정리하며 카운터 뒤로 물러났다. {s2}. \
+             유나는 계산서를 집어 들며 자리에서 일어날 채비를 했다."
+        );
+        let report = assess_narration(&game, &candidate, &StatePatch::default(), None, false);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| matches!(issue, NarrationQualityIssue::HighSimilarity { turn: 1 })),
+            "two copied long sentences must still trigger HighSimilarity: {:?}",
             report.issues
         );
     }

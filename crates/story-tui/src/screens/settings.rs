@@ -201,8 +201,13 @@ fn render_provider_block(frame: &mut Frame, area: Rect, view: &SettingsView<'_>)
         ),
         Span::styled("ms", Styles::muted()),
     ]));
-    // Non-loopback warning.
-    if !view.provider.is_loopback {
+    // Non-loopback warning / offline built-in notice.
+    if view.provider.base_url.starts_with("builtin://") {
+        lines.push(Line::from(vec![Span::styled(
+            "✓ 오프라인 내장 엔진 — 외부 서버 없이 동작합니다.",
+            Styles::muted(),
+        )]));
+    } else if !view.provider.is_loopback {
         lines.push(Line::from(vec![Span::styled(
             "⚠ 주의: base_url이 루프백이 아닙니다 — 외부로 전송될 수 있습니다.",
             Style::default()

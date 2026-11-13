@@ -2,7 +2,10 @@
 //!
 //! Stage 2 (reference): an unknown id is *dropped* — the sanitized patch
 //! loses the entry, and each drop is audited as one warning plus one
-//! `Rejected` change-log entry. Stages 3–5: a violation is rejected with the
+//! `Rejected` change-log entry. Stage 2.5 clamps projected affection/trust/
+//! tension that would leave `stat_limits` to the remaining headroom (warning).
+//! Stages 3–5: remaining violations (illegal delta magnitude, numbers,
+//! strings, inventory, relationship/location) are rejected with the
 //! documented reason code, and a just-in-bounds patch is accepted.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -401,7 +404,7 @@ fn delta_above_plus_3_is_rejected() {
 }
 
 #[test]
-fn projected_stat_above_plus_100_is_rejected() {
+fn projected_stat_above_ceiling_is_clamped_with_warning() {
     let mut st = fresh_state();
     st.characters
         .get_mut(&CharacterId("c-namu".to_string()))
@@ -409,28 +412,57 @@ fn projected_stat_above_plus_100_is_rejected() {
         .affection = 99;
     let rules = fresh_rules();
     let mut patch = StatePatch::default();
-    // 99 + 3 = 102 > 100 → reject even though the delta magnitude is in range.
+    // 99 + 3 = 102 > 100 → clamp to remaining headroom (+1), keep the turn.
     patch
         .affection_delta
         .insert(CharacterId("c-namu".to_string()), 3);
-    let err = run(&st, &rules, &patch).unwrap_err();
-    assert_eq!(reason(&err), Some(PATCH_STAT_OUT_OF_RANGE));
+    let outcome = run(&st, &rules, &patch).expect("clamped patch is accepted");
+    assert_eq!(
+        outcome
+            .sanitized
+            .affection_delta
+            .get(&CharacterId("c-namu".to_string()))
+            .copied(),
+        Some(1)
+    );
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .any(|w| w.code == PATCH_STAT_OUT_OF_RANGE),
+        "expected clamp warning: {:?}",
+        outcome.warnings
+    );
 }
 
 #[test]
-fn projected_stat_below_minus_100_is_rejected() {
+fn projected_stat_below_floor_is_dropped_with_warning() {
     let mut st = fresh_state();
     st.characters
         .get_mut(&CharacterId("c-namu".to_string()))
         .unwrap()
-        .affection = -98;
+        .affection = -100;
     let rules = fresh_rules();
     let mut patch = StatePatch::default();
+    // Already at floor; -3 would go to -103 → drop the delta entirely.
     patch
         .affection_delta
         .insert(CharacterId("c-namu".to_string()), -3);
-    let err = run(&st, &rules, &patch).unwrap_err();
-    assert_eq!(reason(&err), Some(PATCH_STAT_OUT_OF_RANGE));
+    let outcome = run(&st, &rules, &patch).expect("clamped patch is accepted");
+    assert!(
+        !outcome
+            .sanitized
+            .affection_delta
+            .contains_key(&CharacterId("c-namu".to_string()))
+    );
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .any(|w| w.code == PATCH_STAT_OUT_OF_RANGE),
+        "expected clamp warning: {:?}",
+        outcome.warnings
+    );
 }
 
 #[test]

@@ -2015,7 +2015,26 @@ fn reduce_accept_writer_finish(
     };
 
     let writer: WriterResult =
-        finalize_writer_output(finish.full_text, validated, pending.generation_id)?;
+        match finalize_writer_output(finish.full_text, validated, pending.generation_id) {
+            Ok(result) => result,
+            Err(err) => {
+                let error_view = domain_error_view(&err);
+                let mut restored = clone_state(state);
+                restored.game = pending.checkpoint.clone();
+                restored.pending = None;
+                restored.retry_pending = Some(pending.clone());
+                restored.lineage = Vec::new();
+                let view = build_view(&restored, pack, None, Some(error_view.clone()));
+                return Ok(Transition {
+                    state: restored,
+                    effects: vec![
+                        EngineEffect::ShowRecoverableError(error_view),
+                        EngineEffect::PublishView(Box::new(view)),
+                    ],
+                    audit: Vec::new(),
+                });
+            }
+        };
     let mut quality = crate::narration_quality::assess_narration(
         &pending.checkpoint,
         &writer.narration,

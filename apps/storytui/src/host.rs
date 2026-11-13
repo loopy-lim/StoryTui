@@ -17,7 +17,9 @@ use story_core::engine_cmd::{EngineCommand, EngineEffect};
 use story_model::TruncationStatus;
 use story_model::{DomainErrorView, ProviderError, ProviderHealth, StoryPack};
 use story_persistence::{PackLoader, SaveStore};
-use story_provider::{LlmProvider, OpenAiCompatibleProvider};
+use story_provider::{
+    BUILTIN_DEFAULT_MODEL, BUILTIN_MODELS, BUILTIN_PROVIDER_ID, LlmProvider, is_builtin_config,
+};
 use story_tui::{App, HomeRequest};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio_util::sync::CancellationToken;
@@ -249,77 +251,131 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
     let mut config = config;
     let mut pack = PackLoader::load(&config.pack_dir)
         .map_err(|e| format!("Story Pack을 불러오지 못했습니다: {e}"))?;
+    let mut user_settings = load_user_settings(&config.save_dir)?;
+    user_settings.fold_legacy_stage_models(&config.provider.name);
+
     let mut provider_config = config.provider.clone();
     let mut repaired_main_model = false;
     // Which stages the preflight repairs — only those are pinned to the
     // profile below, so untouched stages keep inheriting their defaults.
     let mut repaired_stages = settings::StageRepairs::default();
-    // First-run auto-setup: with no model selected yet (a fresh clone — the
-    // checked-in template intentionally carries no model id), find a local
-    // OpenAI-compatible server and adopt it for this session. The model is
-    // persisted below through the repaired-model path; the URL never is.
-    let mut discovery: Option<settings::DiscoveryOutcome> = None;
-    if provider_config.model.trim().is_empty() {
-        match settings::discover_session_provider(&provider_config).await {
-            settings::DiscoveryOutcome::Connected { base_url, model } => {
-                tracing::info!(
-                    base_url = %base_url,
-                    model = %model,
-                    "no model configured; adopting a detected local server"
-                );
-                provider_config.base_url = base_url;
-                provider_config.model = model;
-                config.provider = provider_config.clone();
-                repaired_main_model = true;
-            }
-            other => discovery = Some(other),
-        }
-    }
-    let mut provider = Arc::new(
-        OpenAiCompatibleProvider::new(provider_config.clone())
-            .map_err(|e| format!("provider를 만들지 못했습니다: {e}"))?,
-    );
-    match provider.list_models().await {
-        Ok(advertised) if !advertised.is_empty() => {
-            if let Some(model) = settings::reconcile_active_model(
-                &provider_config.model,
-                &config.fallback_model,
-                &advertised,
-            ) && model != provider_config.model
+    let mut auto_fallback_builtin = false;
+    let pinned_builtin = user_settings.provider.as_deref() == Some(BUILTIN_PROVIDER_ID)
+        || is_builtin_config(&provider_config);
+
+    if pinned_builtin {
+        if !is_builtin_config(&provider_config) {
+            let mut builtin = story_provider::builtin_provider_config();
+            if let Some(model) = &user_settings.model
+                && BUILTIN_MODELS.contains(&model.as_str())
             {
-                tracing::warn!(
-                    stale_model = %provider_config.model,
-                    fallback_model = %model,
-                    "configured model is not advertised; using an available local model"
-                );
-                provider_config.model = model;
-                repaired_main_model = true;
-                config.provider = provider_config.clone();
-                provider = Arc::new(
-                    OpenAiCompatibleProvider::new(provider_config.clone())
-                        .map_err(|e| format!("대체 provider를 만들지 못했습니다: {e}"))?,
-                );
+                builtin.model = model.clone();
             }
-            let repair_stage = |repaired: &mut bool, stage_model: &mut Option<String>| {
-                if let Some(current) = stage_model.clone()
-                    && !advertised.iter().any(|model| model == &current)
-                {
-                    tracing::warn!(
-                        stale_model = %current,
-                        fallback_model = %provider_config.model,
-                        "stage model is not advertised; using the active model"
-                    );
-                    *stage_model = Some(provider_config.model.clone());
-                    *repaired = true;
-                }
-            };
-            repair_stage(&mut repaired_stages.director, &mut config.director_model);
-            repair_stage(&mut repaired_stages.choice, &mut config.choice_model);
-            repair_stage(&mut repaired_stages.writer, &mut config.writer_model);
+            config.base_sampling = (builtin.temperature, builtin.top_p, builtin.top_k);
+            user_settings.apply_sampling_taste(&mut builtin);
+            provider_config = builtin;
+            config.provider = provider_config.clone();
+        } else if !BUILTIN_MODELS.contains(&provider_config.model.as_str()) {
+            provider_config.model = BUILTIN_DEFAULT_MODEL.to_string();
+            config.provider = provider_config.clone();
         }
-        Ok(_) => tracing::warn!("provider advertised an empty model list"),
-        Err(error) => tracing::warn!(%error, "provider model preflight failed"),
+    } else {
+        let preferred_url = provider_config.base_url.clone();
+        let preferred_name = provider_config.name.clone();
+        let previous_model = provider_config.model.clone();
+        match settings::discover_best_http_provider(
+            &provider_config,
+            &config.providers,
+            &config.fallback_model,
+        )
+        .await
+        {
+            settings::HttpDiscoveryResult::Connected {
+                config: adopted,
+                advertised,
+            } => {
+                let mut adopted = *adopted;
+                let switched_profile = adopted.name != preferred_name;
+                if switched_profile {
+                    tracing::info!(
+                        from = %preferred_name,
+                        to = %adopted.name,
+                        base_url = %adopted.base_url,
+                        model = %adopted.model,
+                        "primary server unavailable; automatically selected a live configured provider"
+                    );
+                    config.base_sampling = (adopted.temperature, adopted.top_p, adopted.top_k);
+                    user_settings.apply_sampling_taste(&mut adopted);
+                    let saved = user_settings.stage_models.get(&adopted.name);
+                    let default = config.stage_defaults.get(&adopted.name);
+                    let current = StageModels {
+                        director: config.director_model.clone(),
+                        choice: config.choice_model.clone(),
+                        writer: config.writer_model.clone(),
+                    };
+                    let (resolved, repairs) = settings::resolve_stage_assignments(
+                        saved,
+                        default,
+                        &current,
+                        &advertised,
+                        &adopted.model,
+                    );
+                    config.director_model = resolved.director;
+                    config.choice_model = resolved.choice;
+                    config.writer_model = resolved.writer;
+                    repaired_stages = repairs;
+                } else if adopted.base_url != preferred_url || adopted.model != previous_model {
+                    tracing::info!(
+                        base_url = %adopted.base_url,
+                        model = %adopted.model,
+                        "automatically connected to a live local model server"
+                    );
+                    if previous_model.trim().is_empty() || adopted.base_url == preferred_url {
+                        repaired_main_model = true;
+                    }
+                }
+                provider_config = adopted;
+                config.provider = provider_config.clone();
+                if !advertised.is_empty() {
+                    let repair_stage = |repaired: &mut bool, stage_model: &mut Option<String>| {
+                        if let Some(current) = stage_model.clone()
+                            && !advertised.iter().any(|model| model == &current)
+                        {
+                            tracing::warn!(
+                                stale_model = %current,
+                                fallback_model = %provider_config.model,
+                                "stage model is not advertised; using the active model"
+                            );
+                            *stage_model = Some(provider_config.model.clone());
+                            *repaired = true;
+                        }
+                    };
+                    repair_stage(&mut repaired_stages.director, &mut config.director_model);
+                    repair_stage(&mut repaired_stages.choice, &mut config.choice_model);
+                    repair_stage(&mut repaired_stages.writer, &mut config.writer_model);
+                }
+            }
+            settings::HttpDiscoveryResult::NoChatModel
+            | settings::HttpDiscoveryResult::NoServer => {
+                tracing::info!(
+                    preferred = %preferred_name,
+                    "no live HTTP model server found; falling back to the built-in offline story provider"
+                );
+                auto_fallback_builtin = true;
+                let mut builtin = story_provider::builtin_provider_config();
+                config.base_sampling = (builtin.temperature, builtin.top_p, builtin.top_k);
+                user_settings.apply_sampling_taste(&mut builtin);
+                provider_config = builtin;
+                config.provider = provider_config.clone();
+                config.director_model = None;
+                config.choice_model = None;
+                config.writer_model = None;
+            }
+        }
     }
+
+    let mut provider = settings::build_provider(&provider_config)
+        .map_err(|e| format!("provider를 만들지 못했습니다: {e}"))?;
     let save_store = SaveStore::open(&config.save_dir)
         .map_err(|e| format!("세이브 디렉터리를 열지 못했습니다: {e}"))?;
 
@@ -351,11 +407,6 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
             None
         }
     };
-    // Player-owned overrides decide the effective generation path BEFORE any
-    // engine/resume stamping: every later reader (resume restore, pack swap,
-    // new game, saves) reads `config.use_director_writer`.
-    let mut user_settings = load_user_settings(&config.save_dir)?;
-    user_settings.fold_legacy_stage_models(&config.provider.name);
     // Player identity + author's note: the user-settings overrides win over
     // the base `[player]` profile; the sections are (re)written idempotently,
     // so later persona/note edits just replace them.
@@ -399,14 +450,9 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
     app.set_greetings(greeting_labels(&pack));
     app.set_current_pack_dir(&config.pack_dir.to_string_lossy());
     {
-        // The roster is exactly the load()-assembled set: base profile first,
-        // then every `[[providers]]` entry — never prepended again, or the
-        // active profile would render twice.
-        let roster: Vec<(String, String)> = config
-            .providers
-            .iter()
-            .map(|entry| (entry.name.clone(), entry.base_url.clone()))
-            .collect();
+        let roster = settings::provider_roster_labels(&settings::effective_provider_roster(
+            &config.providers,
+        ));
         app.set_providers(&roster, &provider_config.name);
     }
     // The `v` toggle persists an explicit preference; absent means the [tts]
@@ -440,14 +486,10 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
             &config.player,
         );
     }
-    // Start-menu status line: guide an unconfigured first run, and note a
-    // down server for a returning user — without blocking the menu.
-    app.set_home_status(if provider_config.model.trim().is_empty() {
-        Some(settings::unconfigured_home_status(
-            discovery
-                .as_ref()
-                .unwrap_or(&settings::DiscoveryOutcome::NoServer),
-        ))
+    // Start-menu status line: inform the player when running on automatic
+    // offline fallback (gray — ready to play) or when a pinned HTTP server is down.
+    app.set_home_status(if auto_fallback_builtin {
+        Some(settings::builtin_fallback_home_status())
     } else if health == ProviderHealth::Unavailable {
         Some(settings::server_down_home_status())
     } else {
@@ -516,21 +558,25 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                         let pending = app.view.loading.as_ref().map(|v| v.generation_id);
                         if let Some(command) = app.handle_key(key, pending) {
                             note_player_turn_command(&command, &mut automation);
-                            dispatch(command, &mut engine, &mut app, &pack, &provider, &config, &save_store, &tts, &mut scene_images, &tx, &mut cancellation).await?;
+                            if let Err(error) = dispatch(command, &mut engine, &mut app, &pack, &provider, &config, &save_store, &tts, &mut scene_images, &tx, &mut cancellation).await {
+                                surface_recoverable_host_error(&mut app, "dispatch(key)", error);
+                            }
                         }
-                        handle_ui_requests(
+                        if let Err(error) = handle_ui_requests(
                             &mut app, &mut engine, &mut pack, &mut provider_config,
                             &mut provider, &mut user_settings, &mut config,
                             &save_store, &tts, &mut scene_images, base_image_picker.as_ref(),
                             &tx, &mut cancellation, &mut resume_engine, &mut automation,
-                        ).await?;
+                        ).await {
+                            surface_recoverable_host_error(&mut app, "ui_requests(key)", error);
+                        }
                         needs_redraw = true;
                     }
                     Event::Mouse(mouse) => {
                         app.handle_mouse(mouse);
                         if let Some(command) = app.take_mouse_command() {
                             note_player_turn_command(&command, &mut automation);
-                            dispatch(
+                            if let Err(error) = dispatch(
                                 command,
                                 &mut engine,
                                 &mut app,
@@ -543,14 +589,20 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                                 &tx,
                                 &mut cancellation,
                             )
-                            .await?;
+                            .await {
+                                surface_recoverable_host_error(&mut app, "dispatch(mouse)", error);
+                                needs_redraw = true;
+                            }
                         }
-                        handle_ui_requests(
+                        if let Err(error) = handle_ui_requests(
                             &mut app, &mut engine, &mut pack, &mut provider_config,
                             &mut provider, &mut user_settings, &mut config,
                             &save_store, &tts, &mut scene_images, base_image_picker.as_ref(),
                             &tx, &mut cancellation, &mut resume_engine, &mut automation,
-                        ).await?;
+                        ).await {
+                            surface_recoverable_host_error(&mut app, "ui_requests(mouse)", error);
+                            needs_redraw = true;
+                        }
                         // Movement carries no render state (hover is not
                         // rendered): a full frame per move event starved the
                         // loop while the cursor crossed the window. Clicks
@@ -575,10 +627,16 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                 if app.should_quit { break; }
             }
             Some(message) = rx.recv() => {
-                needs_redraw = handle_host_message(
+                match handle_host_message(
                     message, &mut engine, &mut app, &pack, &provider, &config, &save_store,
                     &tts, &mut scene_images, &tx, &mut cancellation, &mut automation,
-                ).await?;
+                ).await {
+                    Ok(redraw) => needs_redraw = redraw,
+                    Err(error) => {
+                        surface_recoverable_host_error(&mut app, "host_message", error);
+                        needs_redraw = true;
+                    }
+                }
             }
             _ = frame_tick.tick(), if needs_redraw || app.view.loading.is_some() => {
                 // While a generation is pending, the only thing that changes
@@ -587,12 +645,17 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                 // a measurable slice of a core (probe: 6.9 ms/frame on a
                 // 120-turn stack) and starved the terminal. Streaming chunks
                 // and events keep their own `needs_redraw`.
-                if handle_frame_automation(
+                match handle_frame_automation(
                     &mut engine, &mut app, &pack, &mut provider_config, &mut provider,
                     &mut user_settings, &mut config, &save_store, &tts, &mut scene_images,
                     &tx, &mut cancellation, &mut automation, &mut last_probe, Instant::now(),
-                ).await? {
-                    needs_redraw = true;
+                ).await {
+                    Ok(true) => needs_redraw = true,
+                    Ok(false) => {}
+                    Err(error) => {
+                        surface_recoverable_host_error(&mut app, "frame_automation", error);
+                        needs_redraw = true;
+                    }
                 }
                 let loading_second = app
                     .view
@@ -612,12 +675,17 @@ pub async fn run(config: RuntimeConfig) -> Result<(), String> {
                 // a second — the redraw-gated frame arm above is disabled
                 // while nothing changes, so a server coming back would
                 // otherwise go unnoticed until the next keypress.
-                if handle_frame_automation(
+                match handle_frame_automation(
                     &mut engine, &mut app, &pack, &mut provider_config, &mut provider,
                     &mut user_settings, &mut config, &save_store, &tts, &mut scene_images,
                     &tx, &mut cancellation, &mut automation, &mut last_probe, Instant::now(),
-                ).await? {
-                    needs_redraw = true;
+                ).await {
+                    Ok(true) => needs_redraw = true,
+                    Ok(false) => {}
+                    Err(error) => {
+                        surface_recoverable_host_error(&mut app, "probe_tick", error);
+                        needs_redraw = true;
+                    }
                 }
             }
         }
@@ -655,7 +723,7 @@ pub async fn handle_host_message(
     engine: &mut EngineState,
     app: &mut App,
     pack: &StoryPack,
-    provider: &Arc<OpenAiCompatibleProvider>,
+    provider: &Arc<dyn LlmProvider>,
     config: &RuntimeConfig,
     save_store: &SaveStore,
     tts: &TtsService,
@@ -921,7 +989,7 @@ pub async fn post_accept_automation(
     engine: &mut EngineState,
     app: &mut App,
     pack: &StoryPack,
-    provider: &Arc<OpenAiCompatibleProvider>,
+    provider: &Arc<dyn LlmProvider>,
     config: &RuntimeConfig,
     save_store: &SaveStore,
     tts: &TtsService,
@@ -1003,7 +1071,7 @@ pub async fn handle_frame_automation(
     app: &mut App,
     pack: &StoryPack,
     provider_config: &mut story_provider::ProviderConfig,
-    provider: &mut Arc<OpenAiCompatibleProvider>,
+    provider: &mut Arc<dyn LlmProvider>,
     user_settings: &mut UserSettings,
     config: &mut RuntimeConfig,
     save_store: &SaveStore,
@@ -1039,7 +1107,7 @@ pub async fn handle_frame_automation(
         needs_redraw = true;
     }
     if probe_due(now, *last_probe, app.view.loading.is_some())
-        && (provider_config.model.trim().is_empty()
+        && (settings::should_auto_discover(provider_config, user_settings)
             || app
                 .provider_health()
                 .is_none_or(|health| health == ProviderHealth::Unavailable))
@@ -1294,7 +1362,7 @@ async fn handle_ui_requests(
     engine: &mut EngineState,
     pack: &mut StoryPack,
     provider_config: &mut story_provider::ProviderConfig,
-    provider: &mut Arc<OpenAiCompatibleProvider>,
+    provider: &mut Arc<dyn LlmProvider>,
     user_settings: &mut UserSettings,
     config: &mut RuntimeConfig,
     save_store: &SaveStore,
@@ -1327,7 +1395,8 @@ async fn handle_ui_requests(
             .await?;
         }
         // Keep the "turn the server on, then open settings" promise: while
-        // no model is selected, opening settings retries auto-setup first.
+        // no model is selected or running in auto-fallback built-in mode,
+        // opening settings retries auto-setup first.
         let reprobe = settings::reprobe_if_unconfigured(
             app,
             provider_config,
@@ -1339,11 +1408,19 @@ async fn handle_ui_requests(
         .await;
         match &reprobe {
             // An adopted server already refreshed the model list above.
-            Some(settings::DiscoveryOutcome::Connected { .. }) => {}
+            Some(settings::DiscoveryOutcome::Connected { .. }) => {
+                if app.home_status_text()
+                    == Some(settings::builtin_fallback_home_status().0.as_str())
+                {
+                    app.set_home_status(None);
+                }
+            }
             Some(other) => {
                 app.set_home_status(Some(settings::unconfigured_home_status(other)));
             }
-            None => settings::refresh_model_list(app, provider, provider_config, false).await,
+            None => {
+                settings::refresh_model_list(app, provider.as_ref(), provider_config, false).await
+            }
         }
         // Push the host-owned data the new settings modals edit: the note
         // prefill and the pack's lorebook (edits hot-swap via the engine and
@@ -1354,12 +1431,10 @@ async fn handle_ui_requests(
         app.set_lorebook_data(&pack.lorebook.entries, persisted);
     }
     if app.take_model_reload_requested() {
-        settings::refresh_model_list(app, provider, provider_config, true).await;
+        settings::refresh_model_list(app, provider.as_ref(), provider_config, true).await;
     }
     if let Some(name) = app.take_selected_provider() {
-        // Clone the roster: the call also needs `config` mutably for the
-        // stale-model repair.
-        let roster = config.providers.clone();
+        let roster = settings::effective_provider_roster(&config.providers);
         settings::apply_provider(
             app,
             &name,
@@ -1391,7 +1466,7 @@ async fn handle_ui_requests(
             model,
             config,
             provider_config,
-            provider,
+            provider.as_ref(),
             user_settings,
             tts,
         )
@@ -1403,7 +1478,7 @@ async fn handle_ui_requests(
             model,
             config,
             provider_config,
-            provider,
+            provider.as_ref(),
             user_settings,
             tts,
         )
@@ -1415,7 +1490,7 @@ async fn handle_ui_requests(
             model,
             config,
             provider_config,
-            provider,
+            provider.as_ref(),
             user_settings,
             tts,
         )
@@ -1891,13 +1966,23 @@ where
     }
 }
 
+fn surface_recoverable_host_error(app: &mut App, context: &str, error: String) {
+    tracing::error!(%context, %error, "recoverable host error surfaced instead of exiting");
+    app.view.error = Some(DomainErrorView {
+        code: "host_error".to_string(),
+        title_ko: "작업을 처리할 수 없습니다".to_string(),
+        message_ko: error,
+        recoverable: true,
+    });
+}
+
 #[allow(clippy::too_many_arguments)] // host adapter keeps all effect-owned handles explicit
 pub async fn dispatch(
     command: EngineCommand,
     engine: &mut EngineState,
     app: &mut App,
     pack: &story_model::StoryPack,
-    provider: &Arc<OpenAiCompatibleProvider>,
+    provider: &Arc<dyn LlmProvider>,
     config: &RuntimeConfig,
     save_store: &SaveStore,
     tts: &TtsService,
@@ -1910,18 +1995,24 @@ pub async fn dispatch(
     {
         token.cancel();
     }
-    let transition = reduce(engine, command, pack).map_err(|e| {
-        let view = DomainErrorView {
-            code: e.reason_code().unwrap_or("engine_error").to_string(),
-            title_ko: "명령을 처리할 수 없습니다".to_string(),
-            message_ko: e.to_string(),
-            recoverable: true,
-        };
-        app.view.error = Some(view);
-        e.to_string()
-    })?;
+    let transition = match reduce(engine, command, pack) {
+        Ok(transition) => transition,
+        Err(e) => {
+            let code = e.reason_code().unwrap_or("engine_error").to_string();
+            tracing::warn!(%code, error = %e, "engine command rejected; surfacing recoverable error");
+            app.view.error = Some(DomainErrorView {
+                code,
+                title_ko: "명령을 처리할 수 없습니다".to_string(),
+                message_ko: e.to_string(),
+                recoverable: true,
+            });
+            return Ok(());
+        }
+    };
     *engine = transition.state;
     saves::refresh_app_lists(app, engine, pack);
+
+    let mut deferred_error: Option<DomainErrorView> = None;
 
     for effect in transition.effects {
         match effect {
@@ -1939,13 +2030,18 @@ pub async fn dispatch(
             EngineEffect::ShowRecoverableError(error) => app.view.error = Some(error),
             // No model selected yet (first run before auto-setup succeeded):
             // block the HTTP round-trip with a friendly message instead of a
-            // confusing provider failure.
+            // confusing provider failure, and clear pending/loading so
+            // PublishView cannot leave an unresolvable spinner behind.
             EngineEffect::RequestGeneration { .. }
             | EngineEffect::RequestDirector { .. }
             | EngineEffect::RequestWriter { .. }
                 if provider.model_name().trim().is_empty() =>
             {
-                app.view.error = Some(DomainErrorView {
+                if let Some(pending) = engine.pending.take() {
+                    engine.game = pending.checkpoint;
+                    engine.lineage.clear();
+                }
+                deferred_error = Some(DomainErrorView {
                     code: "model_not_selected".to_string(),
                     title_ko: "모델이 아직 선택되지 않았어요".to_string(),
                     message_ko: "설정 메뉴에서 모델을 고른 뒤 시작해 주세요.".to_string(),
@@ -2087,6 +2183,10 @@ pub async fn dispatch(
                 });
             }
         }
+    }
+    if let Some(error) = deferred_error {
+        app.view.loading = None;
+        app.view.error = Some(error);
     }
     Ok(())
 }
