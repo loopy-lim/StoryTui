@@ -59,6 +59,14 @@ pub struct TurnRequest {
     /// Optional JSON Schema constraining the response, included only when the
     /// provider confirmed structured-output support.
     pub json_schema: Option<serde_json::Value>,
+    /// OpenAI-compatible frequency penalty override. When `None`, the provider
+    /// fills from its runtime config defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
+    /// OpenAI-compatible presence penalty override. When `None`, the provider
+    /// fills from its runtime config defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
 }
 
 // ---------------------------------------------------------------------------

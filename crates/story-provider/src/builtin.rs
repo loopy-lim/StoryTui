@@ -55,6 +55,14 @@ pub fn builtin_provider_config() -> ProviderConfig {
         context_budget_tokens: 24_576,
         structured_output: StructuredOutputMode::On,
         stream_turns: true,
+        frequency_penalty: 0.3,
+        presence_penalty: 0.15,
+        repetition_penalty: 1.05,
+        dry_multiplier: 0.8,
+        dry_base: 1.75,
+        dry_allowed_length: 2,
+        dry_penalty_range: 1024,
+        local_extra_samplers: true,
     }
 }
 

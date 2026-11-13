@@ -556,6 +556,8 @@ async fn mock_draft_round_trips_through_parser() {
                 top_k: 0,
                 max_tokens: 1,
                 json_schema: None,
+                frequency_penalty: None,
+                presence_penalty: None,
             },
             tokio_util::sync::CancellationToken::new(),
         )

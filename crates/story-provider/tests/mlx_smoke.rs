@@ -285,6 +285,8 @@ async fn mlx_choice_model_structured_safe_gate() {
         top_k: 40,
         max_tokens: 900,
         json_schema: Some(generated_choices_schema()),
+        frequency_penalty: None,
+        presence_penalty: None,
     };
     let draft = provider
         .generate_turn(request, CancellationToken::new())
@@ -365,6 +367,8 @@ async fn mlx_writer_model_korean_safe_contract_gate() {
         top_k: 40,
         max_tokens: 1_800,
         json_schema: Some(generated_turn_schema()),
+        frequency_penalty: None,
+        presence_penalty: None,
     };
     let draft = provider
         .generate_turn(request, CancellationToken::new())

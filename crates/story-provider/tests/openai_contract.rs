@@ -71,6 +71,8 @@ fn turn_request() -> TurnRequest {
         top_k: 40,
         max_tokens: 1800,
         json_schema: None,
+        frequency_penalty: None,
+        presence_penalty: None,
     }
 }
 

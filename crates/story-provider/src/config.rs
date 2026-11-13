@@ -118,6 +118,34 @@ pub struct ProviderConfig {
     /// non-streaming request.
     #[serde(default = "default_stream_turns")]
     pub stream_turns: bool,
+    /// OpenAI-compatible frequency penalty (anti-repetition). Sent when non-zero.
+    #[serde(default = "default_frequency_penalty")]
+    pub frequency_penalty: f32,
+    /// OpenAI-compatible presence penalty (anti-repetition). Sent when non-zero.
+    #[serde(default = "default_presence_penalty")]
+    pub presence_penalty: f32,
+    /// Kobold/llama.cpp-style repetition penalty. Omitted on the wire when
+    /// `<= 1.0`. Only sent when [`Self::local_extra_samplers`] is true.
+    #[serde(default = "default_repetition_penalty")]
+    pub repetition_penalty: f32,
+    /// DRY sampler multiplier. When `<= 0.0`, all `dry_*` fields are omitted
+    /// on the wire. Only sent when [`Self::local_extra_samplers`] is true.
+    #[serde(default = "default_dry_multiplier")]
+    pub dry_multiplier: f32,
+    /// DRY sampler base (exponent base for sequence length).
+    #[serde(default = "default_dry_base")]
+    pub dry_base: f32,
+    /// DRY allowed repeated length before penalty applies.
+    #[serde(default = "default_dry_allowed_length")]
+    pub dry_allowed_length: u32,
+    /// DRY lookback range in tokens.
+    #[serde(default = "default_dry_penalty_range")]
+    pub dry_penalty_range: u32,
+    /// When `false`, never send `repetition_penalty` / `dry_*` (cloud hosts
+    /// often reject them). Frequency/presence penalties are still sent when
+    /// non-zero.
+    #[serde(default = "default_local_extra_samplers")]
+    pub local_extra_samplers: bool,
 }
 
 impl ProviderConfig {
@@ -147,6 +175,14 @@ impl ProviderConfig {
             context_budget_tokens: default_context_budget_tokens(),
             structured_output: default_structured_output(),
             stream_turns: default_stream_turns(),
+            frequency_penalty: default_frequency_penalty(),
+            presence_penalty: default_presence_penalty(),
+            repetition_penalty: default_repetition_penalty(),
+            dry_multiplier: default_dry_multiplier(),
+            dry_base: default_dry_base(),
+            dry_allowed_length: default_dry_allowed_length(),
+            dry_penalty_range: default_dry_penalty_range(),
+            local_extra_samplers: default_local_extra_samplers(),
         }
     }
 }
@@ -239,6 +275,30 @@ fn default_structured_output() -> StructuredOutputMode {
 fn default_stream_turns() -> bool {
     true
 }
+fn default_frequency_penalty() -> f32 {
+    0.3
+}
+fn default_presence_penalty() -> f32 {
+    0.15
+}
+fn default_repetition_penalty() -> f32 {
+    1.05
+}
+fn default_dry_multiplier() -> f32 {
+    0.8
+}
+fn default_dry_base() -> f32 {
+    1.75
+}
+fn default_dry_allowed_length() -> u32 {
+    2
+}
+fn default_dry_penalty_range() -> u32 {
+    1024
+}
+fn default_local_extra_samplers() -> bool {
+    true
+}
 
 #[cfg(test)]
 mod tests {
@@ -263,6 +323,14 @@ mod tests {
         assert_eq!(c.max_retries, 2);
         assert_eq!(c.context_budget_tokens, 24_576);
         assert_eq!(c.structured_output, StructuredOutputMode::Auto);
+        assert_eq!(c.frequency_penalty, 0.3);
+        assert_eq!(c.presence_penalty, 0.15);
+        assert_eq!(c.repetition_penalty, 1.05);
+        assert_eq!(c.dry_multiplier, 0.8);
+        assert_eq!(c.dry_base, 1.75);
+        assert_eq!(c.dry_allowed_length, 2);
+        assert_eq!(c.dry_penalty_range, 1024);
+        assert!(c.local_extra_samplers);
         // 127.0.0.1 = loopback (ADR-002).
         assert!(crate::openai_compatible::is_loopback_base_url(&c.base_url));
     }

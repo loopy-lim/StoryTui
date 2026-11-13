@@ -279,6 +279,8 @@ impl OpenAiCompatibleProvider {
                 top_k: self.config.top_k,
                 max_tokens,
                 json_schema: json_schema.clone(),
+                frequency_penalty: None,
+                presence_penalty: None,
             };
             let send_rf =
                 !suppress_rf && self.structured_enabled() && request.json_schema.is_some();
@@ -396,6 +398,19 @@ impl OpenAiCompatibleProvider {
         };
         let mut body = ChatCompletionRequest::from_turn(&bounded_request, model_name, send_rf);
         body.max_tokens_field = self.config.max_tokens_field;
+        body.frequency_penalty = request
+            .frequency_penalty
+            .unwrap_or(self.config.frequency_penalty);
+        body.presence_penalty = request
+            .presence_penalty
+            .unwrap_or(self.config.presence_penalty);
+        if self.config.local_extra_samplers {
+            body.repetition_penalty = self.config.repetition_penalty;
+            body.dry_multiplier = self.config.dry_multiplier;
+            body.dry_base = self.config.dry_base;
+            body.dry_allowed_length = self.config.dry_allowed_length;
+            body.dry_penalty_range = self.config.dry_penalty_range;
+        }
         body
     }
 
@@ -1710,6 +1725,8 @@ mod tests {
             top_k: 0,
             max_tokens: 2,
             json_schema: None,
+            frequency_penalty: None,
+            presence_penalty: None,
         };
         let unchanged = bound_context(&request, 100);
         assert_eq!(unchanged.messages[1].content, request.messages[1].content);

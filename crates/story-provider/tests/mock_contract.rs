@@ -35,6 +35,8 @@ fn sample_request() -> TurnRequest {
         top_k: 0,
         max_tokens: 256,
         json_schema: None,
+        frequency_penalty: None,
+        presence_penalty: None,
     }
 }
 

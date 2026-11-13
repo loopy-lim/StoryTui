@@ -20,6 +20,10 @@ use story_model::{ChatMessage, DirectorRequest, TokenUsage, TurnRequest, WriterR
 /// a configurable key: local OpenAI-compatible servers expect `max_tokens`,
 /// while the OpenAI cloud API expects `max_completion_tokens`
 /// (see [`MaxTokensField`]). Key order mirrors the derive it replaces.
+///
+/// Anti-repetition samplers (`frequency_penalty` / `presence_penalty`, plus
+/// optional Kobold/llama.cpp `repetition_penalty` and DRY) are omitted when
+/// at their no-op values so cloud hosts that reject unknown keys stay happy.
 pub struct ChatCompletionRequest {
     /// Model id to target.
     pub model: String,
@@ -46,6 +50,20 @@ pub struct ChatCompletionRequest {
     /// Structured-output constraint, included only when the provider's
     /// capability confirms support AND the request carries a schema.
     pub response_format: Option<ResponseFormat>,
+    /// OpenAI-compatible frequency penalty. Omitted when `0.0`.
+    pub frequency_penalty: f32,
+    /// OpenAI-compatible presence penalty. Omitted when `0.0`.
+    pub presence_penalty: f32,
+    /// Kobold/llama.cpp repetition penalty. Omitted when `<= 1.0`.
+    pub repetition_penalty: f32,
+    /// DRY sampler multiplier. When `<= 0.0`, all `dry_*` fields are omitted.
+    pub dry_multiplier: f32,
+    /// DRY sampler base.
+    pub dry_base: f32,
+    /// DRY allowed repeated length.
+    pub dry_allowed_length: u32,
+    /// DRY lookback range in tokens.
+    pub dry_penalty_range: u32,
 }
 
 /// `stream_options` payload for streaming requests.
@@ -77,6 +95,21 @@ impl Serialize for ChatCompletionRequest {
         }
         if let Some(response_format) = &self.response_format {
             map.serialize_entry("response_format", response_format)?;
+        }
+        if self.frequency_penalty != 0.0 {
+            map.serialize_entry("frequency_penalty", &self.frequency_penalty)?;
+        }
+        if self.presence_penalty != 0.0 {
+            map.serialize_entry("presence_penalty", &self.presence_penalty)?;
+        }
+        if self.repetition_penalty > 1.0 {
+            map.serialize_entry("repetition_penalty", &self.repetition_penalty)?;
+        }
+        if self.dry_multiplier > 0.0 {
+            map.serialize_entry("dry_multiplier", &self.dry_multiplier)?;
+            map.serialize_entry("dry_base", &self.dry_base)?;
+            map.serialize_entry("dry_allowed_length", &self.dry_allowed_length)?;
+            map.serialize_entry("dry_penalty_range", &self.dry_penalty_range)?;
         }
         map.end()
     }
@@ -132,6 +165,15 @@ impl ChatCompletionRequest {
             stream: false,
             stream_options: None,
             response_format,
+            frequency_penalty: req.frequency_penalty.unwrap_or(0.0),
+            presence_penalty: req.presence_penalty.unwrap_or(0.0),
+            // Local-extra samplers stay at no-op until the provider fills them
+            // from config in `assemble_turn_body`.
+            repetition_penalty: 1.0,
+            dry_multiplier: 0.0,
+            dry_base: 0.0,
+            dry_allowed_length: 0,
+            dry_penalty_range: 0,
         }
     }
 
@@ -167,6 +209,14 @@ impl ChatCompletionRequest {
             stream: false,
             stream_options: None,
             response_format,
+            // DirectorRequest has no per-request penalty overrides yet.
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
+            repetition_penalty: 1.0,
+            dry_multiplier: 0.0,
+            dry_base: 0.0,
+            dry_allowed_length: 0,
+            dry_penalty_range: 0,
         }
     }
 
@@ -185,6 +235,14 @@ impl ChatCompletionRequest {
             stream: true,
             stream_options: None,
             response_format: None,
+            // WriterRequest has no per-request penalty overrides yet.
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
+            repetition_penalty: 1.0,
+            dry_multiplier: 0.0,
+            dry_base: 0.0,
+            dry_allowed_length: 0,
+            dry_penalty_range: 0,
         }
     }
 }
@@ -282,6 +340,8 @@ mod tests {
             top_k,
             max_tokens: 100,
             json_schema: schema,
+            frequency_penalty: None,
+            presence_penalty: None,
         }
     }
 
@@ -426,5 +486,67 @@ mod tests {
         let parsed: ChatCompletionResponse = serde_json::from_str(body).expect("decode");
         assert_eq!(parsed.content(), "");
         assert!(parsed.usage().is_none());
+    }
+
+    #[test]
+    fn frequency_penalty_present_when_nonzero() {
+        let req = turn(0, None);
+        let mut env = ChatCompletionRequest::from_turn(&req, "m", false);
+        env.frequency_penalty = 0.3;
+        let json = serde_json::to_string(&env).expect("serialize");
+        assert!(
+            json.contains("\"frequency_penalty\":0.3"),
+            "frequency_penalty must appear when non-zero: {json}"
+        );
+    }
+
+    #[test]
+    fn dry_multiplier_omitted_when_zero() {
+        let req = turn(0, None);
+        let env = ChatCompletionRequest::from_turn(&req, "m", false);
+        let json = serde_json::to_string(&env).expect("serialize");
+        assert!(
+            !json.contains("\"dry_multiplier\""),
+            "dry_multiplier must be absent when 0: {json}"
+        );
+        assert!(
+            !json.contains("\"dry_base\""),
+            "dry_base must be absent when dry_multiplier is 0: {json}"
+        );
+        assert!(
+            !json.contains("\"dry_allowed_length\""),
+            "dry_allowed_length must be absent when dry_multiplier is 0: {json}"
+        );
+        assert!(
+            !json.contains("\"dry_penalty_range\""),
+            "dry_penalty_range must be absent when dry_multiplier is 0: {json}"
+        );
+    }
+
+    #[test]
+    fn dry_fields_present_when_multiplier_positive() {
+        let req = turn(0, None);
+        let mut env = ChatCompletionRequest::from_turn(&req, "m", false);
+        env.dry_multiplier = 0.8;
+        env.dry_base = 1.75;
+        env.dry_allowed_length = 2;
+        env.dry_penalty_range = 1024;
+        let json = serde_json::to_string(&env).expect("serialize");
+        assert!(
+            json.contains("\"dry_multiplier\":0.8"),
+            "dry_multiplier must be present when >0: {json}"
+        );
+        assert!(
+            json.contains("\"dry_base\":1.75"),
+            "dry_base must be present when dry_multiplier >0: {json}"
+        );
+        assert!(
+            json.contains("\"dry_allowed_length\":2"),
+            "dry_allowed_length must be present when dry_multiplier >0: {json}"
+        );
+        assert!(
+            json.contains("\"dry_penalty_range\":1024"),
+            "dry_penalty_range must be present when dry_multiplier >0: {json}"
+        );
     }
 }

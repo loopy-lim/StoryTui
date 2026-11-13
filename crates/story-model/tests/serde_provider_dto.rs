@@ -90,6 +90,8 @@ fn turn_request_round_trip_with_schema() {
         top_k: 40,
         max_tokens: 1024,
         json_schema: Some(serde_json::json!({"type": "object"})),
+        frequency_penalty: None,
+        presence_penalty: None,
     };
     let json = serde_json::to_string(&req).unwrap();
     let back: TurnRequest = serde_json::from_str(&json).unwrap();
@@ -109,6 +111,8 @@ fn turn_request_round_trip_without_schema() {
         top_k: 0,
         max_tokens: 1,
         json_schema: None,
+        frequency_penalty: None,
+        presence_penalty: None,
     };
     let json = serde_json::to_string(&req).unwrap();
     let back: TurnRequest = serde_json::from_str(&json).unwrap();
